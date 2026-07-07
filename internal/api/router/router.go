@@ -11,7 +11,7 @@ import (
 )
 
 // SetupPublic configures the public API router on :8080.
-func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule bool) *gin.Engine {
+func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule bool, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
@@ -96,6 +96,14 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		// for any id containing reserved chars (e.g. an encoded '/'). Same prefix as
 		// POST .../members (AddMembers); the HTTP method disambiguates.
 		p2.DELETE("/summaries/:id/members", personalH.RemoveMember)
+	}
+
+	// Agent chat: 一期最基础的非流式一问一答。刻意挂在顶层无鉴权分组，
+	// 便于本地直接测基础对话，不套 StrictAuthMiddleware（一期仅本地联调）。
+	agentChatH := handler.NewAgentChatHandler(llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
+	agentGroup := r.Group("/api/v1/agent")
+	{
+		agentGroup.POST("/chat", agentChatH.Chat)
 	}
 
 	return r
