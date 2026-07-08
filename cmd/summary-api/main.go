@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/router"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/auth"
@@ -70,6 +71,16 @@ func main() {
 
 	// Init WebSocket hub
 	hub := ws.NewHub(summaryDB)
+
+	// Init OctoSearch client for summary tools
+	var octoClient *service.OctoSearchBatchClient
+	if cfg.OctoSearchURL != "" && cfg.OctoSearchToken != "" {
+		octoClient = service.NewOctoSearchBatchClient(cfg.OctoSearchURL, cfg.OctoSearchToken)
+		log.Printf("[api] OctoSearch client initialized: %s", cfg.OctoSearchURL)
+	}
+
+	// Inject summary dependencies for agent tools
+	agent.SetSummaryDeps(imDB, octoClient, *cfg)
 
 	// Inject IM DB resolvers
 	if imDB != nil {
