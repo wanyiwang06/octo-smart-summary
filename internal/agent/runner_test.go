@@ -56,14 +56,14 @@ func TestRunner_Run(t *testing.T) {
 	policy := Policy{MaxSteps: 5, MaxTokens: 100000, StepTimeout: time.Second}
 
 	tests := []struct {
-		name       string
-		turns      []AssistantTurn
-		reg        *Registry
-		policy     Policy
-		wantOut    string
-		wantErr    bool
-		errSubstr  string
-		checkMsgs  func(t *testing.T, fc *fakeClient)
+		name      string
+		turns     []AssistantTurn
+		reg       *Registry
+		policy    Policy
+		wantOut   string
+		wantErr   bool
+		errSubstr string
+		checkMsgs func(t *testing.T, fc *fakeClient)
 	}{
 		{
 			name:    "converge immediately",

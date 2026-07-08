@@ -98,10 +98,10 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		p2.DELETE("/summaries/:id/members", personalH.RemoveMember)
 	}
 
-	// Agent chat: 一期最基础的非流式一问一答。刻意挂在顶层无鉴权分组，
-	// 便于本地直接测基础对话，不套 StrictAuthMiddleware（一期仅本地联调）。
+	// Agent chat: requires auth (creator_uid derived from middleware, not LLM params)
 	agentChatH := handler.NewAgentChatHandler(llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
 	agentGroup := r.Group("/api/v1/agent")
+	agentGroup.Use(middleware.StrictAuthMiddleware(authResolver), middleware.StrictSpaceMiddleware())
 	{
 		agentGroup.POST("/chat", agentChatH.Chat)
 	}

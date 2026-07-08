@@ -39,3 +39,9 @@ type AssistantTurn struct {
 	ToolCalls []ToolCall
 	Tokens    int
 }
+
+// ContextKeyUID is the context key for storing user ID in request context.
+type contextKeyUID struct{}
+
+// ContextKeyUID is exported for use by handler to inject uid into context.
+var ContextKeyUID = contextKeyUID{}

@@ -25,6 +25,16 @@ type ToolFactory func() (Tool, Handler)
 var toolFactories = map[string]ToolFactory{
 	"get_current_time":   GetCurrentTimeTool,
 	"extract_time_range": ExtractTimeRangeTool,
+	// Summary tools (Stage 2)
+	"list_channels":            ListChannelsTool,
+	"narrow_channels_by_topic": NarrowChannelsByTopicTool,
+	"find_shared_channels":     FindSharedChannelsTool,
+	"peek_channel":             PeekChannelTool,
+	"fetch_channel":            FetchChannelTool,
+	"search_messages":          SearchMessagesTool,
+	"filter_relevant":          FilterRelevantTool,
+	"summarize_chunk":          SummarizeChunkTool,
+	"merge_summaries":          MergeSummariesTool,
 }
 
 // Profile 描述一个 agent 场景：提示词文件名（不含 .md）+ 允许的工具名单 + 策略。
@@ -46,7 +56,7 @@ var profiles = map[string]Profile{
 	},
 	"summary": {
 		PromptFile: "summary",
-		Tools:      []string{"get_current_time", "extract_time_range"},
+		Tools:      []string{"get_current_time", "extract_time_range", "list_channels", "narrow_channels_by_topic", "find_shared_channels", "peek_channel", "fetch_channel", "search_messages", "filter_relevant", "summarize_chunk", "merge_summaries"},
 		Policy:     Policy{MaxSteps: 12, MaxTokens: 16000, StepTimeout: 60e9},
 	},
 }
@@ -108,4 +118,10 @@ func GetProfile(name string) (Profile, error) {
 		return Profile{}, fmt.Errorf("unknown agent profile %q", name)
 	}
 	return p, nil
+}
+
+// GetToolFactory returns a tool factory by name. Used for per-request registry construction.
+func GetToolFactory(name string) (ToolFactory, bool) {
+	f, ok := toolFactories[name]
+	return f, ok
 }
