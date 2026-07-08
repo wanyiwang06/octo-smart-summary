@@ -57,7 +57,7 @@ var profiles = map[string]Profile{
 	"summary": {
 		PromptFile: "summary",
 		Tools:      []string{"get_current_time", "extract_time_range", "list_channels", "narrow_channels_by_topic", "find_shared_channels", "peek_channel", "fetch_channel", "search_messages", "filter_relevant", "summarize_chunk", "merge_summaries"},
-		Policy:     Policy{MaxSteps: 12, MaxTokens: 16000, StepTimeout: 60e9},
+		Policy:     Policy{MaxSteps: 20, MaxTokens: 60000, StepTimeout: 60e9},
 	},
 }
 
