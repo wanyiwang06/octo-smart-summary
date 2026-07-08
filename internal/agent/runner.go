@@ -30,12 +30,26 @@ func NewRunner(client chatter, reg *Registry, pool *Pool, policy Policy) *Runner
 	return &Runner{client: client, reg: reg, pool: pool, policy: policy}
 }
 
-// Run 驱动多轮"思考→调工具→回喂"回环，直到模型不再调工具（收敛）或触顶。
+// Run 无状态单轮入口：委托 RunWithHistory（history=nil），保持旧签名零回归。
 func (r *Runner) Run(ctx context.Context, system, userInput string) (string, error) {
-	msgs := []Message{
-		{Role: "system", Content: system},
-		{Role: "user", Content: userInput},
-	}
+	reply, _, err := r.RunWithHistory(ctx, system, nil, userInput)
+	return reply, err
+}
+
+// RunWithHistory 在给定历史之上驱动多轮"思考→调工具→回喂"回环，直到模型收敛或触顶。
+// 起始上下文 = [system] + history + [user]；system/history 由调用方拼好（滑窗在上层做）。
+// 返回最终回复 + 本回合新产生的消息（user + assistant(含 tool_calls) + tool），供上层落库；
+// 新消息不含 system，也不含传入的 history。
+func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Message, userInput string) (string, []Message, error) {
+	userMsg := Message{Role: "user", Content: userInput}
+
+	msgs := make([]Message, 0, len(history)+2)
+	msgs = append(msgs, Message{Role: "system", Content: system})
+	msgs = append(msgs, history...)
+	msgs = append(msgs, userMsg)
+
+	// newMsgs 只累积本回合新增（user + 各 assistant + 各 tool），供落库；不含 system/history。
+	newMsgs := []Message{userMsg}
 	totalTokens := 0
 
 	for step := 0; step < r.policy.MaxSteps; step++ {
@@ -43,34 +57,40 @@ func (r *Runner) Run(ctx context.Context, system, userInput string) (string, err
 		turn, err := r.client.Chat(stepCtx, msgs, r.reg.Schemas())
 		cancel()
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		totalTokens += turn.Tokens
 
-		// 无工具调用 = 模型给出最终答案，正常出口。
+		// 无工具调用 = 模型给出最终答案，正常出口：把 assistant 终答并入 newMsgs 落库。
 		if len(turn.ToolCalls) == 0 {
-			return turn.Content, nil
+			newMsgs = append(newMsgs, Message{Role: "assistant", Content: turn.Content})
+			return turn.Content, newMsgs, nil
 		}
 
 		// 回喂 assistant 轮次（必须携带原始 tool_calls，否则下游 tool 消息无处挂靠）。
-		msgs = append(msgs, Message{
+		assistantMsg := Message{
 			Role:      "assistant",
 			Content:   turn.Content,
 			ToolCalls: turn.ToolCalls,
-		})
+		}
+		msgs = append(msgs, assistantMsg)
+		newMsgs = append(newMsgs, assistantMsg)
 
 		// 单跳内多工具并发执行；结果按原索引回填以保证顺序稳定、无数据竞争。
 		results := r.runTools(ctx, turn.ToolCalls)
 		for i, tc := range turn.ToolCalls {
-			msgs = append(msgs, Message{
+			toolMsg := Message{
 				Role:       "tool",
 				ToolCallID: tc.ID,
 				Name:       tc.Function.Name,
 				Content:    results[i],
-			})
+			}
+			msgs = append(msgs, toolMsg)
+			newMsgs = append(newMsgs, toolMsg)
 		}
 
 		// 预算触顶：注入收尾指令，逼模型下一轮直接给答案。
+		// 这条纯运行时提示，不并入 newMsgs（不落库，避免污染历史）。
 		if totalTokens >= r.policy.MaxTokens {
 			msgs = append(msgs, Message{
 				Role:    "user",
@@ -78,7 +98,7 @@ func (r *Runner) Run(ctx context.Context, system, userInput string) (string, err
 			})
 		}
 	}
-	return "", errors.New("max steps exceeded")
+	return "", nil, errors.New("max steps exceeded")
 }
 
 // runTools 并发分发一跳内的全部 tool_calls，各自独立 ctx，错误转结果字符串（不中断）。

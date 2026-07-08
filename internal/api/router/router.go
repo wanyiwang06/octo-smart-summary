@@ -98,8 +98,10 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		p2.DELETE("/summaries/:id/members", personalH.RemoveMember)
 	}
 
-	// Agent chat: requires auth (creator_uid derived from middleware, not LLM params)
-	agentChatH := handler.NewAgentChatHandler(llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
+	// Agent chat: requires auth. creator_uid is derived from the auth middleware
+	// (not from LLM params); the summary profile injects it into tool handlers for
+	// channel/message-level permission isolation. db backs multi-turn history.
+	agentChatH := handler.NewAgentChatHandler(db, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
 	agentGroup := r.Group("/api/v1/agent")
 	agentGroup.Use(middleware.StrictAuthMiddleware(authResolver), middleware.StrictSpaceMiddleware())
 	{
