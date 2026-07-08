@@ -100,7 +100,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 
 	// Agent chat: 一期最基础的非流式一问一答。刻意挂在顶层无鉴权分组，
 	// 便于本地直接测基础对话，不套 StrictAuthMiddleware（一期仅本地联调）。
-	agentChatH := handler.NewAgentChatHandler(llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
+	agentChatH := handler.NewAgentChatHandler(db, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
 	agentGroup := r.Group("/api/v1/agent")
 	{
 		agentGroup.POST("/chat", agentChatH.Chat)
