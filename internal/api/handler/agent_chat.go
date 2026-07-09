@@ -235,3 +235,56 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		"profile":    profileName,
 	}})
 }
+
+// historyBubble 是只读历史接口返回的单条可展示气泡：只含 role + content，
+// 不带 tool_calls/tool_call_id/name 等中间态字段（前端只展示最终对话气泡）。
+type historyBubble struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// History 处理 GET /api/v1/agent/chat/history：按 session_id 只读回该会话的历史消息。
+//
+// 契约：
+//   - session_id 必传，校验规则与 Chat 入口一致（sessionIDPattern），非法/缺失 400（code 40000）。
+//   - 复用 h.store.LoadHistory 拿到按 id 升序的全量消息，在 handler 层过滤：只保留
+//     role∈{user,assistant} 且 content 非空的消息，剥掉 tool_calls 等中间步骤。
+//   - session 无历史时返回空数组 messages:[]，不是错误。
+func (h *AgentChatHandler) History(c *gin.Context) {
+	sessionID := c.Query("session_id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 不能为空"})
+		return
+	}
+	if !sessionIDPattern.MatchString(sessionID) {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 非法"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	history, err := h.store.LoadHistory(ctx, sessionID)
+	if err != nil {
+		log.Printf("[agent] load history error: %v", err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "agent chat history failed"})
+		return
+	}
+
+	// 只保留可展示气泡：role 为 user/assistant 且 content 非空；过滤 tool 消息与
+	// assistant 消息里的 tool_calls 中间步骤（只留 role+content）。
+	bubbles := make([]historyBubble, 0, len(history))
+	for i := range history {
+		m := history[i]
+		if m.Role != "user" && m.Role != "assistant" {
+			continue
+		}
+		if m.Content == "" {
+			continue
+		}
+		bubbles = append(bubbles, historyBubble{Role: m.Role, Content: m.Content})
+	}
+
+	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: gin.H{
+		"session_id": sessionID,
+		"messages":   bubbles,
+	}})
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -334,5 +335,115 @@ func TestRowsDescToMessagesAscEmpty(t *testing.T) {
 	}
 	if len(msgs) != 0 {
 		t.Fatalf("want 0 msgs for nil input, got %d", len(msgs))
+	}
+}
+
+// setupAgentHistoryRouter 挂 GET /api/v1/agent/chat/history 路由，供 History handler 测试。
+func setupAgentHistoryRouter(h *AgentChatHandler) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.GET("/api/v1/agent/chat/history", h.History)
+	return r
+}
+
+func doHistory(t *testing.T, r *gin.Engine, sessionID string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agent/chat/history?session_id="+url.QueryEscape(sessionID), nil)
+	r.ServeHTTP(w, req)
+	return w
+}
+
+// TestAgentChatHistoryOK 校验：给定一个 user/assistant/tool 混合消息的 session，
+// 接口只返回 user+assistant 的气泡、顺序正确（id 升序），tool 消息与 tool_calls 被过滤。
+func TestAgentChatHistoryOK(t *testing.T) {
+	store := newFakeHistoryStore()
+	const sess = "sess-hist"
+	store.byID[sess] = []agent.Message{
+		{Role: "user", Content: "你好"},
+		{Role: "assistant", Content: "", ToolCalls: []agent.ToolCall{{ID: "call_1", Type: "function"}}},
+		{Role: "tool", Content: "tool-result", ToolCallID: "call_1", Name: "foo"},
+		{Role: "assistant", Content: "你好，我是助手"},
+	}
+	h := newAgentChatHandlerWithRunner(nil, "", store, 10)
+	r := setupAgentHistoryRouter(h)
+
+	w := doHistory(t, r, sess)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body=%s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			SessionID string `json:"session_id"`
+			Messages  []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v, body=%s", err, w.Body.String())
+	}
+	if resp.Code != 0 {
+		t.Fatalf("expected code 0, got %d", resp.Code)
+	}
+	if resp.Data.SessionID != sess {
+		t.Fatalf("expected session_id %q, got %q", sess, resp.Data.SessionID)
+	}
+	if len(resp.Data.Messages) != 2 {
+		t.Fatalf("expected 2 bubbles (tool + tool_calls filtered), got %d: %+v", len(resp.Data.Messages), resp.Data.Messages)
+	}
+	if resp.Data.Messages[0].Role != "user" || resp.Data.Messages[0].Content != "你好" {
+		t.Fatalf("bubble[0] wrong: %+v", resp.Data.Messages[0])
+	}
+	if resp.Data.Messages[1].Role != "assistant" || resp.Data.Messages[1].Content != "你好，我是助手" {
+		t.Fatalf("bubble[1] wrong: %+v", resp.Data.Messages[1])
+	}
+}
+
+// TestAgentChatHistoryEmpty 校验：session 无任何历史时返回空数组 messages:[]，不是错误。
+func TestAgentChatHistoryEmpty(t *testing.T) {
+	store := newFakeHistoryStore()
+	h := newAgentChatHandlerWithRunner(nil, "", store, 10)
+	r := setupAgentHistoryRouter(h)
+
+	w := doHistory(t, r, "sess-empty")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"messages":[]`) {
+		t.Fatalf("expected empty messages array, got body=%s", w.Body.String())
+	}
+}
+
+// TestAgentChatHistoryMissingSessionID 校验：缺 session_id -> 400（code 40000）。
+func TestAgentChatHistoryMissingSessionID(t *testing.T) {
+	store := newFakeHistoryStore()
+	h := newAgentChatHandlerWithRunner(nil, "", store, 10)
+	r := setupAgentHistoryRouter(h)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agent/chat/history", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing session_id, got %d, body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestAgentChatHistoryInvalidSessionID 校验：非法 session_id -> 400（code 40000）。
+func TestAgentChatHistoryInvalidSessionID(t *testing.T) {
+	store := newFakeHistoryStore()
+	h := newAgentChatHandlerWithRunner(nil, "", store, 10)
+	r := setupAgentHistoryRouter(h)
+
+	cases := []string{"sess 42", "a/b", "会话1", strings.Repeat("a", 129)}
+	for _, sid := range cases {
+		w := doHistory(t, r, sid)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for session_id=%q, got %d, body=%s", sid, w.Code, w.Body.String())
+		}
 	}
 }
