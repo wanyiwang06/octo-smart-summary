@@ -68,6 +68,11 @@ const (
 const (
 	TriggerManual    = 1
 	TriggerScheduled = 2
+	// TriggerAgent marks a summary created via the agent conversational entry
+	// (POST /api/v1/summaries/agent). The task is born with status=Completed
+	// and content is filled synchronously from the agent's produced deliverable;
+	// no worker dispatch is triggered.
+	TriggerAgent = 3
 )
 
 // Scheduled multi-participant confirm policy constants (summary_schedule.confirm_policy).
