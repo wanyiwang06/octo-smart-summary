@@ -59,6 +59,11 @@ var profiles = map[string]Profile{
 		Tools:      []string{"get_current_time", "extract_time_range", "list_channels", "narrow_channels_by_topic", "find_shared_channels", "peek_channel", "fetch_channel", "search_messages", "filter_relevant", "summarize_chunk", "merge_summaries"},
 		Policy:     Policy{MaxSteps: 20, MaxTokens: 60000, StepTimeout: 60e9},
 	},
+	"summary_refine": {
+		PromptFile: "summary_refine",
+		Tools:      []string{"list_channels", "narrow_channels_by_topic", "find_shared_channels", "peek_channel", "fetch_channel", "search_messages", "filter_relevant", "summarize_chunk", "merge_summaries", "get_current_time", "extract_time_range"},
+		Policy:     Policy{MaxSteps: 15, MaxTokens: 40000, StepTimeout: 60e9},
+	},
 }
 
 var (
