@@ -183,6 +183,7 @@ func TestBuildCitationsForSession_EmptyToolTrace(t *testing.T) {
 // Test 3b: DB 查询失败 → buildCitationsForSession 返回 err != nil
 // (handler 层 agent_summary.go:212-217 会把这个 err 吞成空数组+log,不 500)
 func TestBuildCitationsForSession_DBQueryError(t *testing.T) {
+	agent.ResetForTest()
 	db, skip := setupTestDB(t)
 	if skip {
 		return
@@ -219,8 +220,8 @@ func TestBuildCitationsForSession_DBQueryError(t *testing.T) {
 
 // Test 4: peek_channel 采样式多条不同消息,断言不会互相吞掉
 func TestBuildCitationsForSession_PeekChannelMultipleMessages(t *testing.T) {
-	db, skip := setupTestDB(t)
 	agent.ResetForTest()
+	db, skip := setupTestDB(t)
 	if skip {
 		return
 	}
