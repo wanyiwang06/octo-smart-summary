@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -444,6 +446,227 @@ func TestAgentChatHistoryInvalidSessionID(t *testing.T) {
 		w := doHistory(t, r, sid)
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("expected 400 for session_id=%q, got %d, body=%s", sid, w.Code, w.Body.String())
+		}
+	}
+}
+
+// setupAgentChatStreamRouter sets up a test router with /api/v1/agent/chat/stream endpoint.
+func setupAgentChatStreamRouter(h *AgentChatHandler) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/api/v1/agent/chat/stream", h.ChatStream)
+	return r
+}
+
+// TestChatStreamSuccess verifies the SSE success path: correct headers, done event, AppendMessages called.
+func TestChatStreamSuccess(t *testing.T) {
+	const want = "测试回复"
+	store := newFakeHistoryStore()
+	h := newTestAgentChatHandler(want)
+	h.store = store
+	r := setupAgentChatStreamRouter(h)
+
+	w := httptest.NewRecorder()
+	body := strings.NewReader(`{"message":"你好","session_id":"sess-stream"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agent/chat/stream", body)
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body=%s", w.Code, w.Body.String())
+	}
+
+	// Assert SSE headers
+	if ct := w.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("expected Content-Type text/event-stream, got %q", ct)
+	}
+	if cc := w.Header().Get("Cache-Control"); cc != "no-cache" {
+		t.Errorf("expected Cache-Control no-cache, got %q", cc)
+	}
+	if xab := w.Header().Get("X-Accel-Buffering"); xab != "no" {
+		t.Errorf("expected X-Accel-Buffering no, got %q", xab)
+	}
+
+	// Assert response body contains "event: done" and has reply + session_id in data
+	bodyStr := w.Body.String()
+	if !strings.Contains(bodyStr, "event: done") {
+		t.Fatalf("expected body to contain 'event: done', got: %s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, want) {
+		t.Errorf("expected done event data to contain reply %q, got: %s", want, bodyStr)
+	}
+	if !strings.Contains(bodyStr, "sess-stream") {
+		t.Errorf("expected done event data to contain session_id, got: %s", bodyStr)
+	}
+
+	// Assert AppendMessages was called once (messages were persisted)
+	history, _ := store.LoadHistory(context.Background(), "sess-stream")
+	if len(history) == 0 {
+		t.Fatal("expected AppendMessages to persist messages, but history is empty")
+	}
+}
+
+// TestChatStreamRunnerError verifies the error path: only error event, no done, AppendMessages not called.
+func TestChatStreamRunnerError(t *testing.T) {
+	store := newFakeHistoryStore()
+	h := newTestAgentChatHandlerErr(errors.New("mock runner error"))
+	h.store = store
+	r := setupAgentChatStreamRouter(h)
+
+	w := httptest.NewRecorder()
+	body := strings.NewReader(`{"message":"你好","session_id":"sess-err"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agent/chat/stream", body)
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (SSE always 200), got %d, body=%s", w.Code, w.Body.String())
+	}
+
+	bodyStr := w.Body.String()
+	// Assert body contains "event: error" and does NOT contain "event: done"
+	if !strings.Contains(bodyStr, "event: error") {
+		t.Fatalf("expected body to contain 'event: error', got: %s", bodyStr)
+	}
+	if strings.Contains(bodyStr, "event: done") {
+		t.Errorf("expected no 'event: done' on error path, got: %s", bodyStr)
+	}
+
+	// Assert AppendMessages was NOT called (no persistence on error)
+	history, _ := store.LoadHistory(context.Background(), "sess-err")
+	if len(history) != 0 {
+		t.Errorf("expected no AppendMessages on error, but history has %d messages", len(history))
+	}
+}
+
+// fakeMultiToolChatter implements chatter for concurrent tool testing.
+// First call returns an AssistantTurn with multiple tool calls.
+// Second call returns final answer.
+type fakeMultiToolChatter struct {
+	callCount int
+	mu        sync.Mutex
+}
+
+func (f *fakeMultiToolChatter) Chat(ctx context.Context, msgs []agent.Message, tools []agent.Tool) (agent.AssistantTurn, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.callCount++
+
+	if f.callCount == 1 {
+		// First call: return 3 parallel tool calls
+		tc1 := agent.ToolCall{ID: "call-1", Type: "function"}
+		tc1.Function.Name = "echo_alpha"
+		tc1.Function.Arguments = `{"text":"test1"}`
+
+		tc2 := agent.ToolCall{ID: "call-2", Type: "function"}
+		tc2.Function.Name = "echo_beta"
+		tc2.Function.Arguments = `{"text":"test2"}`
+
+		tc3 := agent.ToolCall{ID: "call-3", Type: "function"}
+		tc3.Function.Name = "echo_gamma"
+		tc3.Function.Arguments = `{"text":"test3"}`
+
+		return agent.AssistantTurn{
+			Content:   "我将并发执行三个工具",
+			ToolCalls: []agent.ToolCall{tc1, tc2, tc3},
+		}, nil
+	}
+
+	// Second call: final answer
+	return agent.AssistantTurn{Content: "并发工具调用测试完成"}, nil
+}
+
+// TestChatStreamConcurrentToolCalls verifies handler works correctly with concurrent tool execution.
+// Uses fakeMultiToolChatter that returns 3 parallel tool calls, triggering runTools concurrent path.
+func TestChatStreamConcurrentToolCalls(t *testing.T) {
+	// Register 3 echo tools for concurrent execution
+	reg := agent.NewRegistry()
+	for _, name := range []string{"echo_alpha", "echo_beta", "echo_gamma"} {
+		toolName := name
+		schema := agent.Tool{
+			Type: "function",
+			Function: agent.ToolFunction{
+				Name:        toolName,
+				Description: "Echo test tool",
+				Parameters: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"text": map[string]interface{}{"type": "string"},
+					},
+					"required": []string{"text"},
+				},
+			},
+		}
+		handler := func(ctx context.Context, args json.RawMessage) (string, error) {
+			var req struct {
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(args, &req); err != nil {
+				return "", err
+			}
+			// Simulate some work to increase chance of race detection
+			time.Sleep(1 * time.Millisecond)
+			return fmt.Sprintf(`{"result":"%s echoed by %s"}`, req.Text, toolName), nil
+		}
+		reg.Register(schema, handler)
+	}
+
+	pool := agent.NewPool(4)
+	policy := agent.Policy{MaxSteps: 8, MaxTokens: 8000, StepTimeout: 5 * time.Second}
+
+	chatter := &fakeMultiToolChatter{}
+	runner := agent.NewRunner(chatter, reg, pool, policy)
+
+	store := newFakeHistoryStore()
+	h := newAgentChatHandlerWithRunner(runner, "test-system", store, 10)
+	r := setupAgentChatStreamRouter(h)
+
+	w := httptest.NewRecorder()
+	body := strings.NewReader(`{"message":"测试并发工具调用","session_id":"sess-concurrent"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agent/chat/stream", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body=%s", w.Code, w.Body.String())
+	}
+
+	bodyStr := w.Body.String()
+
+	// Assert a) handler didn't panic
+	if w.Code != http.StatusOK {
+		t.Fatalf("handler panicked or returned non-200: %d", w.Code)
+	}
+
+	// Assert b) event: done is present exactly once
+	doneCount := strings.Count(bodyStr, "event: done")
+	if doneCount != 1 {
+		t.Errorf("expected exactly 1 'event: done', got %d", doneCount)
+	}
+
+	// Assert c) SSE frame integrity - count progress events (should be at least 3 for the 3 tools)
+	progressCount := strings.Count(bodyStr, "event: progress")
+	if progressCount < 3 {
+		t.Errorf("expected at least 3 'event: progress' (one per tool), got %d", progressCount)
+	}
+
+	// Verify all progress frames are well-formed (not truncated/interleaved)
+	// Each SSE event should have format: "event: TYPE\ndata: {...}\n\n"
+	lines := strings.Split(bodyStr, "\n")
+	for i := 0; i < len(lines); i++ {
+		if strings.HasPrefix(lines[i], "event: progress") {
+			// Next line should be "data: ..."
+			if i+1 >= len(lines) || !strings.HasPrefix(lines[i+1], "data: ") {
+				t.Errorf("malformed SSE frame at line %d: missing data line after event", i)
+			}
+			// The data line should be valid JSON
+			dataLine := lines[i+1]
+			jsonData := strings.TrimPrefix(dataLine, "data: ")
+			var parsed map[string]interface{}
+			if err := json.Unmarshal([]byte(jsonData), &parsed); err != nil {
+				t.Errorf("malformed JSON in progress event at line %d: %v", i, err)
+			}
 		}
 	}
 }

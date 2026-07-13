@@ -1,5 +1,7 @@
 package handler
 
+import "sync"
+
 import (
 	"context"
 	"encoding/json"
@@ -7,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
@@ -151,7 +154,8 @@ type agentChatRequest struct {
 // Chat 处理 POST /api/v1/agent/chat：非流式一问一答，携带多轮历史。
 //
 // 流程：校验 → 取鉴权 uid → 按 profile 动态建 runner（summary 注入 uid 工具）
-//   → 读 session 历史并滑窗截断 → RunWithHistory 多轮驱动 → 成功后落库。
+//
+//	→ 读 session 历史并滑窗截断 → RunWithHistory 多轮驱动 → 成功后落库。
 //
 // 并发约束：单 session 依赖前端单飞（同一 session_id 勿并发发送）。LoadHistory→LLM→
 // AppendMessages 全程无锁，若同 session 并发进入会读到相同历史各自续写，产生分叉历史；
@@ -287,4 +291,188 @@ func (h *AgentChatHandler) History(c *gin.Context) {
 		"session_id": sessionID,
 		"messages":   bubbles,
 	}})
+	c.Writer.Flush()
+}
+
+// sseSink provides thread-safe SSE event writing with a per-request mutex.
+// Each ChatStream request creates one sseSink to serialize concurrent OnEvent callbacks.
+type sseSink struct {
+	mu sync.Mutex
+	w  gin.ResponseWriter
+}
+
+// write emits an SSE event with the given name and JSON payload, gracefully handling write failures.
+func (s *sseSink) write(event string, payload []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", event, payload); err != nil {
+		log.Printf("[agent] write SSE %s failed (client disconnect?): %v", event, err)
+		return
+	}
+	s.w.Flush()
+}
+
+// ChatStream handles POST /api/v1/agent/chat/stream: SSE-based streaming chat with progress events.
+//
+// Workflow: identical to Chat, but emits SSE events (progress/done/error) instead of JSON response.
+// - progress: emitted for each tool_end (phase, label, step, elapsed_ms, detail)
+// - done: final reply + session_id
+// - error: on any failure
+//
+// Context timeout: 300s (longer than Chat's 120s for map-reduce workloads).
+// Database persistence: same as Chat (AppendMessages only on success, no progress events stored).
+func (h *AgentChatHandler) ChatStream(c *gin.Context) {
+	var req agentChatRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
+		return
+	}
+	if req.Message == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "message 不能为空"})
+		return
+	}
+	if len([]rune(req.Message)) > maxMessageLen {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "message 过长"})
+		return
+	}
+	if req.SessionID == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 不能为空"})
+		return
+	}
+	if !sessionIDPattern.MatchString(req.SessionID) {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 非法"})
+		return
+	}
+
+	profileName := req.Profile
+	if profileName == "" {
+		profileName = agentChatProfile
+	}
+
+	// Set SSE headers
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no") // Disable nginx buffering
+
+	// Flush headers immediately to trigger frontend open callback
+	c.Writer.Flush()
+
+	// 300s context timeout for long-running map-reduce tasks
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 300*time.Second)
+	defer cancel()
+
+	uid := middleware.GetUserID(c)
+
+	// Build runner with OnEvent callback for SSE progress
+	var runner *agent.Runner
+	var system string
+	var err error
+	if h.testRunner != nil {
+		runner = h.testRunner
+		system = h.testSystem
+	} else {
+		runner, system, err = h.buildRunnerForProfile(profileName, uid)
+		if err != nil {
+			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
+			sink := &sseSink{w: c.Writer}
+			h.writeSSEErrorViaSink(sink, 50000, "failed to initialize agent")
+			return
+		}
+	}
+
+	// Create per-request SSE sink for thread-safe concurrent writes
+	sink := &sseSink{w: c.Writer}
+
+	// Inject OnEvent callback to emit SSE progress events
+	runner.OnEvent = func(e agent.Event) {
+		if e.Type == "tool_end" {
+			// Emit tool-specific progress event with detail
+			phase, label := agent.GetToolLabel(e.Tool)
+			h.writeSSEProgressViaSink(sink, phase, label, e.Detail, e.Step, e.OfSteps, e.Tool, e.ElapsedMs)
+		} else if e.Type == "step_end" && !e.StepHasTools {
+			// Only emit step_end progress if this step had no tool calls (final answer step)
+			h.writeSSEProgressViaSink(sink, "other", "生成回复", "", e.Step, e.OfSteps, "", e.ElapsedMs)
+		}
+	}
+
+	// Load and truncate history (same as Chat)
+	history, err := h.store.LoadHistory(ctx, req.SessionID)
+	if err != nil {
+		log.Printf("[agent] load history error: %v", err)
+		h.writeSSEErrorViaSink(sink, 50000, "agent chat failed")
+		return
+	}
+	history = agent.TruncateHistory(history, h.window)
+
+	// Run agent with history
+	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
+	if err != nil {
+		log.Printf("[agent] chat runner error: %v", err)
+		h.writeSSEErrorViaSink(sink, 50000, "agent chat failed")
+		return
+	}
+
+	// Persist messages on success (same as Chat)
+	if err := h.store.AppendMessages(ctx, req.SessionID, newMsgs); err != nil {
+		log.Printf("[agent] append messages error: %v", err)
+	}
+
+	// Emit done event with final reply
+	h.writeSSEDoneViaSink(sink, reply, req.SessionID)
+}
+
+// writeSSEProgressViaSink writes a progress SSE event via the provided sink.
+func (h *AgentChatHandler) writeSSEProgressViaSink(sink *sseSink, phase, label, detail string, step, ofSteps int, tool string, elapsedMs int64) {
+	data := map[string]interface{}{
+		"phase":      phase,
+		"label":      label,
+		"step":       step,
+		"ofSteps":    ofSteps,
+		"elapsed_ms": elapsedMs,
+	}
+	if detail != "" {
+		data["detail"] = detail
+	}
+	if tool != "" {
+		data["tool"] = tool
+	}
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("[agent] marshal progress event: %v", err)
+		return
+	}
+
+	sink.write("progress", jsonData)
+}
+
+// writeSSEDoneViaSink writes a done SSE event via the provided sink.
+func (h *AgentChatHandler) writeSSEDoneViaSink(sink *sseSink, reply, sessionID string) {
+	data := map[string]interface{}{
+		"reply":      reply,
+		"session_id": sessionID,
+	}
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("[agent] marshal done event: %v", err)
+		return
+	}
+
+	sink.write("done", jsonData)
+}
+
+// writeSSEErrorViaSink writes an error SSE event via the provided sink.
+func (h *AgentChatHandler) writeSSEErrorViaSink(sink *sseSink, code int, message string) {
+	data := map[string]interface{}{
+		"code":    code,
+		"message": message,
+	}
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("[agent] marshal error event: %v", err)
+		return
+	}
+
+	sink.write("error", jsonData)
 }

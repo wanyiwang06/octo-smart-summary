@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -19,11 +20,24 @@ type Policy struct {
 	StepTimeout time.Duration
 }
 
+// Event represents a progress event during runner execution.
+// Used for SSE streaming to provide real-time progress updates.
+type Event struct {
+	Type         string // "step_start" | "tool_start" | "tool_end" | "step_end"
+	Step         int    // Current step number (1-indexed)
+	OfSteps      int    // Total max steps
+	Tool         string // Tool name (for tool_start/tool_end)
+	ElapsedMs    int64  // Elapsed time in milliseconds for this step/tool
+	Detail       string // Optional detail (e.g., fetch count)
+	StepHasTools bool   // Whether this step has tool calls (set by runner main loop)
+}
+
 type Runner struct {
-	client chatter
-	reg    *Registry
-	pool   *Pool
-	policy Policy
+	client  chatter
+	reg     *Registry
+	pool    *Pool
+	policy  Policy
+	OnEvent func(Event) // Optional callback for progress events; nil-safe
 }
 
 func NewRunner(client chatter, reg *Registry, pool *Pool, policy Policy) *Runner {
@@ -53,6 +67,17 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 	totalTokens := 0
 
 	for step := 0; step < r.policy.MaxSteps; step++ {
+		stepStart := time.Now()
+
+		// Emit step_start event
+		if r.OnEvent != nil {
+			r.OnEvent(Event{
+				Type:    "step_start",
+				Step:    step + 1,
+				OfSteps: r.policy.MaxSteps,
+			})
+		}
+
 		stepCtx, cancel := context.WithTimeout(ctx, r.policy.StepTimeout)
 		turn, err := r.client.Chat(stepCtx, msgs, r.reg.Schemas())
 		cancel()
@@ -63,6 +88,16 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 
 		// 无工具调用 = 模型给出最终答案，正常出口：把 assistant 终答并入 newMsgs 落库。
 		if len(turn.ToolCalls) == 0 {
+			stepElapsed := time.Since(stepStart).Milliseconds()
+			if r.OnEvent != nil {
+				r.OnEvent(Event{
+					Type:         "step_end",
+					Step:         step + 1,
+					OfSteps:      r.policy.MaxSteps,
+					ElapsedMs:    stepElapsed,
+					StepHasTools: false, // No tool calls - final answer
+				})
+			}
 			newMsgs = append(newMsgs, Message{Role: "assistant", Content: turn.Content})
 			return turn.Content, newMsgs, nil
 		}
@@ -77,7 +112,7 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 		newMsgs = append(newMsgs, assistantMsg)
 
 		// 单跳内多工具并发执行；结果按原索引回填以保证顺序稳定、无数据竞争。
-		results := r.runTools(ctx, turn.ToolCalls)
+		results := r.runTools(ctx, turn.ToolCalls, step+1, r.policy.MaxSteps)
 		for i, tc := range turn.ToolCalls {
 			toolMsg := Message{
 				Role:       "tool",
@@ -87,6 +122,17 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 			}
 			msgs = append(msgs, toolMsg)
 			newMsgs = append(newMsgs, toolMsg)
+		}
+
+		stepElapsed := time.Since(stepStart).Milliseconds()
+		if r.OnEvent != nil {
+			r.OnEvent(Event{
+				Type:         "step_end",
+				Step:         step + 1,
+				OfSteps:      r.policy.MaxSteps,
+				ElapsedMs:    stepElapsed,
+				StepHasTools: true, // Had tool calls
+			})
 		}
 
 		// 预算触顶：注入收尾指令，逼模型下一轮直接给答案。
@@ -103,7 +149,7 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 
 // runTools 并发分发一跳内的全部 tool_calls，各自独立 ctx，错误转结果字符串（不中断）。
 // 结果写入预分配 slice 的固定索引，天然无写冲突；WaitGroup 收齐。
-func (r *Runner) runTools(ctx context.Context, calls []ToolCall) []string {
+func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps int) []string {
 	results := make([]string, len(calls))
 	var wg sync.WaitGroup
 	for i, tc := range calls {
@@ -111,7 +157,35 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall) []string {
 		i, tc := i, tc
 		r.pool.Submit(func() {
 			defer wg.Done()
+
+			toolStart := time.Now()
+			if r.OnEvent != nil {
+				r.OnEvent(Event{
+					Type:    "tool_start",
+					Tool:    tc.Function.Name,
+					Step:    step,
+					OfSteps: ofSteps,
+				})
+			}
+
 			out, err := r.reg.Dispatch(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+
+			toolElapsed := time.Since(toolStart).Milliseconds()
+
+			// Extract detail from tool result (cheap count extraction)
+			detail := extractToolDetail(tc.Function.Name, out, i, len(calls))
+
+			if r.OnEvent != nil {
+				r.OnEvent(Event{
+					Type:      "tool_end",
+					Tool:      tc.Function.Name,
+					Step:      step,
+					OfSteps:   ofSteps,
+					ElapsedMs: toolElapsed,
+					Detail:    detail,
+				})
+			}
+
 			if err != nil {
 				results[i] = "错误: " + err.Error()
 				return
@@ -121,4 +195,63 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall) []string {
 	}
 	wg.Wait()
 	return results
+}
+
+// extractToolDetail extracts a cheap count-based detail string from tool results.
+// Returns empty string if extraction fails or tool doesn't need detail.
+func extractToolDetail(toolName, result string, idx, total int) string {
+	switch toolName {
+	case "fetch_channel", "search_messages":
+		// Try to extract count from JSON result
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(result), &data); err != nil {
+			return ""
+		}
+
+		// Try various count fields
+		count := 0
+		if messages, ok := data["messages"].([]interface{}); ok {
+			count = len(messages)
+		} else if total, ok := data["total"].(float64); ok {
+			count = int(total)
+		} else {
+			return ""
+		}
+
+		// Format based on tool
+		switch toolName {
+		case "fetch_channel":
+			return fmt.Sprintf("已抓取 %d 条", count)
+		case "search_messages":
+			return fmt.Sprintf("命中 %d 条", count)
+		}
+
+	case "filter_relevant":
+		// filter_relevant returns {"filtered_count": N, ...}
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(result), &data); err != nil {
+			return ""
+		}
+		if filteredCount, ok := data["filtered_count"].(float64); ok {
+			return fmt.Sprintf("保留 %d 条", int(filteredCount))
+		}
+		return ""
+
+	case "summarize_chunk":
+		// Show current/total for map phase
+		return fmt.Sprintf("%d/%d", idx+1, total)
+
+	case "merge_summaries":
+		// merge_summaries returns {"chunk_count": N, ...}
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(result), &data); err != nil {
+			return ""
+		}
+		if chunkCount, ok := data["chunk_count"].(float64); ok {
+			return fmt.Sprintf("合并 %d 段", int(chunkCount))
+		}
+		return ""
+	}
+
+	return ""
 }
