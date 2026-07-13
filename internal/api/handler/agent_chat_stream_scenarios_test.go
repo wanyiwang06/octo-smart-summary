@@ -17,12 +17,10 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -372,16 +370,8 @@ func TestChatStreamEventSequenceAndDetail(t *testing.T) {
 	if doneCount != 1 {
 		t.Fatalf("expected exactly 1 'event: done', got %d\n%s", doneCount, body)
 	}
-	if !strings.HasSuffix(strings.TrimRight(body, "\n"),
-		body[strings.LastIndex(body, "event: done"):len(body)-len("\n")]) &&
-		strings.Index(body, "event: done") < strings.LastIndex(body, "event:") {
-		// 上面是弱检查,再直接断:done 后不应再有别的 event 行
-		afterDone := body[strings.Index(body, "event: done"):]
-		// afterDone 里除了 done 本身那一段,不应再出现 event: (排除 done 自己的第 1 次)
-		rest := afterDone[len("event: done"):]
-		if strings.Contains(rest, "event: ") {
-			t.Errorf("expected no more events after 'done', got extra events in tail:\n%s", rest)
-		}
+	if strings.LastIndex(body, "event:") != strings.Index(body, "event: done") {
+		t.Errorf("expected 'done' to be the last event, got extra events after it:\n%s", body)
 	}
 
 	// —— 收集所有 progress payload 并按契约断言 schema ——
@@ -469,8 +459,3 @@ func TestChatStreamEventSequenceAndDetail(t *testing.T) {
 		t.Errorf("summarize_chunk detail should be N/M format, got %q", detailByTool["summarize_chunk"])
 	}
 }
-
-// ─── 抑制未使用 import 警告(如果 sync/errors 只在别处用) ────────────────
-// (占位,若上面有分支删掉了 sync/errors 的使用,再取消引用)
-var _ = sync.Mutex{}
-var _ = errors.New("")
