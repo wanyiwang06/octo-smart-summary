@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
@@ -211,6 +212,9 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			cits = nil
 		}
 		creatorPR.SetCitations(cits)
+		// Build v1 snapshot for agent-generated summary
+		snapshot := h.buildSnapshotV1(tx, req.SessionID, &task, req.Sources)
+		creatorPR.SetSnapshot(snapshot)
 		if err := tx.Create(&creatorPR).Error; err != nil {
 			return fmt.Errorf("create creator personal_result: %w", err)
 		}
@@ -282,4 +286,74 @@ func loadLatestAssistantContent(db *gorm.DB, sessionID string) (string, error) {
 		return "", err
 	}
 	return msg.Content, nil
+}
+
+// buildSnapshotV1 constructs the v1 snapshot for an agent-generated summary.
+// This is the initial snapshot (parent_snapshot_version=null, user_instruction=null).
+// Tool summary is built by counting role='tool' messages in agent_message.
+func (h *AgentSummaryHandler) buildSnapshotV1(
+	db *gorm.DB,
+	sessionID string,
+	task *model.SummaryTask,
+	sources []sourceReq,
+) *model.Snapshot {
+	// Build tool_summary: count tool invocations by name
+	var toolMessages []model.AgentMessage
+	if err := db.Where("session_id = ? AND role = ?", sessionID, "tool").
+		Find(&toolMessages).Error; err != nil {
+		log.Printf("[handler] buildSnapshotV1: failed to query tool messages: %v", err)
+		// fallback to empty array on error
+	}
+
+	toolCounts := make(map[string]int)
+	for _, tm := range toolMessages {
+		if tm.Name != "" {
+			toolCounts[tm.Name]++
+		}
+	}
+
+	toolSummary := make([]string, 0, len(toolCounts))
+	// Sort tool names for stable output order
+	toolNames := make([]string, 0, len(toolCounts))
+	for name := range toolCounts {
+		toolNames = append(toolNames, name)
+	}
+	sort.Strings(toolNames)
+
+	for _, name := range toolNames {
+		toolSummary = append(toolSummary, fmt.Sprintf("%s x %d", name, toolCounts[name]))
+	}
+
+	// Build scope: channel_ids from sources, channel_names left empty for now
+	// (SUM-36 allows channel_names to be empty array if not available)
+	channelIDs := make([]string, 0, len(sources))
+	for _, s := range sources {
+		if s.SourceID != "" {
+			channelIDs = append(channelIDs, s.SourceID)
+		}
+	}
+
+	// Requirement: use task title as the user requirement
+	requirement := task.Title
+
+	snap := &model.Snapshot{
+		SnapshotVersion: 1,
+		TaskID:          task.ID,
+		ContentVersion:  1,
+		Requirement:     requirement,
+		Scope: model.SnapshotScope{
+			ChannelIDs:   channelIDs,
+			ChannelNames: []string{}, // empty for now, P0.2 will populate
+			TimeRange: model.TimeRangeJSON{
+				Start: task.TimeRangeStart.Format("2006-01-02T15:04:05Z07:00"),
+				End:   task.TimeRangeEnd.Format("2006-01-02T15:04:05Z07:00"),
+			},
+		},
+		ToolSummary:           toolSummary,
+		DataFreshnessNote:     "tool_summary 记录本次生成时的调用轨迹,不代表数据边界,涉及新数据源必须调 fetch_channel 验证",
+		ParentSnapshotVersion: nil,
+		UserInstruction:       nil,
+	}
+
+	return snap
 }
