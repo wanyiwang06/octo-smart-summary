@@ -14,6 +14,7 @@ import (
 
 // Test 1: 有 [n] 标记 + 有完整 tool 轨迹 → citations 非空、结构正确
 func TestBuildCitationsForSession_WithMarkersAndMessages(t *testing.T) {
+	agent.ResetForTest()
 	db, skip := setupTestDB(t)
 	if skip {
 		return
@@ -91,6 +92,7 @@ func TestBuildCitationsForSession_WithMarkersAndMessages(t *testing.T) {
 
 // Test 2: 无 [n] 标记 → 返回空数组
 func TestBuildCitationsForSession_NoMarkers(t *testing.T) {
+	agent.ResetForTest()
 	db, skip := setupTestDB(t)
 	if skip {
 		return
@@ -138,6 +140,7 @@ func TestBuildCitationsForSession_NoMarkers(t *testing.T) {
 
 // Test 3a: cache 过期/无 tool message → 返回空数组 + err == nil (正常路径)
 func TestBuildCitationsForSession_EmptyToolTrace(t *testing.T) {
+	agent.ResetForTest()
 	db, skip := setupTestDB(t)
 	if skip {
 		return
@@ -217,6 +220,7 @@ func TestBuildCitationsForSession_DBQueryError(t *testing.T) {
 // Test 4: peek_channel 采样式多条不同消息,断言不会互相吞掉
 func TestBuildCitationsForSession_PeekChannelMultipleMessages(t *testing.T) {
 	db, skip := setupTestDB(t)
+	agent.ResetForTest()
 	if skip {
 		return
 	}
