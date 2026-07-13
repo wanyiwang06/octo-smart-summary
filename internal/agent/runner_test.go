@@ -410,3 +410,83 @@ func TestTruncateHistory(t *testing.T) {
 		}
 	})
 }
+
+// TestRunner_OnEvent_Nil verifies that when OnEvent is nil, behavior is unchanged.
+func TestRunner_OnEvent_Nil(t *testing.T) {
+	policy := Policy{MaxSteps: 5, MaxTokens: 100000, StepTimeout: time.Second}
+	fc := &fakeClient{
+		turns: []AssistantTurn{
+			{ToolCalls: []ToolCall{mkToolCall("c1", "alpha", `{}`)}, Tokens: 10},
+			{Content: "done", Tokens: 5},
+		},
+	}
+	runner := newTestRunner(fc, regWithEcho("alpha"), policy)
+	
+	// OnEvent is nil by default (not set)
+	if runner.OnEvent != nil {
+		t.Fatal("OnEvent should be nil by default")
+	}
+	
+	reply, newMsgs, err := runner.RunWithHistory(context.Background(), "sys", nil, "user input")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reply != "done" {
+		t.Fatalf("reply = %q, want %q", reply, "done")
+	}
+	if len(newMsgs) != 4 {
+		t.Fatalf("newMsgs len = %d, want 4", len(newMsgs))
+	}
+}
+
+// TestRunner_OnEvent_EmitsEvents verifies that OnEvent is called with correct events.
+func TestRunner_OnEvent_EmitsEvents(t *testing.T) {
+	policy := Policy{MaxSteps: 5, MaxTokens: 100000, StepTimeout: time.Second}
+	fc := &fakeClient{
+		turns: []AssistantTurn{
+			{ToolCalls: []ToolCall{mkToolCall("c1", "alpha", `{}`)}, Tokens: 10},
+			{Content: "done", Tokens: 5},
+		},
+	}
+	runner := newTestRunner(fc, regWithEcho("alpha"), policy)
+	
+	events := []Event{}
+	runner.OnEvent = func(e Event) {
+		events = append(events, e)
+	}
+	
+	reply, _, err := runner.RunWithHistory(context.Background(), "sys", nil, "user input")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reply != "done" {
+		t.Fatalf("reply = %q, want %q", reply, "done")
+	}
+	
+	// Expected events: step_start(1), tool_start(alpha), tool_end(alpha), step_end(1), step_start(2), step_end(2)
+	if len(events) < 4 {
+		t.Fatalf("events len = %d, want at least 4, got: %+v", len(events), events)
+	}
+	
+	// Verify step events have correct Step/OfSteps
+	for _, e := range events {
+		if strings.HasSuffix(e.Type, "_start") || strings.HasSuffix(e.Type, "_end") {
+			if e.OfSteps != 5 {
+				t.Errorf("event %v has OfSteps=%d, want 5", e.Type, e.OfSteps)
+			}
+			if e.Step < 1 || e.Step > 5 {
+				t.Errorf("event %v has Step=%d, want 1-5", e.Type, e.Step)
+			}
+		}
+		if e.Type == "tool_start" || e.Type == "tool_end" {
+			if e.Tool != "alpha" {
+				t.Errorf("tool event has Tool=%q, want %q", e.Tool, "alpha")
+			}
+		}
+		if e.Type == "tool_end" || e.Type == "step_end" {
+			if e.ElapsedMs < 0 {
+				t.Errorf("event %v has negative ElapsedMs=%d", e.Type, e.ElapsedMs)
+			}
+		}
+	}
+}

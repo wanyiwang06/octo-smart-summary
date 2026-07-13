@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
@@ -287,4 +288,178 @@ func (h *AgentChatHandler) History(c *gin.Context) {
 		"session_id": sessionID,
 		"messages":   bubbles,
 	}})
+}
+
+// ChatStream handles POST /api/v1/agent/chat/stream: SSE-based streaming chat with progress events.
+//
+// Workflow: identical to Chat, but emits SSE events (progress/done/error) instead of JSON response.
+// - progress: emitted for each step/tool during RunWithHistory (phase, label, step, elapsed_ms)
+// - done: final reply + session_id
+// - error: on any failure
+//
+// Context timeout: 300s (longer than Chat's 120s for map-reduce workloads).
+// Database persistence: same as Chat (AppendMessages only on success, no progress events stored).
+func (h *AgentChatHandler) ChatStream(c *gin.Context) {
+	var req agentChatRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
+		return
+	}
+	if req.Message == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "message 不能为空"})
+		return
+	}
+	if len([]rune(req.Message)) > maxMessageLen {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "message 过长"})
+		return
+	}
+	if req.SessionID == "" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 不能为空"})
+		return
+	}
+	if !sessionIDPattern.MatchString(req.SessionID) {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 非法"})
+		return
+	}
+
+	profileName := req.Profile
+	if profileName == "" {
+		profileName = agentChatProfile
+	}
+
+	// Set SSE headers
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no") // Disable nginx buffering
+
+	// Flush headers immediately to trigger frontend open callback
+	c.Writer.Flush()
+
+	// 300s context timeout for long-running map-reduce tasks
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 300*time.Second)
+	defer cancel()
+
+	uid := middleware.GetUserID(c)
+
+	// Build runner with OnEvent callback for SSE progress
+	var runner *agent.Runner
+	var system string
+	var err error
+	if h.testRunner != nil {
+		runner = h.testRunner
+		system = h.testSystem
+	} else {
+		runner, system, err = h.buildRunnerForProfile(profileName, uid)
+		if err != nil {
+			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
+			h.writeSSEError(c, 50000, "failed to initialize agent")
+			return
+		}
+	}
+
+	// Inject OnEvent callback to emit SSE progress events
+	runner.OnEvent = func(e agent.Event) {
+		// Only emit progress events for step_end and tool_end (with elapsed_ms)
+		if e.Type == "step_end" {
+			// Emit a generic step progress event
+			h.writeSSEProgress(c, "other", "处理中", "", e.Step, e.OfSteps, "", e.ElapsedMs)
+		} else if e.Type == "tool_end" {
+			// Emit tool-specific progress event
+			phase, label := agent.GetToolLabel(e.Tool)
+			h.writeSSEProgress(c, phase, label, e.Detail, e.Step, e.OfSteps, e.Tool, e.ElapsedMs)
+		}
+	}
+
+	// Load and truncate history (same as Chat)
+	history, err := h.store.LoadHistory(ctx, req.SessionID)
+	if err != nil {
+		log.Printf("[agent] load history error: %v", err)
+		h.writeSSEError(c, 50000, "agent chat failed")
+		return
+	}
+	history = agent.TruncateHistory(history, h.window)
+
+	// Run agent with history
+	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
+	if err != nil {
+		log.Printf("[agent] chat runner error: %v", err)
+		h.writeSSEError(c, 50000, "agent chat failed")
+		return
+	}
+
+	// Persist messages on success (same as Chat)
+	if err := h.store.AppendMessages(ctx, req.SessionID, newMsgs); err != nil {
+		log.Printf("[agent] append messages error: %v", err)
+	}
+
+	// Emit done event with final reply
+	h.writeSSEDone(c, reply, req.SessionID)
+}
+
+// writeSSEProgress writes a progress SSE event and flushes. Graceful on write failure.
+func (h *AgentChatHandler) writeSSEProgress(c *gin.Context, phase, label, detail string, step, ofSteps int, tool string, elapsedMs int64) {
+	data := map[string]interface{}{
+		"phase":      phase,
+		"label":      label,
+		"step":       step,
+		"ofSteps":    ofSteps,
+		"elapsed_ms": elapsedMs,
+	}
+	if detail != "" {
+		data["detail"] = detail
+	}
+	if tool != "" {
+		data["tool"] = tool
+	}
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("[agent] marshal progress event: %v", err)
+		return
+	}
+
+	if _, err := fmt.Fprintf(c.Writer, "event: progress\ndata: %s\n\n", jsonData); err != nil {
+		log.Printf("[agent] write SSE progress failed (client disconnect?): %v", err)
+		return
+	}
+	c.Writer.Flush()
+}
+
+// writeSSEDone writes a done SSE event and flushes.
+func (h *AgentChatHandler) writeSSEDone(c *gin.Context, reply, sessionID string) {
+	data := map[string]interface{}{
+		"reply":      reply,
+		"session_id": sessionID,
+	}
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("[agent] marshal done event: %v", err)
+		return
+	}
+
+	if _, err := fmt.Fprintf(c.Writer, "event: done\ndata: %s\n\n", jsonData); err != nil {
+		log.Printf("[agent] write SSE done failed: %v", err)
+		return
+	}
+	c.Writer.Flush()
+}
+
+// writeSSEError writes an error SSE event and flushes.
+func (h *AgentChatHandler) writeSSEError(c *gin.Context, code int, message string) {
+	data := map[string]interface{}{
+		"code":    code,
+		"message": message,
+	}
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("[agent] marshal error event: %v", err)
+		return
+	}
+
+	if _, err := fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", jsonData); err != nil {
+		log.Printf("[agent] write SSE error failed: %v", err)
+		return
+	}
+	c.Writer.Flush()
 }
