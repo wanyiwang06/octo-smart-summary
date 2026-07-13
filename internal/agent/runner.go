@@ -3,8 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -23,12 +23,13 @@ type Policy struct {
 // Event represents a progress event during runner execution.
 // Used for SSE streaming to provide real-time progress updates.
 type Event struct {
-	Type      string // "step_start" | "tool_start" | "tool_end" | "step_end"
-	Step      int    // Current step number (1-indexed)
-	OfSteps   int    // Total max steps
-	Tool      string // Tool name (for tool_start/tool_end)
-	ElapsedMs int64  // Elapsed time in milliseconds for this step/tool
-	Detail    string // Optional detail (e.g., fetch count)
+	Type         string // "step_start" | "tool_start" | "tool_end" | "step_end"
+	Step         int    // Current step number (1-indexed)
+	OfSteps      int    // Total max steps
+	Tool         string // Tool name (for tool_start/tool_end)
+	ElapsedMs    int64  // Elapsed time in milliseconds for this step/tool
+	Detail       string // Optional detail (e.g., fetch count)
+	StepHasTools bool   // Whether this step has tool calls (set by runner main loop)
 }
 
 type Runner struct {
@@ -67,7 +68,7 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 
 	for step := 0; step < r.policy.MaxSteps; step++ {
 		stepStart := time.Now()
-		
+
 		// Emit step_start event
 		if r.OnEvent != nil {
 			r.OnEvent(Event{
@@ -90,10 +91,11 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 			stepElapsed := time.Since(stepStart).Milliseconds()
 			if r.OnEvent != nil {
 				r.OnEvent(Event{
-					Type:      "step_end",
-					Step:      step + 1,
-					OfSteps:   r.policy.MaxSteps,
-					ElapsedMs: stepElapsed,
+					Type:         "step_end",
+					Step:         step + 1,
+					OfSteps:      r.policy.MaxSteps,
+					ElapsedMs:    stepElapsed,
+					StepHasTools: false, // No tool calls - final answer
 				})
 			}
 			newMsgs = append(newMsgs, Message{Role: "assistant", Content: turn.Content})
@@ -125,10 +127,11 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 		stepElapsed := time.Since(stepStart).Milliseconds()
 		if r.OnEvent != nil {
 			r.OnEvent(Event{
-				Type:      "step_end",
-				Step:      step + 1,
-				OfSteps:   r.policy.MaxSteps,
-				ElapsedMs: stepElapsed,
+				Type:         "step_end",
+				Step:         step + 1,
+				OfSteps:      r.policy.MaxSteps,
+				ElapsedMs:    stepElapsed,
+				StepHasTools: true, // Had tool calls
 			})
 		}
 
@@ -154,7 +157,7 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 		i, tc := i, tc
 		r.pool.Submit(func() {
 			defer wg.Done()
-			
+
 			toolStart := time.Now()
 			if r.OnEvent != nil {
 				r.OnEvent(Event{
@@ -164,14 +167,14 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 					OfSteps: ofSteps,
 				})
 			}
-			
+
 			out, err := r.reg.Dispatch(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
-			
+
 			toolElapsed := time.Since(toolStart).Milliseconds()
-			
+
 			// Extract detail from tool result (cheap count extraction)
 			detail := extractToolDetail(tc.Function.Name, out, i, len(calls))
-			
+
 			if r.OnEvent != nil {
 				r.OnEvent(Event{
 					Type:      "tool_end",
@@ -182,7 +185,7 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 					Detail:    detail,
 				})
 			}
-			
+
 			if err != nil {
 				results[i] = "错误: " + err.Error()
 				return
@@ -198,56 +201,57 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 // Returns empty string if extraction fails or tool doesn't need detail.
 func extractToolDetail(toolName, result string, idx, total int) string {
 	switch toolName {
-	case "fetch_channel", "search_messages", "filter_relevant":
+	case "fetch_channel", "search_messages":
 		// Try to extract count from JSON result
 		var data map[string]interface{}
 		if err := json.Unmarshal([]byte(result), &data); err != nil {
 			return ""
 		}
-		
+
 		// Try various count fields
 		count := 0
-		if items, ok := data["items"].([]interface{}); ok {
-			count = len(items)
-		} else if messages, ok := data["messages"].([]interface{}); ok {
+		if messages, ok := data["messages"].([]interface{}); ok {
 			count = len(messages)
 		} else if total, ok := data["total"].(float64); ok {
 			count = int(total)
-		} else if cnt, ok := data["count"].(float64); ok {
-			count = int(cnt)
 		} else {
 			return ""
 		}
-		
+
 		// Format based on tool
 		switch toolName {
 		case "fetch_channel":
 			return fmt.Sprintf("已抓取 %d 条", count)
 		case "search_messages":
 			return fmt.Sprintf("命中 %d 条", count)
-		case "filter_relevant":
-			return fmt.Sprintf("保留 %d 条", count)
 		}
-		
-	case "summarize_chunk":
-		// Show current/total for map phase
-		return fmt.Sprintf("%d/%d", idx+1, total)
-		
-	case "merge_summaries":
-		// Try to extract number of merged segments
+
+	case "filter_relevant":
+		// filter_relevant returns {"filtered_count": N, ...}
 		var data map[string]interface{}
 		if err := json.Unmarshal([]byte(result), &data); err != nil {
 			return ""
 		}
-		
-		if summaries, ok := data["summaries"].([]interface{}); ok {
-			return fmt.Sprintf("合并 %d 段", len(summaries))
-		} else if segments, ok := data["segments"].([]interface{}); ok {
-			return fmt.Sprintf("合并 %d 段", len(segments))
-		} else if count, ok := data["merged_count"].(float64); ok {
-			return fmt.Sprintf("合并 %d 段", int(count))
+		if filteredCount, ok := data["filtered_count"].(float64); ok {
+			return fmt.Sprintf("保留 %d 条", int(filteredCount))
 		}
+		return ""
+
+	case "summarize_chunk":
+		// Show current/total for map phase
+		return fmt.Sprintf("%d/%d", idx+1, total)
+
+	case "merge_summaries":
+		// merge_summaries returns {"chunk_count": N, ...}
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(result), &data); err != nil {
+			return ""
+		}
+		if chunkCount, ok := data["chunk_count"].(float64); ok {
+			return fmt.Sprintf("合并 %d 段", int(chunkCount))
+		}
+		return ""
 	}
-	
+
 	return ""
 }

@@ -421,12 +421,12 @@ func TestRunner_OnEvent_Nil(t *testing.T) {
 		},
 	}
 	runner := newTestRunner(fc, regWithEcho("alpha"), policy)
-	
+
 	// OnEvent is nil by default (not set)
 	if runner.OnEvent != nil {
 		t.Fatal("OnEvent should be nil by default")
 	}
-	
+
 	reply, newMsgs, err := runner.RunWithHistory(context.Background(), "sys", nil, "user input")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -449,12 +449,12 @@ func TestRunner_OnEvent_EmitsEvents(t *testing.T) {
 		},
 	}
 	runner := newTestRunner(fc, regWithEcho("alpha"), policy)
-	
+
 	events := []Event{}
 	runner.OnEvent = func(e Event) {
 		events = append(events, e)
 	}
-	
+
 	reply, _, err := runner.RunWithHistory(context.Background(), "sys", nil, "user input")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -462,12 +462,12 @@ func TestRunner_OnEvent_EmitsEvents(t *testing.T) {
 	if reply != "done" {
 		t.Fatalf("reply = %q, want %q", reply, "done")
 	}
-	
+
 	// Expected events: step_start(1), tool_start(alpha), tool_end(alpha), step_end(1), step_start(2), step_end(2)
 	if len(events) < 4 {
 		t.Fatalf("events len = %d, want at least 4, got: %+v", len(events), events)
 	}
-	
+
 	// Verify step events have correct Step/OfSteps
 	for _, e := range events {
 		if strings.HasSuffix(e.Type, "_start") || strings.HasSuffix(e.Type, "_end") {

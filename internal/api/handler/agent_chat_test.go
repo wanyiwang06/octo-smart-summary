@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -537,28 +539,93 @@ func TestChatStreamRunnerError(t *testing.T) {
 	}
 }
 
-// TestChatStreamConcurrentToolCalls verifies concurrent OnEvent calls don't panic (sseSink mutex works).
+// fakeMultiToolChatter implements chatter for concurrent tool testing.
+// First call returns an AssistantTurn with multiple tool calls.
+// Second call returns final answer.
+type fakeMultiToolChatter struct {
+	callCount int
+	mu        sync.Mutex
+}
+
+func (f *fakeMultiToolChatter) Chat(ctx context.Context, msgs []agent.Message, tools []agent.Tool) (agent.AssistantTurn, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.callCount++
+
+	if f.callCount == 1 {
+		// First call: return 3 parallel tool calls
+		tc1 := agent.ToolCall{ID: "call-1", Type: "function"}
+		tc1.Function.Name = "echo_alpha"
+		tc1.Function.Arguments = `{"text":"test1"}`
+
+		tc2 := agent.ToolCall{ID: "call-2", Type: "function"}
+		tc2.Function.Name = "echo_beta"
+		tc2.Function.Arguments = `{"text":"test2"}`
+
+		tc3 := agent.ToolCall{ID: "call-3", Type: "function"}
+		tc3.Function.Name = "echo_gamma"
+		tc3.Function.Arguments = `{"text":"test3"}`
+
+		return agent.AssistantTurn{
+			Content:   "我将并发执行三个工具",
+			ToolCalls: []agent.ToolCall{tc1, tc2, tc3},
+		}, nil
+	}
+
+	// Second call: final answer
+	return agent.AssistantTurn{Content: "并发工具调用测试完成"}, nil
+}
+
+// TestChatStreamConcurrentToolCalls verifies handler works correctly with concurrent tool execution.
+// Uses fakeMultiToolChatter that returns 3 parallel tool calls, triggering runTools concurrent path.
 func TestChatStreamConcurrentToolCalls(t *testing.T) {
-	// Create a fake runner that concurrently calls OnEvent from multiple goroutines
+	// Register 3 echo tools for concurrent execution
 	reg := agent.NewRegistry()
+	for _, name := range []string{"echo_alpha", "echo_beta", "echo_gamma"} {
+		toolName := name
+		schema := agent.Tool{
+			Type: "function",
+			Function: agent.ToolFunction{
+				Name:        toolName,
+				Description: "Echo test tool",
+				Parameters: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"text": map[string]interface{}{"type": "string"},
+					},
+					"required": []string{"text"},
+				},
+			},
+		}
+		handler := func(ctx context.Context, args json.RawMessage) (string, error) {
+			var req struct {
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(args, &req); err != nil {
+				return "", err
+			}
+			// Simulate some work to increase chance of race detection
+			time.Sleep(1 * time.Millisecond)
+			return fmt.Sprintf(`{"result":"%s echoed by %s"}`, req.Text, toolName), nil
+		}
+		reg.Register(schema, handler)
+	}
+
 	pool := agent.NewPool(4)
 	policy := agent.Policy{MaxSteps: 8, MaxTokens: 8000, StepTimeout: 5 * time.Second}
-	
-	// Use fakeChatter with reply
-	chatter := &fakeChatter{reply: "并发测试完成"}
+
+	chatter := &fakeMultiToolChatter{}
 	runner := agent.NewRunner(chatter, reg, pool, policy)
-	
+
 	store := newFakeHistoryStore()
 	h := newAgentChatHandlerWithRunner(runner, "test-system", store, 10)
 	r := setupAgentChatStreamRouter(h)
 
 	w := httptest.NewRecorder()
-	body := strings.NewReader(`{"message":"测试并发","session_id":"sess-concurrent"}`)
+	body := strings.NewReader(`{"message":"测试并发工具调用","session_id":"sess-concurrent"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/agent/chat/stream", body)
 	req.Header.Set("Content-Type", "application/json")
-	
-	// The handler should not panic even if OnEvent is called concurrently
-	// (though with fakeChatter there are no actual tool calls, so we're mainly testing setup doesn't panic)
+
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
@@ -566,8 +633,40 @@ func TestChatStreamConcurrentToolCalls(t *testing.T) {
 	}
 
 	bodyStr := w.Body.String()
-	// Assert we got a done event and no panic
-	if !strings.Contains(bodyStr, "event: done") {
-		t.Fatalf("expected 'event: done', got: %s", bodyStr)
+
+	// Assert a) handler didn't panic
+	if w.Code != http.StatusOK {
+		t.Fatalf("handler panicked or returned non-200: %d", w.Code)
+	}
+
+	// Assert b) event: done is present exactly once
+	doneCount := strings.Count(bodyStr, "event: done")
+	if doneCount != 1 {
+		t.Errorf("expected exactly 1 'event: done', got %d", doneCount)
+	}
+
+	// Assert c) SSE frame integrity - count progress events (should be at least 3 for the 3 tools)
+	progressCount := strings.Count(bodyStr, "event: progress")
+	if progressCount < 3 {
+		t.Errorf("expected at least 3 'event: progress' (one per tool), got %d", progressCount)
+	}
+
+	// Verify all progress frames are well-formed (not truncated/interleaved)
+	// Each SSE event should have format: "event: TYPE\ndata: {...}\n\n"
+	lines := strings.Split(bodyStr, "\n")
+	for i := 0; i < len(lines); i++ {
+		if strings.HasPrefix(lines[i], "event: progress") {
+			// Next line should be "data: ..."
+			if i+1 >= len(lines) || !strings.HasPrefix(lines[i+1], "data: ") {
+				t.Errorf("malformed SSE frame at line %d: missing data line after event", i)
+			}
+			// The data line should be valid JSON
+			dataLine := lines[i+1]
+			jsonData := strings.TrimPrefix(dataLine, "data: ")
+			var parsed map[string]interface{}
+			if err := json.Unmarshal([]byte(jsonData), &parsed); err != nil {
+				t.Errorf("malformed JSON in progress event at line %d: %v", i, err)
+			}
+		}
 	}
 }

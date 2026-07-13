@@ -154,7 +154,8 @@ type agentChatRequest struct {
 // Chat 处理 POST /api/v1/agent/chat：非流式一问一答，携带多轮历史。
 //
 // 流程：校验 → 取鉴权 uid → 按 profile 动态建 runner（summary 注入 uid 工具）
-//   → 读 session 历史并滑窗截断 → RunWithHistory 多轮驱动 → 成功后落库。
+//
+//	→ 读 session 历史并滑窗截断 → RunWithHistory 多轮驱动 → 成功后落库。
 //
 // 并发约束：单 session 依赖前端单飞（同一 session_id 勿并发发送）。LoadHistory→LLM→
 // AppendMessages 全程无锁，若同 session 并发进入会读到相同历史各自续写，产生分叉历史；
@@ -383,24 +384,15 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	// Create per-request SSE sink for thread-safe concurrent writes
 	sink := &sseSink{w: c.Writer}
 
-	// Track whether this step has any tool calls (to filter step_end noise)
-	hadToolCalls := false
-
 	// Inject OnEvent callback to emit SSE progress events
 	runner.OnEvent = func(e agent.Event) {
-		if e.Type == "tool_start" {
-			hadToolCalls = true
-		} else if e.Type == "tool_end" {
+		if e.Type == "tool_end" {
 			// Emit tool-specific progress event with detail
 			phase, label := agent.GetToolLabel(e.Tool)
 			h.writeSSEProgressViaSink(sink, phase, label, e.Detail, e.Step, e.OfSteps, e.Tool, e.ElapsedMs)
-		} else if e.Type == "step_end" && !hadToolCalls {
+		} else if e.Type == "step_end" && !e.StepHasTools {
 			// Only emit step_end progress if this step had no tool calls (final answer step)
 			h.writeSSEProgressViaSink(sink, "other", "生成回复", "", e.Step, e.OfSteps, "", e.ElapsedMs)
-		}
-		// Reset for next step
-		if e.Type == "step_start" {
-			hadToolCalls = false
 		}
 	}
 
