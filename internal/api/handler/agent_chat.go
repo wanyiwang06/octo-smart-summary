@@ -1,5 +1,7 @@
 package handler
 
+import "sync"
+
 import (
 	"context"
 	"encoding/json"
@@ -288,12 +290,31 @@ func (h *AgentChatHandler) History(c *gin.Context) {
 		"session_id": sessionID,
 		"messages":   bubbles,
 	}})
+	c.Writer.Flush()
+}
+
+// sseSink provides thread-safe SSE event writing with a per-request mutex.
+// Each ChatStream request creates one sseSink to serialize concurrent OnEvent callbacks.
+type sseSink struct {
+	mu sync.Mutex
+	w  gin.ResponseWriter
+}
+
+// write emits an SSE event with the given name and JSON payload, gracefully handling write failures.
+func (s *sseSink) write(event string, payload []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", event, payload); err != nil {
+		log.Printf("[agent] write SSE %s failed (client disconnect?): %v", event, err)
+		return
+	}
+	s.w.Flush()
 }
 
 // ChatStream handles POST /api/v1/agent/chat/stream: SSE-based streaming chat with progress events.
 //
 // Workflow: identical to Chat, but emits SSE events (progress/done/error) instead of JSON response.
-// - progress: emitted for each step/tool during RunWithHistory (phase, label, step, elapsed_ms)
+// - progress: emitted for each tool_end (phase, label, step, elapsed_ms, detail)
 // - done: final reply + session_id
 // - error: on any failure
 //
@@ -353,21 +374,33 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		runner, system, err = h.buildRunnerForProfile(profileName, uid)
 		if err != nil {
 			log.Printf("[agent] build runner for profile %q: %v", profileName, err)
-			h.writeSSEError(c, 50000, "failed to initialize agent")
+			sink := &sseSink{w: c.Writer}
+			h.writeSSEErrorViaSink(sink, 50000, "failed to initialize agent")
 			return
 		}
 	}
 
+	// Create per-request SSE sink for thread-safe concurrent writes
+	sink := &sseSink{w: c.Writer}
+
+	// Track whether this step has any tool calls (to filter step_end noise)
+	hadToolCalls := false
+
 	// Inject OnEvent callback to emit SSE progress events
 	runner.OnEvent = func(e agent.Event) {
-		// Only emit progress events for step_end and tool_end (with elapsed_ms)
-		if e.Type == "step_end" {
-			// Emit a generic step progress event
-			h.writeSSEProgress(c, "other", "处理中", "", e.Step, e.OfSteps, "", e.ElapsedMs)
+		if e.Type == "tool_start" {
+			hadToolCalls = true
 		} else if e.Type == "tool_end" {
-			// Emit tool-specific progress event
+			// Emit tool-specific progress event with detail
 			phase, label := agent.GetToolLabel(e.Tool)
-			h.writeSSEProgress(c, phase, label, e.Detail, e.Step, e.OfSteps, e.Tool, e.ElapsedMs)
+			h.writeSSEProgressViaSink(sink, phase, label, e.Detail, e.Step, e.OfSteps, e.Tool, e.ElapsedMs)
+		} else if e.Type == "step_end" && !hadToolCalls {
+			// Only emit step_end progress if this step had no tool calls (final answer step)
+			h.writeSSEProgressViaSink(sink, "other", "生成回复", "", e.Step, e.OfSteps, "", e.ElapsedMs)
+		}
+		// Reset for next step
+		if e.Type == "step_start" {
+			hadToolCalls = false
 		}
 	}
 
@@ -375,7 +408,7 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	history, err := h.store.LoadHistory(ctx, req.SessionID)
 	if err != nil {
 		log.Printf("[agent] load history error: %v", err)
-		h.writeSSEError(c, 50000, "agent chat failed")
+		h.writeSSEErrorViaSink(sink, 50000, "agent chat failed")
 		return
 	}
 	history = agent.TruncateHistory(history, h.window)
@@ -384,7 +417,7 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
 	if err != nil {
 		log.Printf("[agent] chat runner error: %v", err)
-		h.writeSSEError(c, 50000, "agent chat failed")
+		h.writeSSEErrorViaSink(sink, 50000, "agent chat failed")
 		return
 	}
 
@@ -394,11 +427,11 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	}
 
 	// Emit done event with final reply
-	h.writeSSEDone(c, reply, req.SessionID)
+	h.writeSSEDoneViaSink(sink, reply, req.SessionID)
 }
 
-// writeSSEProgress writes a progress SSE event and flushes. Graceful on write failure.
-func (h *AgentChatHandler) writeSSEProgress(c *gin.Context, phase, label, detail string, step, ofSteps int, tool string, elapsedMs int64) {
+// writeSSEProgressViaSink writes a progress SSE event via the provided sink.
+func (h *AgentChatHandler) writeSSEProgressViaSink(sink *sseSink, phase, label, detail string, step, ofSteps int, tool string, elapsedMs int64) {
 	data := map[string]interface{}{
 		"phase":      phase,
 		"label":      label,
@@ -419,15 +452,11 @@ func (h *AgentChatHandler) writeSSEProgress(c *gin.Context, phase, label, detail
 		return
 	}
 
-	if _, err := fmt.Fprintf(c.Writer, "event: progress\ndata: %s\n\n", jsonData); err != nil {
-		log.Printf("[agent] write SSE progress failed (client disconnect?): %v", err)
-		return
-	}
-	c.Writer.Flush()
+	sink.write("progress", jsonData)
 }
 
-// writeSSEDone writes a done SSE event and flushes.
-func (h *AgentChatHandler) writeSSEDone(c *gin.Context, reply, sessionID string) {
+// writeSSEDoneViaSink writes a done SSE event via the provided sink.
+func (h *AgentChatHandler) writeSSEDoneViaSink(sink *sseSink, reply, sessionID string) {
 	data := map[string]interface{}{
 		"reply":      reply,
 		"session_id": sessionID,
@@ -438,15 +467,11 @@ func (h *AgentChatHandler) writeSSEDone(c *gin.Context, reply, sessionID string)
 		return
 	}
 
-	if _, err := fmt.Fprintf(c.Writer, "event: done\ndata: %s\n\n", jsonData); err != nil {
-		log.Printf("[agent] write SSE done failed: %v", err)
-		return
-	}
-	c.Writer.Flush()
+	sink.write("done", jsonData)
 }
 
-// writeSSEError writes an error SSE event and flushes.
-func (h *AgentChatHandler) writeSSEError(c *gin.Context, code int, message string) {
+// writeSSEErrorViaSink writes an error SSE event via the provided sink.
+func (h *AgentChatHandler) writeSSEErrorViaSink(sink *sseSink, code int, message string) {
 	data := map[string]interface{}{
 		"code":    code,
 		"message": message,
@@ -457,9 +482,5 @@ func (h *AgentChatHandler) writeSSEError(c *gin.Context, code int, message strin
 		return
 	}
 
-	if _, err := fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", jsonData); err != nil {
-		log.Printf("[agent] write SSE error failed: %v", err)
-		return
-	}
-	c.Writer.Flush()
+	sink.write("error", jsonData)
 }

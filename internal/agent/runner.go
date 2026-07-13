@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"errors"
 	"sync"
 	"time"
@@ -167,6 +168,10 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 			out, err := r.reg.Dispatch(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
 			
 			toolElapsed := time.Since(toolStart).Milliseconds()
+			
+			// Extract detail from tool result (cheap count extraction)
+			detail := extractToolDetail(tc.Function.Name, out, i, len(calls))
+			
 			if r.OnEvent != nil {
 				r.OnEvent(Event{
 					Type:      "tool_end",
@@ -174,6 +179,7 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 					Step:      step,
 					OfSteps:   ofSteps,
 					ElapsedMs: toolElapsed,
+					Detail:    detail,
 				})
 			}
 			
@@ -186,4 +192,62 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 	}
 	wg.Wait()
 	return results
+}
+
+// extractToolDetail extracts a cheap count-based detail string from tool results.
+// Returns empty string if extraction fails or tool doesn't need detail.
+func extractToolDetail(toolName, result string, idx, total int) string {
+	switch toolName {
+	case "fetch_channel", "search_messages", "filter_relevant":
+		// Try to extract count from JSON result
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(result), &data); err != nil {
+			return ""
+		}
+		
+		// Try various count fields
+		count := 0
+		if items, ok := data["items"].([]interface{}); ok {
+			count = len(items)
+		} else if messages, ok := data["messages"].([]interface{}); ok {
+			count = len(messages)
+		} else if total, ok := data["total"].(float64); ok {
+			count = int(total)
+		} else if cnt, ok := data["count"].(float64); ok {
+			count = int(cnt)
+		} else {
+			return ""
+		}
+		
+		// Format based on tool
+		switch toolName {
+		case "fetch_channel":
+			return fmt.Sprintf("已抓取 %d 条", count)
+		case "search_messages":
+			return fmt.Sprintf("命中 %d 条", count)
+		case "filter_relevant":
+			return fmt.Sprintf("保留 %d 条", count)
+		}
+		
+	case "summarize_chunk":
+		// Show current/total for map phase
+		return fmt.Sprintf("%d/%d", idx+1, total)
+		
+	case "merge_summaries":
+		// Try to extract number of merged segments
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(result), &data); err != nil {
+			return ""
+		}
+		
+		if summaries, ok := data["summaries"].([]interface{}); ok {
+			return fmt.Sprintf("合并 %d 段", len(summaries))
+		} else if segments, ok := data["segments"].([]interface{}); ok {
+			return fmt.Sprintf("合并 %d 段", len(segments))
+		} else if count, ok := data["merged_count"].(float64); ok {
+			return fmt.Sprintf("合并 %d 段", int(count))
+		}
+	}
+	
+	return ""
 }
