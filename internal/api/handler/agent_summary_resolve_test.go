@@ -243,3 +243,32 @@ func TestResolveOriginChannelFromSession_SkipsMalformedJSON(t *testing.T) {
 		t.Errorf("expected channel_type=2, got %d", channelType)
 	}
 }
+
+// TestResolveOriginChannelFromSession_DBError tests that a real DB error
+// (not "not found") is returned as an error, not empty result.
+// We simulate this by using a closed database connection.
+func TestResolveOriginChannelFromSession_DBError(t *testing.T) {
+	db, skip := setupResolveTestDB(t)
+	if skip {
+		return
+	}
+	
+	// Close the DB connection to force an error
+	sqlDB, _ := db.DB()
+	sqlDB.Close()
+	
+	handler := &AgentSummaryHandler{db: db}
+
+	channelID, channelType, err := handler.resolveOriginChannelFromSession(context.Background(), "any-session")
+
+	// Should return an error (not nil), and empty values
+	if err == nil {
+		t.Error("expected DB error, got nil")
+	}
+	if channelID != "" {
+		t.Errorf("expected empty channel_id on error, got %s", channelID)
+	}
+	if channelType != 0 {
+		t.Errorf("expected channel_type=0 on error, got %d", channelType)
+	}
+}

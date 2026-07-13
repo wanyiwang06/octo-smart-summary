@@ -43,11 +43,11 @@ func NewAgentSummaryHandler(db *gorm.DB) *AgentSummaryHandler {
 }
 
 // createAgentSummaryReq mirrors the SUM-24 v1.0 contract where origin_channel
-// fields are now optional. If not provided, they will be resolved from the
-// session's tool traces.
+// fields are now optional. OriginChannelID is a pointer to distinguish between
+// "not provided" (nil) and "explicitly provided as empty string" (non-nil pointing to "").
 type createAgentSummaryReq struct {
 	SessionID         string           `json:"session_id"`
-	OriginChannelID   string           `json:"origin_channel_id,omitempty"`
+	OriginChannelID   *string          `json:"origin_channel_id,omitempty"`
 	OriginChannelType int              `json:"origin_channel_type,omitempty"`
 	Title             string           `json:"title,omitempty"`
 	Sources           []sourceReq      `json:"sources,omitempty"`
@@ -57,7 +57,8 @@ type createAgentSummaryReq struct {
 // CreateAgentSummary handles POST /api/v1/summaries/agent.
 //
 // SUM-24 change: origin_channel_id and origin_channel_type are now optional.
-// If not provided, they are resolved from the session's fetch_channel tool calls.
+// If not provided (nil), they are resolved from the session's fetch_channel tool calls.
+// If explicitly provided as empty string, the old validation error is returned.
 //
 // Error codes are chosen to match the SUM-15 v1.0 contract (40000 / 40001 /
 // 40004 / 50000) so the front-end can key off the same numeric codes it
@@ -83,12 +84,15 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		return
 	}
 
-	// SUM-24: origin_channel fields are now optional. Resolve from session if not provided.
-	finalChannelID := req.OriginChannelID
-	finalChannelType := req.OriginChannelType
+	// SUM-24: origin_channel fields are now optional. Distinguish between:
+	// - nil (not provided) → resolve from session
+	// - non-nil but empty → old validation error
+	// - non-nil and non-empty → use provided value
+	var finalChannelID string
+	var finalChannelType int
 
-	if finalChannelID == "" {
-		// Attempt to resolve from session tool traces
+	if req.OriginChannelID == nil {
+		// Not provided → resolve from session tool traces
 		resolvedID, resolvedType, err := h.resolveOriginChannelFromSession(c.Request.Context(), req.SessionID)
 		if err != nil {
 			// DB error or other real failure → 500
@@ -104,7 +108,14 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		finalChannelID = resolvedID
 		finalChannelType = resolvedType
 	} else {
-		// Origin was provided, validate type as before
+		// Provided (even if empty string) → validate as before
+		finalChannelID = *req.OriginChannelID
+		finalChannelType = req.OriginChannelType
+
+		if finalChannelID == "" {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_id 不能为空"})
+			return
+		}
 		if finalChannelType < model.OriginChannelGroup || finalChannelType > model.OriginChannelDM {
 			c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_type 必须是 1(群)/2(thread)/3(DM)"})
 			return
