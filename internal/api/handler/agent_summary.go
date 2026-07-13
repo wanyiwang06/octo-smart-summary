@@ -42,20 +42,23 @@ func NewAgentSummaryHandler(db *gorm.DB) *AgentSummaryHandler {
 	return &AgentSummaryHandler{db: db}
 }
 
-// createAgentSummaryReq mirrors the SUM-15 v1.0 contract exactly. Only
-// session_id + origin_channel_{id,type} are required; the rest are optional
-// and default to sensible values. New optional fields may be added in the
-// future without breaking existing clients; required fields never change.
+// createAgentSummaryReq mirrors the SUM-24 v1.0 contract where origin_channel
+// fields are now optional. OriginChannelID is a pointer to distinguish between
+// "not provided" (nil) and "explicitly provided as empty string" (non-nil pointing to "").
 type createAgentSummaryReq struct {
 	SessionID         string           `json:"session_id"`
-	OriginChannelID   string           `json:"origin_channel_id"`
-	OriginChannelType int              `json:"origin_channel_type"`
+	OriginChannelID   *string          `json:"origin_channel_id,omitempty"`
+	OriginChannelType int              `json:"origin_channel_type,omitempty"`
 	Title             string           `json:"title,omitempty"`
 	Sources           []sourceReq      `json:"sources,omitempty"`
 	Participants      []participantReq `json:"participants,omitempty"`
 }
 
 // CreateAgentSummary handles POST /api/v1/summaries/agent.
+//
+// SUM-24 change: origin_channel_id and origin_channel_type are now optional.
+// If not provided (nil), they are resolved from the session's fetch_channel tool calls.
+// If explicitly provided as empty string, the old validation error is returned.
 //
 // Error codes are chosen to match the SUM-15 v1.0 contract (40000 / 40001 /
 // 40004 / 50000) so the front-end can key off the same numeric codes it
@@ -80,14 +83,45 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 缺失或不符合正则 ^[A-Za-z0-9_-]{1,128}$"})
 		return
 	}
-	if req.OriginChannelID == "" {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_id 不能为空"})
-		return
+
+	// SUM-24: origin_channel fields are now optional. Distinguish between:
+	// - nil (not provided) → resolve from session
+	// - non-nil but empty → old validation error
+	// - non-nil and non-empty → use provided value
+	var finalChannelID string
+	var finalChannelType int
+
+	if req.OriginChannelID == nil {
+		// Not provided → resolve from session tool traces
+		resolvedID, resolvedType, err := h.resolveOriginChannelFromSession(c.Request.Context(), req.SessionID)
+		if err != nil {
+			// DB error or other real failure → 500
+			log.Printf("[handler] resolveOriginChannelFromSession failed session=%s: %v", req.SessionID, err)
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "resolve origin channel failed: " + err.Error()})
+			return
+		}
+		if resolvedID == "" {
+			// No fetch_channel call found in session → 400 with specific message
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_id 未传且无法从 session 反查(session 无 fetch_channel 调用)"})
+			return
+		}
+		finalChannelID = resolvedID
+		finalChannelType = resolvedType
+	} else {
+		// Provided (even if empty string) → validate as before
+		finalChannelID = *req.OriginChannelID
+		finalChannelType = req.OriginChannelType
+
+		if finalChannelID == "" {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_id 不能为空"})
+			return
+		}
+		if finalChannelType < model.OriginChannelGroup || finalChannelType > model.OriginChannelDM {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_type 必须是 1(群)/2(thread)/3(DM)"})
+			return
+		}
 	}
-	if req.OriginChannelType < model.OriginChannelGroup || req.OriginChannelType > model.OriginChannelDM {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_type 必须是 1(群)/2(thread)/3(DM)"})
-		return
-	}
+
 	if utf8.RuneCountInString(req.Title) > 1000 {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 1000 字符"})
 		return
@@ -147,8 +181,8 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		TimeRangeEnd:      now,
 		Status:            model.StatusCompleted,
 		TriggerType:       model.TriggerAgent,
-		OriginChannelID:   req.OriginChannelID,
-		OriginChannelType: req.OriginChannelType,
+		OriginChannelID:   finalChannelID,
+		OriginChannelType: finalChannelType,
 	}
 
 	var createdTaskID int64
@@ -245,8 +279,8 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		return
 	}
 
-	log.Printf("[handler] CreateAgentSummary ok space=%s user=%s task_id=%d session=%s content_len=%d",
-		spaceID, userID, createdTaskID, req.SessionID, len(content))
+	log.Printf("[handler] CreateAgentSummary ok space=%s user=%s task_id=%d session=%s content_len=%d origin_channel=%s/%d",
+		spaceID, userID, createdTaskID, req.SessionID, len(content), finalChannelID, finalChannelType)
 
 	// Response shape is intentionally isomorphic to POST /summaries so the
 	// front-end can consume both endpoints with the same success handler.
