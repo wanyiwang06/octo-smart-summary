@@ -21,7 +21,6 @@ import (
 // 1. 从 agent_message 提取本 session 所有 role='tool' 的 Content
 // 2. 解析 JSON,提取 messages_handle (工具返回里的缓存句柄)
 // 3. 尝试从 agent.messageCache 恢复 messages (30分钟 TTL)
-// 4. 对于 peek_channel 等直接返回 messages 数组的工具,也从 Content 提取
 // 5. 合并去重 → 得到 allMessages 池
 // 6. 为每条 message 分配 CitationIndex(1-indexed, 全局唯一, 时间升序)
 // 7. 收集 nameMap: sender_uid -> sender_name
@@ -86,23 +85,6 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 			}
 		}
 
-		// Also try direct messages array (e.g., peek_channel returns sampled messages)
-		if msgsRaw, ok := toolReturn["messages"]; ok {
-			if msgsArr, ok := msgsRaw.([]interface{}); ok {
-				for _, msgRaw := range msgsArr {
-					if msgMap, ok := msgRaw.(map[string]interface{}); ok {
-						msg := mapToMessage(msgMap, tm.Name)
-						if msg != nil {
-							key := msgKey(*msg)
-							if !seenKey[key] {
-								allMessages = append(allMessages, *msg)
-								seenKey[key] = true
-							}
-						}
-					}
-				}
-			}
-		}
 	}
 
 	if len(allMessages) == 0 {

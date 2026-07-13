@@ -191,10 +191,9 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		}
 
 		// The creator's PersonalResult IS the deliverable — status=Completed,
-		// content pulled from agent_message above. Citations start as an empty
-		// array (SetCitations([]Citation{}) writes "[]") and will be filled by
-		// a follow-up PR that changes summarize_chunk/merge_summaries to emit
-		// [n]-indexed prose plus a Citation-compatible message pool.
+		// The creator's PersonalResult IS the deliverable — status=Completed,
+		// content pulled from agent_message above. Citations are built from
+		// session tool traces below via buildCitationsForSession.
 		creatorPR := model.PersonalResult{
 			TaskID:           createdTaskID,
 			ParticipantRefID: creatorP.ID,
