@@ -191,7 +191,6 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		}
 
 		// The creator's PersonalResult IS the deliverable — status=Completed,
-		// The creator's PersonalResult IS the deliverable — status=Completed,
 		// content pulled from agent_message above. Citations are built from
 		// session tool traces below via buildCitationsForSession.
 		creatorPR := model.PersonalResult{

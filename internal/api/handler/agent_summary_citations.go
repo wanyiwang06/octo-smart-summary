@@ -72,7 +72,7 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 				cached := cache.Retrieve(handle, uid)
 				if cached != nil {
 					for _, msg := range cached {
-						key := msgKey(msg)
+						key := fmt.Sprintf("%s:%d", msg.ChannelID, msg.MessageSeq)
 						if !seenKey[key] {
 							allMessages = append(allMessages, msg)
 							seenKey[key] = true
@@ -118,49 +118,3 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 	return citations, nil
 }
 
-// msgKey generates a unique key for deduplication (channel_id + message_seq).
-func msgKey(msg pipeline.Message) string {
-	return fmt.Sprintf("%s:%d", msg.ChannelID, msg.MessageSeq)
-}
-
-// mapToMessage converts a tool return's message map to pipeline.Message.
-// Many tools return partial fields; we fill what's available.
-func mapToMessage(m map[string]interface{}, toolName string) *pipeline.Message {
-	msg := &pipeline.Message{}
-
-	// Extract available fields
-	if v, ok := m["sender_uid"].(string); ok {
-		msg.SenderUID = v
-	}
-	if v, ok := m["sender_name"].(string); ok {
-		msg.SenderName = v
-	}
-	if v, ok := m["content"].(string); ok {
-		msg.Content = v
-	}
-	if v, ok := m["send_time"].(string); ok {
-		msg.SendTime = v
-	}
-	if v, ok := m["channel_id"].(string); ok {
-		msg.ChannelID = v
-	}
-	if v, ok := m["channel_type"].(float64); ok {
-		msg.ChannelType = int(v)
-	}
-	if v, ok := m["message_seq"].(float64); ok {
-		msg.MessageSeq = int64(v)
-	}
-	if v, ok := m["timestamp"].(float64); ok {
-		msg.Timestamp = int64(v)
-	}
-	if v, ok := m["source_name"].(string); ok {
-		msg.SourceName = v
-	}
-
-	// Minimal validation: must have content and some identifier
-	if msg.Content == "" || (msg.MessageSeq == 0 && msg.SenderName == "") {
-		return nil
-	}
-
-	return msg
-}
