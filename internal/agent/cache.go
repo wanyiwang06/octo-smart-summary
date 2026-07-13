@@ -117,3 +117,10 @@ func safeHandleUID(uid string) string {
 	}
 	return uid[:8]
 }
+
+// GetMessageCache returns the package-level message cache instance.
+// Exposed for out-of-package callers (e.g., the agent summary handler)
+// that need to retrieve cached messages by handle when building citations.
+func GetMessageCache() *msgCache {
+	return messageCache
+}

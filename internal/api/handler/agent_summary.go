@@ -206,7 +206,13 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			CreatedAt:        now,
 			UpdatedAt:        now,
 		}
-		creatorPR.SetCitations(nil) // "[]"
+		// Build citations from session tool traces (fallback to empty array on error)
+		cits, cerr := h.buildCitationsForSession(c.Request.Context(), req.SessionID, content, userID)
+		if cerr != nil {
+			log.Printf("[handler] buildCitationsForSession failed session=%s: %v (fallback to empty)", req.SessionID, cerr)
+			cits = nil
+		}
+		creatorPR.SetCitations(cits)
 		if err := tx.Create(&creatorPR).Error; err != nil {
 			return fmt.Errorf("create creator personal_result: %w", err)
 		}
