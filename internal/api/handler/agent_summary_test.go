@@ -38,12 +38,6 @@ func setupAgentSummaryTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
-// mockTokenResolver provides test auth
-type mockTokenResolver struct{}
-
-func (m *mockTokenResolver) GetUserID(token string) (string, error) {
-	return token, nil // use token as user_id for simplicity
-}
 
 // setupAgentSummaryRouter sets up a test gin router with the handler
 func setupAgentSummaryRouter(h *AgentSummaryHandler) *gin.Engine {
