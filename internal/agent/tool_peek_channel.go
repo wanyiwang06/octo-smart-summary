@@ -25,7 +25,7 @@ func PeekChannelTool() (Tool, Handler) {
 					},
 					"channel_type": map[string]interface{}{
 						"type":        "integer",
-						"description": "频道类型：1=群组, 2=私聊",
+						"description": "频道类型：1=群组(Group), 2=子区(Thread), 3=私聊(DM)",
 					},
 					"limit": map[string]interface{}{
 						"type":        "integer",
