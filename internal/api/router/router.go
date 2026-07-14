@@ -115,6 +115,12 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		agentGroup.GET("/chat/history", agentChatH.History)
 	}
 
+	// Agent summary: persists agent-generated summaries and supports refine workflow.
+	// Shares the same LLM configuration as agent chat.
+	agentSummaryH := handler.NewAgentSummaryHandler(db, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
+	v1.POST("/summaries/agent", agentSummaryH.CreateAgentSummary)
+	v1.POST("/summaries/:task_id/refine", agentSummaryH.RefineAgentSummary)
+
 	return r
 }
 
