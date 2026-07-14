@@ -65,6 +65,7 @@ const (
 )
 
 // Trigger type constants.
+// Trigger types for summary_task.trigger_type
 const (
 	TriggerManual    = 1
 	TriggerScheduled = 2
@@ -73,6 +74,8 @@ const (
 	// and content is filled synchronously from the agent's produced deliverable;
 	// no worker dispatch is triggered.
 	TriggerAgent = 3
+)
+>>>>>>> 521bd17 (feat(SUM-43): add TriggerAgent constant + refine endpoint scaffold (incomplete - needs LLM client wiring))
 )
 
 // Scheduled multi-participant confirm policy constants (summary_schedule.confirm_policy).
