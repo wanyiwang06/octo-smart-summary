@@ -139,6 +139,12 @@ type SummaryTask struct {
 	CreatedAt          time.Time  `gorm:"column:created_at;not null" json:"created_at"`
 	UpdatedAt          time.Time  `gorm:"column:updated_at;not null" json:"updated_at"`
 	DeletedAt          *time.Time `gorm:"column:deleted_at;index" json:"deleted_at,omitempty"`
+	// ReferencedTaskIDs is a JSON-encoded array of task_ids that this agent
+	// summary was generated with reference to. NULL when the summary was
+	// generated from scratch (no reference). Only populated for
+	// trigger_type=agent summaries where the user picked one or more existing
+	// summaries as reference material via the chat UI.
+	ReferencedTaskIDs *string `gorm:"column:referenced_task_ids;type:text" json:"-"`
 }
 
 func (SummaryTask) TableName() string { return "summary_task" }

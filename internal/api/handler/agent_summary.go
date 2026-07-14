@@ -82,6 +82,10 @@ type createAgentSummaryReq struct {
 	Title             string           `json:"title,omitempty"`
 	Sources           []sourceReq      `json:"sources,omitempty"`
 	Participants      []participantReq `json:"participants,omitempty"`
+	// ReferencedTaskIDs 可选:本次 agent chat 引用的已有总结 task_id 数组。
+	// 前端在保存时把首轮引用的 task IDs 透传过来,后端记录到 SummaryTask
+	// (方便日后做衍生关系追溯),不影响本次生成的 content/citations。
+	ReferencedTaskIDs []int64 `json:"referenced_task_ids,omitempty"`
 }
 
 // CreateAgentSummary handles POST /api/v1/summaries/agent.
@@ -131,12 +135,33 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			return
 		}
 		if resolvedID == "" {
-			// No fetch_channel call found in session → 400 with specific message
-			c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_id 未传且无法从 session 反查(session 无 fetch_channel 调用)"})
-			return
+			// SUM-24 fallback failed (no fetch_channel in session — typical for
+			// pure refine flows where the agent didn't need to re-fetch).
+			// CHAT-REFERENCE-BASED-DESIGN-v1 second-order fallback: if the user
+			// referenced existing summaries, borrow the FIRST referenced task's
+			// origin as the new summary's origin. This keeps the chat/list
+			// grouping sensible without asking the user to re-select the channel.
+			if len(req.ReferencedTaskIDs) > 0 {
+				var refTask model.SummaryTask
+				if err := h.db.WithContext(c.Request.Context()).
+					Select("id, origin_channel_id, origin_channel_type").
+					Where("id = ? AND space_id = ? AND origin_channel_id != ''", req.ReferencedTaskIDs[0], spaceID).
+					First(&refTask).Error; err == nil {
+					finalChannelID = refTask.OriginChannelID
+					finalChannelType = refTask.OriginChannelType
+					log.Printf("[handler] CreateAgentSummary borrowed origin from referenced task_id=%d channel=%s/%d session=%s",
+						refTask.ID, finalChannelID, finalChannelType, req.SessionID)
+				}
+			}
+			if finalChannelID == "" {
+				// Truly no origin available anywhere → 400 with specific message
+				c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "origin_channel_id 未传且无法从 session 反查(session 无 fetch_channel 调用),也无引用总结可继承 origin"})
+				return
+			}
+		} else {
+			finalChannelID = resolvedID
+			finalChannelType = resolvedType
 		}
-		finalChannelID = resolvedID
-		finalChannelType = resolvedType
 	} else {
 		// Provided (even if empty string) → validate as before
 		finalChannelID = *req.OriginChannelID
@@ -213,6 +238,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		TriggerType:       model.TriggerAgent,
 		OriginChannelID:   finalChannelID,
 		OriginChannelType: finalChannelType,
+		ReferencedTaskIDs: serializeReferencedTaskIDs(req.ReferencedTaskIDs),
 	}
 
 	var createdTaskID int64
@@ -302,6 +328,20 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			if err := tx.Create(&pp).Error; err != nil {
 				return fmt.Errorf("create participant %s: %w", p.UserID, err)
 			}
+		}
+
+		// Session lifecycle: chat is a "temporary workshop" — once the
+		// deliverable is persisted, DELETE all agent_message rows for this
+		// session so the workshop cannot be revisited (see
+		// CHAT-REFERENCE-BASED-DESIGN-v1 §core mental model).
+		//
+		// Best-effort within the transaction: if the DELETE fails we still
+		// let the whole transaction commit (the summary was saved fine, we
+		// just leave orphan message rows for a cleanup cron). A failure
+		// here should NOT block the user from seeing their saved summary.
+		if err := tx.Where("session_id = ?", req.SessionID).Delete(&model.AgentMessage{}).Error; err != nil {
+			log.Printf("[handler] CreateAgentSummary: session cleanup DELETE failed session=%s: %v (summary was saved OK, orphan rows will remain)", req.SessionID, err)
+			// Intentionally do NOT return err — the summary is safely saved.
 		}
 
 		return nil
