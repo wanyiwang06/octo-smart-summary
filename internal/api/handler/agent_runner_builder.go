@@ -9,7 +9,7 @@ import (
 )
 
 // buildRunner constructs a runner for the given profile name with LLM configuration.
-// If uid is non-empty and profile is "summary", it will be injected into tool handlers.
+// If uid is non-empty and profile is "summary" or "summary_refine", it will be injected into tool handlers.
 // This is a shared helper used by both AgentChatHandler and AgentSummaryHandler.
 func buildRunner(profileName, uid, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int) (*agent.Runner, string, error) {
 	profile, err := agent.GetProfile(profileName)
@@ -22,7 +22,7 @@ func buildRunner(profileName, uid, llmApiURL, llmApiKey, llmModel string, llmTim
 	}
 
 	var reg *agent.Registry
-	if profileName == "summary" && uid != "" {
+	if (profileName == "summary" || profileName == "summary_refine") && uid != "" {
 		reg, err = buildSummaryRegistryWithUID(uid)
 	} else {
 		reg, err = agent.BuildRegistry(profile.Tools)

@@ -39,9 +39,8 @@ type AgentSummaryHandler struct {
 	llmModel     string
 	llmTimeout   int
 	llmMaxTokens int
+	store        agentHistoryStore
 }
-
-// NewAgentSummaryHandler wires the handler with LLM configuration.
 func NewAgentSummaryHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int) *AgentSummaryHandler {
 	return &AgentSummaryHandler{
 		db:           db,
@@ -50,6 +49,7 @@ func NewAgentSummaryHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, 
 		llmModel:     llmModel,
 		llmTimeout:   llmTimeout,
 		llmMaxTokens: llmMaxTokens,
+		store:        newAgentMessageRepo(db),
 	}
 }
 

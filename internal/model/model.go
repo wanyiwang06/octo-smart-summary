@@ -75,8 +75,6 @@ const (
 	// no worker dispatch is triggered.
 	TriggerAgent = 3
 )
->>>>>>> 521bd17 (feat(SUM-43): add TriggerAgent constant + refine endpoint scaffold (incomplete - needs LLM client wiring))
-)
 
 // Scheduled multi-participant confirm policy constants (summary_schedule.confirm_policy).
 const (

@@ -38,16 +38,6 @@ func BuildCitations(text string, messages []pipeline.Message, allMessages []pipe
 }
 // buildCitations builds a citation list from the summary text and original messages.
 // Only messages actually referenced in the text are included.
-// allMessages is the full message set (all channels) used for context lookup.
-// nameMap maps sender UIDs to display names; if nil or a UID is missing, the UID is used as-is.
-// BuildCitations is the exported wrapper of the internal buildCitations —
-// exposed so out-of-package callers (e.g. the agent summary handler that
-// persists agent-generated deliverables) can reuse the exact traditional
-// pipeline citation logic without reimplementing it. Signature and behavior
-// are identical to buildCitations.
-func BuildCitations(text string, messages []pipeline.Message, allMessages []pipeline.Message, nameMap map[string]string) []model.Citation {
-	return buildCitations(text, messages, allMessages, nameMap)
-}
 
 func buildCitations(text string, messages []pipeline.Message, allMessages []pipeline.Message, nameMap map[string]string) []model.Citation {
 	indexes := extractCitationIndexes(text)

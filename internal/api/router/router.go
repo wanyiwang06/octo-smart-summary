@@ -49,7 +49,6 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		// Isomorphic response shape with /summaries; born status=Completed +
 		// trigger_type=Agent, content pulled from agent_message on the given
 		// session_id. See handler/agent_summary.go.
-		v1.POST("/summaries/agent", handler.NewAgentSummaryHandler(db).CreateAgentSummary)
 		v1.POST("/summaries/batch-status", taskH.BatchStatus)
 		v1.GET("/summaries", taskH.ListSummaries)
 		v1.GET("/summaries/:id", taskH.GetSummary)

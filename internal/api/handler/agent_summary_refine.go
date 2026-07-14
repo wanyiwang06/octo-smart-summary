@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 )
 
 // refineAgentSummaryReq is the request body for POST /api/v1/summaries/{task_id}/refine.
@@ -109,28 +110,34 @@ func (h *AgentSummaryHandler) RefineAgentSummary(c *gin.Context) {
 		return
 	}
 
-	// 8. Invoke agent
+	// 8. Invoke agent with RunWithHistory
 	newSessionID := uuid.New().String()
-	result, err := runner.Run(c.Request.Context(), system, refineMessage)
+	history := []agent.Message{} // refine is a new session
+	newContent, newMsgs, err := runner.RunWithHistory(c.Request.Context(), system, history, refineMessage)
 	if err != nil {
-		log.Printf("[handler] RefineAgentSummary runner.Run failed session=%s: %v", newSessionID, err)
+		log.Printf("[handler] RefineAgentSummary runner.RunWithHistory failed session=%s: %v", newSessionID, err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "Agent 调用失败: " + err.Error()})
 		return
 	}
-	newContent := result
+
+	// 9. Persist agent messages BEFORE buildCitations (which reads from agent_message table)
+	if err := h.store.AppendMessages(c.Request.Context(), newSessionID, newMsgs); err != nil {
+		log.Printf("[handler] RefineAgentSummary AppendMessages failed session=%s: %v (citations will fallback to empty)", newSessionID, err)
+	}
+
 	if newContent == "" {
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "Agent 未产出内容"})
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "Agent 未产出有效回复"})
 		return
 	}
 
-	// 9. Build citations for the refined content
+	// 10. Build citations for the refined content
 	cits, cerr := h.buildCitationsForSession(c.Request.Context(), newSessionID, newContent, userID)
 	if cerr != nil {
 		log.Printf("[handler] RefineAgentSummary buildCitationsForSession failed session=%s: %v (fallback to empty)", newSessionID, cerr)
 		cits = nil
 	}
 
-	// 10. Build new snapshot (increment version, link to parent)
+	// 11. Build new snapshot (increment version, link to parent)
 	newVersion := snap.ContentVersion + 1
 	parentVersion := snap.ContentVersion
 	instructionCopy := req.Instruction
@@ -146,7 +153,7 @@ func (h *AgentSummaryHandler) RefineAgentSummary(c *gin.Context) {
 		UserInstruction:       &instructionCopy,
 	}
 
-	// 11. Insert new PersonalResult in a transaction
+	// 12. Insert new PersonalResult in a transaction
 	now := time.Now()
 	var newPRID int64
 	txErr := h.db.Transaction(func(tx *gorm.DB) error {
