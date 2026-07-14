@@ -68,6 +68,7 @@ const (
 const (
 	TriggerManual    = 1
 	TriggerScheduled = 2
+	TriggerAgent     = 3
 )
 
 // Scheduled multi-participant confirm policy constants (summary_schedule.confirm_policy).
