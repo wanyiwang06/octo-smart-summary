@@ -9,7 +9,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/gin-gonic/gin"
@@ -102,60 +101,52 @@ func (h *AgentSummaryHandler) RefineAgentSummary(c *gin.Context) {
 	// 6. Build refine message
 	refineMessage := buildRefineMessage(snap, &pr, req.Instruction)
 
-	// 7. Invoke agent (summary_refine profile)
-	newSessionID := uuid.New().String()
-	aReq := agent.Message{
-		Profile:   "summary_refine",
-		SessionID: newSessionID,
-		Messages: []agent.Message{
-			{Role: "user", Content: refineMessage},
-		},
-		CreatorUID: userID,
-		SpaceID:    task.SpaceID,
-	}
-	aResp, err := buildRunnerForProfile(c.Request.Context(), aReq)
+	// 7. Build runner for summary_refine profile
+	runner, system, err := buildRunner("summary_refine", userID, h.llmApiURL, h.llmApiKey, h.llmModel, h.llmTimeout, h.llmMaxTokens)
 	if err != nil {
-		log.Printf("[handler] RefineAgentSummary buildRunnerForProfile failed session=%s: %v", newSessionID, err)
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "Agent 调用失败: " + err.Error()})
+		log.Printf("[handler] RefineAgentSummary buildRunner failed: %v", err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "构建 agent runner 失败: " + err.Error()})
 		return
 	}
 
-	// Extract content from agent response (last assistant message)
-	newContent := ""
-	for i := len(aResp.Messages) - 1; i >= 0; i-- {
-		if aResp.Messages[i].Role == "assistant" && aResp.Messages[i].Content != "" {
-			newContent = aResp.Messages[i].Content
-			break
-		}
+	// 8. Invoke agent
+	newSessionID := uuid.New().String()
+	result, err := runner.Run(c.Request.Context(), system, refineMessage)
+	if err != nil {
+		log.Printf("[handler] RefineAgentSummary runner.Run failed session=%s: %v", newSessionID, err)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "Agent 调用失败: " + err.Error()})
+		return
 	}
+	newContent := result
 	if newContent == "" {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "Agent 未产出内容"})
 		return
 	}
 
-	// 8. Build citations for the refined content
+	// 9. Build citations for the refined content
 	cits, cerr := h.buildCitationsForSession(c.Request.Context(), newSessionID, newContent, userID)
 	if cerr != nil {
 		log.Printf("[handler] RefineAgentSummary buildCitationsForSession failed session=%s: %v (fallback to empty)", newSessionID, cerr)
 		cits = nil
 	}
 
-	// 9. Build new snapshot (increment version, link to parent)
-	newVersion := 1
-	oldVersion := 1
+	// 10. Build new snapshot (increment version, link to parent)
+	newVersion := snap.ContentVersion + 1
+	parentVersion := snap.ContentVersion
 	instructionCopy := req.Instruction
 	newSnap := &model.Snapshot{
 		SnapshotVersion:       1,
 		TaskID:                task.ID,
+		ContentVersion:        newVersion,
 		Requirement:           snap.Requirement,
 		Scope:                 snap.Scope,
 		ToolSummary:           snap.ToolSummary,
 		DataFreshnessNote:     snap.DataFreshnessNote,
-		ParentSnapshotVersion: &oldVersion,
+		ParentSnapshotVersion: &parentVersion,
 		UserInstruction:       &instructionCopy,
 	}
 
-	// 10. Insert new PersonalResult in a transaction
+	// 11. Insert new PersonalResult in a transaction
 	now := time.Now()
 	var newPRID int64
 	txErr := h.db.Transaction(func(tx *gorm.DB) error {
@@ -163,7 +154,6 @@ func (h *AgentSummaryHandler) RefineAgentSummary(c *gin.Context) {
 			TaskID:           task.ID,
 			ParticipantRefID: pr.ParticipantRefID,
 			UserID:           userID,
-			
 			Content:          newContent,
 			WorkerStatus:     model.PersonalStatusCompleted,
 			GeneratedAt:      &now,
@@ -179,7 +169,7 @@ func (h *AgentSummaryHandler) RefineAgentSummary(c *gin.Context) {
 		}
 		newPRID = newPR.ID
 
-		// Update task updated_at (optional)
+		// Update task updated_at
 		if err := tx.Model(&task).Update("updated_at", now).Error; err != nil {
 			return fmt.Errorf("update task updated_at: %w", err)
 		}

@@ -33,14 +33,24 @@ import (
 //     StrictSpace); accepting them from the request body would break the identity
 //     boundary the Chat handler already enforces.
 type AgentSummaryHandler struct {
-	db *gorm.DB
+	db           *gorm.DB
+	llmApiURL    string
+	llmApiKey    string
+	llmModel     string
+	llmTimeout   int
+	llmMaxTokens int
 }
 
-// NewAgentSummaryHandler wires the handler; kept parallel to NewTaskHandler.
-// Only db is required because this handler never calls the summary worker or
-// resolves channels through the IM DB.
-func NewAgentSummaryHandler(db *gorm.DB) *AgentSummaryHandler {
-	return &AgentSummaryHandler{db: db}
+// NewAgentSummaryHandler wires the handler with LLM configuration.
+func NewAgentSummaryHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int) *AgentSummaryHandler {
+	return &AgentSummaryHandler{
+		db:           db,
+		llmApiURL:    llmApiURL,
+		llmApiKey:    llmApiKey,
+		llmModel:     llmModel,
+		llmTimeout:   llmTimeout,
+		llmMaxTokens: llmMaxTokens,
+	}
 }
 
 // createAgentSummaryReq mirrors the SUM-15 v1.0 contract exactly. Only
