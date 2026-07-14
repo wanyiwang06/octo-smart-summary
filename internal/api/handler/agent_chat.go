@@ -147,9 +147,10 @@ func (h *AgentChatHandler) buildSummaryRegistryWithUID(uid string) (*agent.Regis
 
 // agentChatRequest 是聊天入参。session_id 由前端生成并必传，后端据此串联多轮历史。
 // profile 可选，指定使用的场景名（默认 "chat"）；总结场景传 "summary" 以挂载真实工具。
-// referenced_task_ids 可选，仅在**首轮**（该 session 的 history 为空时）生效：
-// 后端会 fetch 引用的总结产物 + 快照，作为 system message 的附录喂给 agent。
-// 后续轮次此字段被忽略（引用一次锁定，见 CHAT-REFERENCE-BASED-DESIGN-v1 决策 3）。
+// referenced_task_ids 可选：每轮都会重新 fetch 引用总结,拼进 system prompt。
+// 前端可全程带此字段(引用锁定后每轮都用相同 id),后端每轮拉最新版本;
+// 若空数组或字段缺,当轮 chat 无引用材料(等同普通 chat)。
+// 见 CHAT-REFERENCE-BASED-DESIGN-v1。
 type agentChatRequest struct {
 	Message           string  `json:"message"`
 	SessionID         string  `json:"session_id"`
@@ -225,9 +226,11 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		return
 	}
 
-	// 首轮 + 带引用 → fetch 引用总结的产物和快照,拼进 system prompt。
-	// 首轮判断:LoadHistory 返回空(该 session 还没落任何消息)。
-	if len(history) == 0 && len(req.ReferencedTaskIDs) > 0 {
+	// 每轮 chat 都重新拼引用进 system(每次拉最新版本、多轮迭代持续可见)。
+	// system 每轮独立传给 LLM 不会自动继承 —— 首轮限定的老实现会导致
+	// 第 2+ 轮 agent 看不到引用材料(见 CHAT-REFERENCE-BASED-DESIGN-v1
+	// 多轮上下文修复)。token 增量按引用大小约 5-15K/轮,可接受。
+	if len(req.ReferencedTaskIDs) > 0 {
 		spaceID := middleware.GetSpaceID(c)
 		refContext, loaded, refErr := buildReferencedSummariesContext(
 			ctx, h.db, spaceID, uid, req.ReferencedTaskIDs)
@@ -426,9 +429,9 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		return
 	}
 
-	// 首轮 + 带引用 → fetch 引用总结的产物和快照,拼进 system prompt。
-	// 与 Chat 逻辑严格一致(见 agentChatRequest 字段说明)。
-	if len(history) == 0 && len(req.ReferencedTaskIDs) > 0 {
+	// 每轮 chat 都重新拼引用进 system —— 与 Chat 逻辑严格一致
+	// (见 CHAT-REFERENCE-BASED-DESIGN-v1 多轮上下文修复)。
+	if len(req.ReferencedTaskIDs) > 0 {
 		spaceID := middleware.GetSpaceID(c)
 		refContext, loaded, refErr := buildReferencedSummariesContext(
 			ctx, h.db, spaceID, uid, req.ReferencedTaskIDs)
