@@ -300,6 +300,25 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			log.Printf("[handler] buildCitationsForSession failed session=%s: %v (fallback to empty)", req.SessionID, cerr)
 			cits = nil
 		}
+		// Reference-based fallback (CHAT-REFERENCE-BASED-DESIGN-v1):
+		// If session has no tool traces (typical refine flow — agent didn't
+		// re-fetch, just rewrote from the referenced summary's content) AND
+		// user referenced existing summaries, borrow citations from the FIRST
+		// referenced task's PR. The content preserves original [n] markers
+		// from the referenced summary (per summary_refine.md rule), so we
+		// preserve the citation index alignment by borrowing verbatim.
+		//
+		// Without this, refined content shows "[n]" markers pointing at an
+		// empty citations array → frontend renders broken/dangling refs.
+		if len(cits) == 0 && len(req.ReferencedTaskIDs) > 0 {
+			borrowedCits := h.borrowCitationsFromReference(
+				c.Request.Context(), req.ReferencedTaskIDs[0], spaceID, userID)
+			if len(borrowedCits) > 0 {
+				cits = borrowedCits
+				log.Printf("[handler] CreateAgentSummary borrowed %d citations from referenced task_id=%d session=%s",
+					len(cits), req.ReferencedTaskIDs[0], req.SessionID)
+			}
+		}
 		creatorPR.SetCitations(cits)
 		// Build v1 snapshot for agent-generated summary
 		snapshot := h.buildSnapshotV1(tx, req.SessionID, &task, req.Sources)

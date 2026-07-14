@@ -144,3 +144,51 @@ func serializeReferencedTaskIDs(ids []int64) *string {
 	s := string(b)
 	return &s
 }
+
+// borrowCitationsFromReference returns the citations JSON of the specified
+// referenced task's PersonalResult, so a refine-flow save can preserve the
+// [n] citation index alignment when its own session had no tool traces.
+//
+// Returns []model.Citation{} (never nil) if:
+//   - the referenced task isn't found in the caller's space
+//   - no PR exists for it
+//   - the PR's citations_json is empty/invalid
+//
+// See CHAT-REFERENCE-BASED-DESIGN-v1 §citation preservation.
+func (h *AgentSummaryHandler) borrowCitationsFromReference(
+	ctx context.Context,
+	refTaskID int64,
+	spaceID string,
+	userID string,
+) []model.Citation {
+	// Space-scoped lookup: refuse to leak citations across spaces.
+	var task model.SummaryTask
+	if err := h.db.WithContext(ctx).
+		Select("id, space_id").
+		Where("id = ? AND space_id = ?", refTaskID, spaceID).
+		First(&task).Error; err != nil {
+		return []model.Citation{}
+	}
+
+	// Prefer caller's own PR (per-creator citation set); fall back to any PR
+	// for this task if not found.
+	var pr model.PersonalResult
+	err := h.db.WithContext(ctx).
+		Where("task_id = ? AND user_id = ?", refTaskID, userID).
+		Order("id DESC").
+		First(&pr).Error
+	if err != nil {
+		if err2 := h.db.WithContext(ctx).
+			Where("task_id = ?", refTaskID).
+			Order("id DESC").
+			First(&pr).Error; err2 != nil {
+			return []model.Citation{}
+		}
+	}
+
+	cits := pr.GetCitations()
+	if cits == nil {
+		return []model.Citation{}
+	}
+	return cits
+}
