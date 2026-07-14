@@ -65,6 +65,7 @@ const (
 )
 
 // Trigger type constants.
+// Trigger types for summary_task.trigger_type
 const (
 	TriggerManual    = 1
 	TriggerScheduled = 2

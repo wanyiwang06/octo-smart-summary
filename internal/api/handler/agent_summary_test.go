@@ -38,12 +38,8 @@ func setupAgentSummaryTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
-// mockTokenResolver provides test auth
-type mockTokenResolver struct{}
-
-func (m *mockTokenResolver) GetUserID(token string) (string, error) {
-	return token, nil // use token as user_id for simplicity
-}
+// mockTokenResolver 已在 auth_test.go 定义,此处复用(不重复声明)。
+// 该 mock 实现 middleware.TokenResolver 接口 (ResolveUID)。
 
 // setupAgentSummaryRouter sets up a test gin router with the handler
 func setupAgentSummaryRouter(h *AgentSummaryHandler) *gin.Engine {
@@ -59,7 +55,7 @@ func setupAgentSummaryRouter(h *AgentSummaryHandler) *gin.Engine {
 // behavior is unchanged (no resolve, direct validation and pass).
 func TestCreateAgentSummary_ProvidedOriginChannelDirectPass(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db)
+	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed: session with assistant message (deliverable content)
@@ -74,10 +70,10 @@ func TestCreateAgentSummary_ProvidedOriginChannelDirectPass(t *testing.T) {
 	// Request with explicitly provided origin_channel_id and type
 	channelID := "CH-PROVIDED"
 	reqBody := map[string]interface{}{
-		"session_id":           sessionID,
-		"origin_channel_id":    channelID,
-		"origin_channel_type":  1,
-		"title":                "Test Summary",
+		"session_id":          sessionID,
+		"origin_channel_id":   channelID,
+		"origin_channel_type": 1,
+		"title":               "Test Summary",
 	}
 	bodyBytes, _ := json.Marshal(reqBody)
 
@@ -114,7 +110,7 @@ func TestCreateAgentSummary_ProvidedOriginChannelDirectPass(t *testing.T) {
 // and successfully creates the task with the resolved values.
 func TestCreateAgentSummary_NotProvidedResolveSuccess(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db)
+	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed: session with assistant message (deliverable) and fetch_channel tool call
@@ -173,7 +169,7 @@ func TestCreateAgentSummary_NotProvidedResolveSuccess(t *testing.T) {
 // returns 400 40001 with the new error message.
 func TestCreateAgentSummary_NotProvidedResolveFailure(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db)
+	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed: session with only assistant content, no fetch_channel tool call
@@ -218,7 +214,7 @@ func TestCreateAgentSummary_NotProvidedResolveFailure(t *testing.T) {
 // is explicitly provided as an empty string, the handler returns the old error message.
 func TestCreateAgentSummary_ExplicitlyEmptyString(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db)
+	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed: session with assistant content
@@ -264,7 +260,7 @@ func TestCreateAgentSummary_ExplicitlyEmptyString(t *testing.T) {
 // is out of valid range (1-3), the handler returns 400 40001 with the original message.
 func TestCreateAgentSummary_InvalidChannelType(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db)
+	h := NewAgentSummaryHandler(db, "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed: session with assistant content
@@ -278,9 +274,9 @@ func TestCreateAgentSummary_InvalidChannelType(t *testing.T) {
 
 	// Request with invalid origin_channel_type (0 or 4+)
 	reqBody := map[string]interface{}{
-		"session_id":           sessionID,
-		"origin_channel_id":    "CH-VALID",
-		"origin_channel_type":  0, // invalid (below 1)
+		"session_id":          sessionID,
+		"origin_channel_id":   "CH-VALID",
+		"origin_channel_type": 0, // invalid (below 1)
 	}
 	bodyBytes, _ := json.Marshal(reqBody)
 

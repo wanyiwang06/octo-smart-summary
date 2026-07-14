@@ -49,7 +49,6 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		// Isomorphic response shape with /summaries; born status=Completed +
 		// trigger_type=Agent, content pulled from agent_message on the given
 		// session_id. See handler/agent_summary.go.
-		v1.POST("/summaries/agent", handler.NewAgentSummaryHandler(db).CreateAgentSummary)
 		v1.POST("/summaries/batch-status", taskH.BatchStatus)
 		v1.GET("/summaries", taskH.ListSummaries)
 		v1.GET("/summaries/:id", taskH.GetSummary)
@@ -114,6 +113,12 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		agentGroup.POST("/chat/stream", agentChatH.ChatStream)
 		agentGroup.GET("/chat/history", agentChatH.History)
 	}
+
+	// Agent summary: persists agent-generated summaries and supports refine workflow.
+	// Shares the same LLM configuration as agent chat.
+	agentSummaryH := handler.NewAgentSummaryHandler(db, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
+	v1.POST("/summaries/agent", agentSummaryH.CreateAgentSummary)
+	v1.POST("/summaries/:task_id/refine", agentSummaryH.RefineAgentSummary)
 
 	return r
 }
