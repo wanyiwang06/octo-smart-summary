@@ -411,20 +411,13 @@ func TestRefineBuildMessage_IncludesAllFields(t *testing.T) {
 	}
 }
 
-// TestRefineSnapshotParentLink_ConstructedCorrectly: 验证 refine 构造新 snapshot 时:
-//   - ContentVersion = 旧 + 1
-//   - ParentSnapshotVersion 指向旧 ContentVersion
-//   - UserInstruction 记录本次指令
-//   - Scope/Requirement/ToolSummary/DataFreshnessNote 沿用旧值
+// TestRefineSnapshot_BuildRefineSnapshot: 验证 handler 里第 11 步的 snapshot 构造。
 //
-// 这是 handler 内的组装逻辑,提取为单独函数测更快 —— 但当前 handler 里是内联的,
-// 所以我们通过跑一次完整 refine flow 后从 DB 读回新 PersonalResult 验证。
-// 该测试需要 mock agent 返回固定内容,受限于 buildRunner 是全局函数难以注入,
-// 这里仅覆盖数据准备 + fake chatter 通过 t.Skip 说明依赖后续 refactor;
-// 主要断言下沉到"通过 buildRefineMessage + newSnap 手写构造"的等价测试。
-func TestRefineSnapshotParentLink_Construction(t *testing.T) {
-	// 直接手工模拟 handler 里 newSnap 构造逻辑,断言链正确
-	parentVer := 1
+// 这个 test 直接调用生产代码的 `buildRefineSnapshot()`(agent_summary_refine.go),
+// 而不是像旧版那样在 test 函数体里手写一遍相同逻辑再断言 —— 后者是"自证自洽"的
+// 假测试,handler 里 ParentSnapshotVersion 写反 / ContentVersion+1 改错时不会 fail。
+// 现在改成同一份代码同一份断言,改错必挂。
+func TestRefineSnapshot_BuildRefineSnapshot(t *testing.T) {
 	oldSnap := &model.Snapshot{
 		SnapshotVersion:       1,
 		TaskID:                100,
@@ -436,77 +429,295 @@ func TestRefineSnapshotParentLink_Construction(t *testing.T) {
 		ParentSnapshotVersion: nil, // v1 首版无 parent
 		UserInstruction:       nil,
 	}
-	// 模拟 handler 里的 newSnap 构造(agent_summary_refine.go:140-154)
-	newVer := oldSnap.ContentVersion + 1
-	instruction := "扩充风险章节"
-	newSnap := &model.Snapshot{
-		SnapshotVersion:       1,
-		TaskID:                oldSnap.TaskID,
-		ContentVersion:        newVer,
-		Requirement:           oldSnap.Requirement,
-		Scope:                 oldSnap.Scope,
-		ToolSummary:           oldSnap.ToolSummary,
-		DataFreshnessNote:     oldSnap.DataFreshnessNote,
-		ParentSnapshotVersion: &parentVer, // 指向旧 version
-		UserInstruction:       &instruction,
-	}
 
-	// 断言链
+	// 直接调用生产函数 —— 改错必挂
+	newSnap := buildRefineSnapshot(oldSnap, 100, "扩充风险章节")
+
 	if newSnap.ContentVersion != 2 {
-		t.Errorf("ContentVersion: expected 2, got %d", newSnap.ContentVersion)
+		t.Errorf("ContentVersion: expected 2 (oldSnap.ContentVersion+1), got %d", newSnap.ContentVersion)
 	}
 	if newSnap.ParentSnapshotVersion == nil || *newSnap.ParentSnapshotVersion != 1 {
-		t.Errorf("ParentSnapshotVersion: expected *int(1), got %v", newSnap.ParentSnapshotVersion)
+		t.Errorf("ParentSnapshotVersion: expected *int(1) pointing to old ContentVersion, got %v", newSnap.ParentSnapshotVersion)
 	}
 	if newSnap.UserInstruction == nil || *newSnap.UserInstruction != "扩充风险章节" {
 		t.Errorf("UserInstruction: expected 扩充风险章节, got %v", newSnap.UserInstruction)
 	}
-	// 沿用字段
+	if newSnap.SnapshotVersion != 1 {
+		t.Errorf("SnapshotVersion: expected 1 (schema version, not bumped by refine), got %d", newSnap.SnapshotVersion)
+	}
+	if newSnap.TaskID != 100 {
+		t.Errorf("TaskID: expected 100, got %d", newSnap.TaskID)
+	}
+	// 沿用字段:refine 不改抓取 scope
 	if newSnap.Requirement != oldSnap.Requirement {
 		t.Errorf("Requirement not carried over")
 	}
-	if newSnap.Scope.ChannelIDs[0] != "ch-x" {
-		t.Errorf("Scope not carried over")
+	if len(newSnap.Scope.ChannelIDs) != 1 || newSnap.Scope.ChannelIDs[0] != "ch-x" {
+		t.Errorf("Scope.ChannelIDs not carried over: %v", newSnap.Scope.ChannelIDs)
 	}
-	if newSnap.ToolSummary[0] != "fetch_channel x 1" {
-		t.Errorf("ToolSummary not carried over")
+	if len(newSnap.ToolSummary) != 1 || newSnap.ToolSummary[0] != "fetch_channel x 1" {
+		t.Errorf("ToolSummary not carried over: %v", newSnap.ToolSummary)
 	}
 	if newSnap.DataFreshnessNote != "note" {
 		t.Errorf("DataFreshnessNote not carried over")
 	}
 }
 
-// ─── 50000 分支(runner 失败)+ 事务回滚 ─────────────────────
-//
-// 说明:handler 走到 runner.RunWithHistory 需要真正的 LLM 或注入 fake chatter。
-// 当前 handler 通过全局 buildRunner 构造 runner,没有 test seam 让我们注入 fake chatter,
-// 所以 50000 分支和"完整成功链路 + 事务回滚"两条测试当前**无法在单测里完整跑**。
-//
-// 缓解:
-//  1. 前置 4 个分支(40001-40004)+ snapshot 构造 + buildRefineMessage 已充分覆盖 handler 逻辑
-//  2. runner 失败路径的 handler 行为(log + 500 响应)与其他 handler(agent_chat.go)一致,
-//     且 fakeErrChatter 模式在 agent_chat_test.go:33 已验证,同一实现风格
-//  3. 事务回滚由 gorm.Transaction 语义保证,rollback 分支单测意义有限
-//
-// 后续增强:如果需要严格单测这两条,建议 refactor handler 引入 runner factory 接口,
-// 让测试注入 fake。当前状态已满足"关键错误分支 + 关键组装逻辑"覆盖。
-func TestRefineAgentSummary_UntestedBranchesDocumented(t *testing.T) {
-	t.Log("以下 2 条分支需要 runner factory 依赖注入 refactor 才能单测:")
-	t.Log("  - 50000: runner.RunWithHistory 返回 error(runner 失败)")
-	t.Log("  - 50000: 事务 tx.Create 失败回滚(DB 层错误)")
-	t.Log("当前覆盖:40001×2 + 40002 + 40003×2 + 40004×2 + snapshot 链 + refine message 组装 = 8+ 测试点")
-	// 静默通过,不 fail 也不 skip,只做记录
+// TestRefineSnapshot_MultiRoundLineage: 验证多轮 refine 的 lineage 链是否正确 —
+// v1 → v2 → v3,每一版 parent 指向前一版 ContentVersion。
+// 这是需求 v1.0 里 lineage 链的核心断言。
+func TestRefineSnapshot_MultiRoundLineage(t *testing.T) {
+	// v1(首版,parent=nil):
+	snap1 := &model.Snapshot{
+		SnapshotVersion: 1, TaskID: 200, ContentVersion: 1,
+		Requirement: "req", Scope: model.SnapshotScope{ChannelIDs: []string{"c"}},
+	}
+	// v1 → v2
+	snap2 := buildRefineSnapshot(snap1, 200, "第一次改")
+	if snap2.ContentVersion != 2 || snap2.ParentSnapshotVersion == nil || *snap2.ParentSnapshotVersion != 1 {
+		t.Fatalf("v1→v2 lineage broken: version=%d parent=%v", snap2.ContentVersion, snap2.ParentSnapshotVersion)
+	}
+	// v2 → v3
+	snap3 := buildRefineSnapshot(snap2, 200, "第二次改")
+	if snap3.ContentVersion != 3 || snap3.ParentSnapshotVersion == nil || *snap3.ParentSnapshotVersion != 2 {
+		t.Fatalf("v2→v3 lineage broken: version=%d parent=%v", snap3.ContentVersion, snap3.ParentSnapshotVersion)
+	}
+	if snap3.UserInstruction == nil || *snap3.UserInstruction != "第二次改" {
+		t.Errorf("v3 UserInstruction should be latest instruction, got %v", snap3.UserInstruction)
+	}
+}
+
+// ─── 50000 分支 + 事务回滚(用 runnerFactory 注入 fake runner)─────────
+
+// fakeRunner 实现 refineRunner 接口,用于测试注入 —— 可以返回错误、空 content、
+// 或成功产出。**不需要真的 LLM,不需要 fake chatter 层层构造**。
+type fakeRunner struct {
+	reply   string          // 成功时返回的 content
+	newMsgs []agent.Message // 成功时返回的新消息(用于 AppendMessages)
+	err     error           // 非 nil 则 RunWithHistory 返回此错误
+}
+
+func (f *fakeRunner) RunWithHistory(ctx context.Context, system string, history []agent.Message, userInput string) (string, []agent.Message, error) {
+	if f.err != nil {
+		return "", nil, f.err
+	}
+	return f.reply, f.newMsgs, nil
+}
+
+// TestRefineAgentSummary_RunnerFailure_500: 50000 - runner.RunWithHistory 返回错误
+func TestRefineAgentSummary_RunnerFailure_500(t *testing.T) {
+	db, skip := setupRefineTestDB(t)
+	if skip {
+		return
+	}
+	// 准备完整前置:task + PersonalResult with snapshot(前 4 个分支都要过)
+	task := model.SummaryTask{
+		ID: 5, TaskNo: "refine-test-runner-fail",
+		CreatorID:   "user-5",
+		Title:       "agent task for runner-failure test",
+		TriggerType: model.TriggerAgent,
+		Status:      model.StatusCompleted,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("insert task: %v", err)
+	}
+	now := time.Now()
+	pr := model.PersonalResult{
+		TaskID: task.ID, UserID: "user-5",
+		Content: "v1 正文", WorkerStatus: model.PersonalStatusCompleted,
+		GeneratedAt: &now, SubmittedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}
+	// 塞一个 snapshot,让 40004 分支能过
+	pr.SetSnapshot(&model.Snapshot{
+		SnapshotVersion: 1, TaskID: task.ID, ContentVersion: 1,
+		Requirement: "req", Scope: model.SnapshotScope{ChannelIDs: []string{"c"}},
+	})
+	if err := db.Create(&pr).Error; err != nil {
+		t.Fatalf("insert pr: %v", err)
+	}
+
+	h := newRefineTestHandler(db)
+	// 注入 fake runner 让 RunWithHistory 返回错误
+	h.runnerFactory = func(profile, uid string) (refineRunner, string, error) {
+		return &fakeRunner{err: errors.New("simulated LLM timeout")}, "system-prompt", nil
+	}
+	r := setupRefineRouter(h, "user-5")
+
+	w := doRefine(t, r, "5", "改一下")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 got %d body=%s", w.Code, w.Body.String())
+	}
+	resp := parseRefineResp(t, w)
+	if resp.Code != 50000 {
+		t.Errorf("expected code 50000, got %d msg=%s", resp.Code, resp.Message)
+	}
+	if !strings.Contains(resp.Message, "Agent") && !strings.Contains(resp.Message, "agent") {
+		t.Errorf("expected message about agent failure, got %q", resp.Message)
+	}
+
+	// 关键:runner 失败时 **必须没有新 PersonalResult 落库**
+	var count int64
+	db.Model(&model.PersonalResult{}).Where("task_id = ?", task.ID).Count(&count)
+	if count != 1 {
+		t.Errorf("expected 1 PersonalResult (only original), got %d — runner failure should NOT insert new row", count)
+	}
+}
+
+// TestRefineAgentSummary_AgentEmptyReply_500: 50000 - runner 成功返回但 content 为空
+func TestRefineAgentSummary_AgentEmptyReply_500(t *testing.T) {
+	db, skip := setupRefineTestDB(t)
+	if skip {
+		return
+	}
+	task := model.SummaryTask{
+		ID: 6, TaskNo: "refine-test-empty-reply",
+		CreatorID:   "user-6",
+		Title:       "agent task for empty-reply test",
+		TriggerType: model.TriggerAgent,
+		Status:      model.StatusCompleted,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("insert task: %v", err)
+	}
+	now := time.Now()
+	pr := model.PersonalResult{
+		TaskID: task.ID, UserID: "user-6",
+		Content: "v1", WorkerStatus: model.PersonalStatusCompleted,
+		GeneratedAt: &now, SubmittedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}
+	pr.SetSnapshot(&model.Snapshot{
+		SnapshotVersion: 1, TaskID: task.ID, ContentVersion: 1, Requirement: "req",
+	})
+	if err := db.Create(&pr).Error; err != nil {
+		t.Fatalf("insert pr: %v", err)
+	}
+
+	h := newRefineTestHandler(db)
+	// runner 成功但产出为空字符串
+	h.runnerFactory = func(profile, uid string) (refineRunner, string, error) {
+		return &fakeRunner{reply: "", newMsgs: nil}, "system-prompt", nil
+	}
+	r := setupRefineRouter(h, "user-6")
+
+	w := doRefine(t, r, "6", "改一下")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 got %d body=%s", w.Code, w.Body.String())
+	}
+	resp := parseRefineResp(t, w)
+	if resp.Code != 50000 {
+		t.Errorf("expected code 50000, got %d msg=%s", resp.Code, resp.Message)
+	}
+
+	// 空 reply 时也不能有新 PersonalResult 落库
+	var count int64
+	db.Model(&model.PersonalResult{}).Where("task_id = ?", task.ID).Count(&count)
+	if count != 1 {
+		t.Errorf("expected 1 PersonalResult, got %d", count)
+	}
+}
+
+// TestRefineAgentSummary_Success_FullLifecycle: 成功链路 —— 走完 runner + tx + 响应,
+// 断言:①201 应答 ②DB 里新 PersonalResult(version 递增)③snapshot lineage 链正确
+// ④response body 里 content/citations/new_version 字段齐
+func TestRefineAgentSummary_Success_FullLifecycle(t *testing.T) {
+	db, skip := setupRefineTestDB(t)
+	if skip {
+		return
+	}
+	task := model.SummaryTask{
+		ID: 7, TaskNo: "refine-test-success",
+		CreatorID:   "user-7",
+		Title:       "agent task for success e2e",
+		TriggerType: model.TriggerAgent,
+		Status:      model.StatusCompleted,
+	}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatalf("insert task: %v", err)
+	}
+	now := time.Now()
+	pr := model.PersonalResult{
+		TaskID: task.ID, UserID: "user-7",
+		Content: "v1 正文,风险章节偏简略", WorkerStatus: model.PersonalStatusCompleted,
+		GeneratedAt: &now, SubmittedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}
+	pr.SetSnapshot(&model.Snapshot{
+		SnapshotVersion: 1, TaskID: task.ID, ContentVersion: 1,
+		Requirement:       "总结群内决策",
+		Scope:             model.SnapshotScope{ChannelIDs: []string{"c-1"}},
+		ToolSummary:       []string{"fetch_channel x 1"},
+		DataFreshnessNote: "note",
+	})
+	if err := db.Create(&pr).Error; err != nil {
+		t.Fatalf("insert pr: %v", err)
+	}
+
+	h := newRefineTestHandler(db)
+	// runner 成功返回新 content
+	h.runnerFactory = func(profile, uid string) (refineRunner, string, error) {
+		if profile != "summary_refine" {
+			t.Errorf("expected profile summary_refine, got %s", profile)
+		}
+		if uid != "user-7" {
+			t.Errorf("expected uid user-7, got %s", uid)
+		}
+		return &fakeRunner{
+			reply:   "v2 正文,风险章节已扩充成完整段落。",
+			newMsgs: []agent.Message{{Role: "assistant", Content: "v2 正文,风险章节已扩充成完整段落。"}},
+		}, "system-prompt", nil
+	}
+	r := setupRefineRouter(h, "user-7")
+
+	w := doRefine(t, r, "7", "把风险章节扩充成一整段")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d body=%s", w.Code, w.Body.String())
+	}
+	resp := parseRefineResp(t, w)
+	if resp.Code != 0 {
+		t.Errorf("expected code 0, got %d msg=%s", resp.Code, resp.Message)
+	}
+
+	// 断言响应体字段(data 是 gin.H,需要解为 map)
+	data, ok := resp.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("resp.Data expected map, got %T body=%s", resp.Data, w.Body.String())
+	}
+	if v, _ := data["new_version"].(float64); int(v) != 2 {
+		t.Errorf("new_version: expected 2, got %v", data["new_version"])
+	}
+	if v, _ := data["content"].(string); !strings.Contains(v, "v2") {
+		t.Errorf("content: expected v2 marker, got %q", v)
+	}
+
+	// 断言 DB 里有 2 条 PersonalResult(旧 v1 + 新 v2)
+	var prs []model.PersonalResult
+	db.Where("task_id = ?", task.ID).Order("id ASC").Find(&prs)
+	if len(prs) != 2 {
+		t.Fatalf("expected 2 PersonalResults after refine, got %d", len(prs))
+	}
+	newestPR := prs[1]
+	if newestPR.Content == "" || !strings.Contains(newestPR.Content, "v2") {
+		t.Errorf("newest PR content wrong: %q", newestPR.Content)
+	}
+	// 断言 lineage 链
+	newSnap := newestPR.GetSnapshot()
+	if newSnap == nil {
+		t.Fatalf("newest PR should have snapshot")
+	}
+	if newSnap.ContentVersion != 2 {
+		t.Errorf("newSnap.ContentVersion: expected 2, got %d", newSnap.ContentVersion)
+	}
+	if newSnap.ParentSnapshotVersion == nil || *newSnap.ParentSnapshotVersion != 1 {
+		t.Errorf("newSnap.ParentSnapshotVersion: expected *int(1), got %v", newSnap.ParentSnapshotVersion)
+	}
+	if newSnap.UserInstruction == nil || *newSnap.UserInstruction != "把风险章节扩充成一整段" {
+		t.Errorf("newSnap.UserInstruction wrong: %v", newSnap.UserInstruction)
+	}
 }
 
 // ─── Sanity: 确认 model.TriggerAgent 常量存在(SUM-43 新增)─────
 func TestModelTriggerAgentConstantExists(t *testing.T) {
-	// 只要引用编译过就算通过
 	if model.TriggerAgent == 0 {
-		t.Log("model.TriggerAgent value:", model.TriggerAgent)
-	}
-	// 顺便断言它不为 0(和 default 值区分开)
-	if model.TriggerAgent == 0 {
-		t.Error("model.TriggerAgent should not be 0 (would clash with default)")
+		t.Error("model.TriggerAgent should not be 0 (would clash with default trigger_type value)")
 	}
 }
 

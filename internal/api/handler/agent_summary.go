@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -8,6 +9,7 @@ import (
 	"sort"
 	"unicode/utf8"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
@@ -40,7 +42,24 @@ type AgentSummaryHandler struct {
 	llmTimeout   int
 	llmMaxTokens int
 	store        agentHistoryStore
+	// runnerFactory is an optional test-only hook for injecting a fake agent
+	// runner without going through the real LLM. When nil (production path),
+	// newRunner falls back to buildRunner with handler's LLM config.
+	// Returns refineRunner (an interface, so tests can plug in a fake struct)
+	// rather than *agent.Runner (a concrete type whose dependencies are
+	// unexported).
+	// Not exposed via NewAgentSummaryHandler — tests assign this field
+	// directly using same-package access.
+	runnerFactory func(profile, uid string) (refineRunner, string, error)
 }
+
+// refineRunner is the minimal subset of *agent.Runner used by RefineAgentSummary.
+// Declared as an interface (not a concrete type) so tests can inject a fake
+// without depending on unexported types in the agent package.
+type refineRunner interface {
+	RunWithHistory(ctx context.Context, system string, history []agent.Message, userInput string) (string, []agent.Message, error)
+}
+
 func NewAgentSummaryHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int) *AgentSummaryHandler {
 	return &AgentSummaryHandler{
 		db:           db,

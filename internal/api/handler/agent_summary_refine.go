@@ -9,12 +9,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 )
 
 // refineAgentSummaryReq is the request body for POST /api/v1/summaries/{task_id}/refine.
@@ -102,8 +102,9 @@ func (h *AgentSummaryHandler) RefineAgentSummary(c *gin.Context) {
 	// 6. Build refine message
 	refineMessage := buildRefineMessage(snap, &pr, req.Instruction)
 
-	// 7. Build runner for summary_refine profile
-	runner, system, err := buildRunner("summary_refine", userID, h.llmApiURL, h.llmApiKey, h.llmModel, h.llmTimeout, h.llmMaxTokens)
+	// 7. Build runner for summary_refine profile.
+	// Prefer runnerFactory override if set (used by tests to inject fake runner).
+	runner, system, err := h.newRunner("summary_refine", userID)
 	if err != nil {
 		log.Printf("[handler] RefineAgentSummary buildRunner failed: %v", err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "构建 agent runner 失败: " + err.Error()})
@@ -137,21 +138,13 @@ func (h *AgentSummaryHandler) RefineAgentSummary(c *gin.Context) {
 		cits = nil
 	}
 
-	// 11. Build new snapshot (increment version, link to parent)
-	newVersion := snap.ContentVersion + 1
-	parentVersion := snap.ContentVersion
-	instructionCopy := req.Instruction
-	newSnap := &model.Snapshot{
-		SnapshotVersion:       1,
-		TaskID:                task.ID,
-		ContentVersion:        newVersion,
-		Requirement:           snap.Requirement,
-		Scope:                 snap.Scope,
-		ToolSummary:           snap.ToolSummary,
-		DataFreshnessNote:     snap.DataFreshnessNote,
-		ParentSnapshotVersion: &parentVersion,
-		UserInstruction:       &instructionCopy,
-	}
+	// 11. Build new snapshot (increment version, link to parent).
+	// Extracted to buildRefineSnapshot so both handler AND unit tests exercise
+	// the SAME construction code — prevents the "self-verifying copy" testing
+	// antipattern where a test copies the logic into itself and asserts on
+	// its own copy (see SUM-43 code review).
+	newSnap := buildRefineSnapshot(snap, task.ID, req.Instruction)
+	newVersion := newSnap.ContentVersion
 
 	// 12. Insert new PersonalResult in a transaction
 	now := time.Now()
@@ -239,4 +232,44 @@ citations:
 		instruction,
 	)
 	return msg
+}
+
+// buildRefineSnapshot constructs the new Snapshot for a refined summary.
+// Extracted from the RefineAgentSummary handler so that both production code
+// and unit tests exercise the SAME construction — this eliminates the
+// "self-verifying copy" testing antipattern where a test hand-copies the
+// handler's construction into itself and asserts on its own copy.
+//
+// Contract (SUM-43 spec §11):
+//   - ContentVersion = oldSnap.ContentVersion + 1
+//   - ParentSnapshotVersion = oldSnap.ContentVersion (lineage link)
+//   - UserInstruction = this round's instruction
+//   - Scope / Requirement / ToolSummary / DataFreshnessNote: carry over from oldSnap
+//     (refine does not change the scope; a spec change would be a new snapshot_version)
+func buildRefineSnapshot(oldSnap *model.Snapshot, taskID int64, instruction string) *model.Snapshot {
+	parentVer := oldSnap.ContentVersion
+	instructionCopy := instruction
+	return &model.Snapshot{
+		SnapshotVersion:       1,
+		TaskID:                taskID,
+		ContentVersion:        oldSnap.ContentVersion + 1,
+		Requirement:           oldSnap.Requirement,
+		Scope:                 oldSnap.Scope,
+		ToolSummary:           oldSnap.ToolSummary,
+		DataFreshnessNote:     oldSnap.DataFreshnessNote,
+		ParentSnapshotVersion: &parentVer,
+		UserInstruction:       &instructionCopy,
+	}
+}
+
+// newRunner constructs the agent runner for a request.
+// Prefers the runnerFactory override (used by tests to inject fake runner);
+// falls back to the shared package-level buildRunner using handler's
+// LLM configuration. Public/private split intentional: NewAgentSummaryHandler
+// stays 6-param, runnerFactory is assigned directly in same-package tests.
+func (h *AgentSummaryHandler) newRunner(profile, uid string) (refineRunner, string, error) {
+	if h.runnerFactory != nil {
+		return h.runnerFactory(profile, uid)
+	}
+	return buildRunner(profile, uid, h.llmApiURL, h.llmApiKey, h.llmModel, h.llmTimeout, h.llmMaxTokens)
 }
