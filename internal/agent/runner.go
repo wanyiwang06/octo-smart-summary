@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 )
@@ -26,9 +25,9 @@ type Event struct {
 	Type         string // "step_start" | "tool_start" | "tool_end" | "step_end"
 	Step         int    // Current step number (1-indexed)
 	OfSteps      int    // Total max steps
-	Tool         string // Tool name (for tool_start/tool_end)
+	Tool         string // Tool name (internal only: used to derive the abstract phase; NOT sent over SSE)
 	ElapsedMs    int64  // Elapsed time in milliseconds for this step/tool
-	Detail       string // Optional detail (e.g., fetch count)
+	Count        int    // Optional safe integer count (e.g. messages processed); 0 = omit. Replaces the old free-text Detail so no tool/channel-identifying strings leak.
 	StepHasTools bool   // Whether this step has tool calls (set by runner main loop)
 }
 
@@ -172,8 +171,8 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 
 			toolElapsed := time.Since(toolStart).Milliseconds()
 
-			// Extract detail from tool result (cheap count extraction)
-			detail := extractToolDetail(tc.Function.Name, out, i, len(calls))
+			// Extract a cheap, safe integer count from the tool result (0 = none).
+			count := extractToolCount(tc.Function.Name, out, i, len(calls))
 
 			if r.OnEvent != nil {
 				r.OnEvent(Event{
@@ -182,7 +181,7 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 					Step:      step,
 					OfSteps:   ofSteps,
 					ElapsedMs: toolElapsed,
-					Detail:    detail,
+					Count:     count,
 				})
 			}
 
@@ -197,61 +196,48 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 	return results
 }
 
-// extractToolDetail extracts a cheap count-based detail string from tool results.
-// Returns empty string if extraction fails or tool doesn't need detail.
-func extractToolDetail(toolName, result string, idx, total int) string {
+// extractToolCount extracts a cheap, safe integer count from a tool result.
+// Returns 0 when there is no meaningful count (the SSE layer then omits it).
+// It deliberately returns ONLY a number — never a tool/channel-identifying string —
+// so the progress stream cannot leak internal tool semantics. summarize_chunk has
+// no message count (its per-chunk index is intentionally not exposed), so it returns 0.
+func extractToolCount(toolName, result string, idx, total int) int {
 	switch toolName {
 	case "fetch_channel", "search_messages":
-		// Try to extract count from JSON result
 		var data map[string]interface{}
 		if err := json.Unmarshal([]byte(result), &data); err != nil {
-			return ""
+			return 0
 		}
-
-		// Try various count fields
-		count := 0
 		if messages, ok := data["messages"].([]interface{}); ok {
-			count = len(messages)
-		} else if total, ok := data["total"].(float64); ok {
-			count = int(total)
-		} else {
-			return ""
+			return len(messages)
 		}
-
-		// Format based on tool
-		switch toolName {
-		case "fetch_channel":
-			return fmt.Sprintf("已抓取 %d 条", count)
-		case "search_messages":
-			return fmt.Sprintf("命中 %d 条", count)
+		if t, ok := data["total"].(float64); ok {
+			return int(t)
 		}
+		return 0
 
 	case "filter_relevant":
 		// filter_relevant returns {"filtered_count": N, ...}
 		var data map[string]interface{}
 		if err := json.Unmarshal([]byte(result), &data); err != nil {
-			return ""
+			return 0
 		}
 		if filteredCount, ok := data["filtered_count"].(float64); ok {
-			return fmt.Sprintf("保留 %d 条", int(filteredCount))
+			return int(filteredCount)
 		}
-		return ""
-
-	case "summarize_chunk":
-		// Show current/total for map phase
-		return fmt.Sprintf("%d/%d", idx+1, total)
+		return 0
 
 	case "merge_summaries":
 		// merge_summaries returns {"chunk_count": N, ...}
 		var data map[string]interface{}
 		if err := json.Unmarshal([]byte(result), &data); err != nil {
-			return ""
+			return 0
 		}
 		if chunkCount, ok := data["chunk_count"].(float64); ok {
-			return fmt.Sprintf("合并 %d 段", int(chunkCount))
+			return int(chunkCount)
 		}
-		return ""
+		return 0
 	}
 
-	return ""
+	return 0
 }

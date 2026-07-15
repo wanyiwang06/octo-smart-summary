@@ -409,15 +409,17 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	// Create per-request SSE sink for thread-safe concurrent writes
 	sink := &sseSink{w: c.Writer}
 
-	// Inject OnEvent callback to emit SSE progress events
+	// Inject OnEvent callback to emit SSE progress events.
+	// SECURITY: we emit ONLY the abstract phase (+ a safe integer count) — never the
+	// raw tool name, label, or free-text detail — so the progress stream does not
+	// leak which concrete tools drive summarization.
 	runner.OnEvent = func(e agent.Event) {
 		if e.Type == "tool_end" {
-			// Emit tool-specific progress event with detail
-			phase, label := agent.GetToolLabel(e.Tool)
-			h.writeSSEProgressViaSink(sink, phase, label, e.Detail, e.Step, e.OfSteps, e.Tool, e.ElapsedMs)
+			phase, _ := agent.GetToolLabel(e.Tool)
+			h.writeSSEProgressViaSink(sink, phase, e.Step, e.OfSteps, e.Count, e.ElapsedMs)
 		} else if e.Type == "step_end" && !e.StepHasTools {
-			// Only emit step_end progress if this step had no tool calls (final answer step)
-			h.writeSSEProgressViaSink(sink, "other", "生成回复", "", e.Step, e.OfSteps, "", e.ElapsedMs)
+			// Final answer step (no tool calls) → abstract "reply" phase.
+			h.writeSSEProgressViaSink(sink, "reply", e.Step, e.OfSteps, 0, e.ElapsedMs)
 		}
 	}
 
@@ -463,19 +465,19 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 }
 
 // writeSSEProgressViaSink writes a progress SSE event via the provided sink.
-func (h *AgentChatHandler) writeSSEProgressViaSink(sink *sseSink, phase, label, detail string, step, ofSteps int, tool string, elapsedMs int64) {
+// Contract (stable with frontend): only abstract, non-leaking fields are emitted —
+//   phase (safe enum: understand|retrieve|filter|distill|compose|reply),
+//   step / ofSteps / elapsed_ms, and an optional integer count (omitted when 0).
+// It intentionally does NOT emit the raw tool name, an internal label, or free-text detail.
+func (h *AgentChatHandler) writeSSEProgressViaSink(sink *sseSink, phase string, step, ofSteps, count int, elapsedMs int64) {
 	data := map[string]interface{}{
 		"phase":      phase,
-		"label":      label,
 		"step":       step,
 		"ofSteps":    ofSteps,
 		"elapsed_ms": elapsedMs,
 	}
-	if detail != "" {
-		data["detail"] = detail
-	}
-	if tool != "" {
-		data["tool"] = tool
+	if count > 0 {
+		data["count"] = count
 	}
 
 	jsonData, err := json.Marshal(data)

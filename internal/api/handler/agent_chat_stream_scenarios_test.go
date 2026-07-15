@@ -374,23 +374,25 @@ func TestChatStreamEventSequenceAndDetail(t *testing.T) {
 		t.Errorf("expected 'done' to be the last event, got extra events after it:\n%s", body)
 	}
 
-	// —— 收集所有 progress payload 并按契约断言 schema ——
+	// —— 收集所有 progress payload 并按新契约断言 schema ——
+	// 新契约：只发 phase(抽象枚举)/step/ofSteps/elapsed_ms/count(整型,可选)。
+	// 不得出现 tool / label / detail（防泄露原始工具信息）。
 	type progressEvt struct {
 		Phase     string `json:"phase"`
-		Label     string `json:"label"`
 		Step      int    `json:"step"`
 		OfSteps   int    `json:"ofSteps"`
-		Tool      string `json:"tool,omitempty"`
 		ElapsedMs int64  `json:"elapsed_ms"`
-		Detail    string `json:"detail,omitempty"`
+		Count     int    `json:"count,omitempty"`
 	}
 	var progresses []progressEvt
+	var rawPayloads []string
 	// 按 SSE 帧解析:每两行是 "event: xxx\n" + "data: {json}\n"
 	lines := strings.Split(body, "\n")
 	for i := 0; i < len(lines)-1; i++ {
 		if lines[i] == "event: progress" && strings.HasPrefix(lines[i+1], "data: ") {
-			var p progressEvt
 			raw := strings.TrimPrefix(lines[i+1], "data: ")
+			rawPayloads = append(rawPayloads, raw)
+			var p progressEvt
 			if err := json.Unmarshal([]byte(raw), &p); err != nil {
 				t.Errorf("progress payload not valid JSON: %v raw=%s", err, raw)
 				continue
@@ -402,10 +404,24 @@ func TestChatStreamEventSequenceAndDetail(t *testing.T) {
 		t.Fatalf("expected >=4 progress events (one per tool), got %d\n%s", len(progresses), body)
 	}
 
-	// —— 每条 progress 契约字段完整性:step/ofSteps/elapsed_ms 都是有效值 ——
+	// —— 安全契约:progress 载荷绝不能泄露原始工具信息 ——
+	for _, raw := range rawPayloads {
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			t.Errorf("progress payload not valid JSON: %v", err)
+			continue
+		}
+		for _, forbidden := range []string{"tool", "label", "detail"} {
+			if _, ok := m[forbidden]; ok {
+				t.Errorf("progress payload must NOT contain %q (leaks tool info): %s", forbidden, raw)
+			}
+		}
+	}
+
+	// —— 每条 progress 字段完整性:phase 非空,step/ofSteps 有效,elapsed 非负 ——
 	for i, p := range progresses {
-		if p.Phase == "" || p.Label == "" {
-			t.Errorf("progress[%d] missing phase/label: %+v", i, p)
+		if p.Phase == "" {
+			t.Errorf("progress[%d] missing phase: %+v", i, p)
 		}
 		if p.Step <= 0 || p.OfSteps <= 0 {
 			t.Errorf("progress[%d] invalid step/ofSteps: %+v", i, p)
@@ -415,47 +431,32 @@ func TestChatStreamEventSequenceAndDetail(t *testing.T) {
 		}
 	}
 
-	// —— 4 个真工具的 progress 必须都出现,且 detail 非空 ——
-	phasesByTool := map[string]string{}
-	detailByTool := map[string]string{}
+	// —— 抽象 phase 必须覆盖 检索/筛选/提炼/汇总（且不含任何原始工具名）——
+	seenPhase := map[string]bool{}
+	countByPhase := map[string]int{}
 	for _, p := range progresses {
-		if p.Tool != "" {
-			phasesByTool[p.Tool] = p.Phase
-			detailByTool[p.Tool] = p.Detail
+		seenPhase[p.Phase] = true
+		if p.Count > countByPhase[p.Phase] {
+			countByPhase[p.Phase] = p.Count
 		}
 	}
-	wantPhases := map[string]string{
-		"fetch_channel":   "fetch",
-		"filter_relevant": "filter",
-		"summarize_chunk": "map",
-		"merge_summaries": "reduce",
-	}
-	for tool, wantPhase := range wantPhases {
-		got, ok := phasesByTool[tool]
-		if !ok {
-			t.Errorf("missing progress event for tool %q", tool)
-			continue
-		}
-		if got != wantPhase {
-			t.Errorf("tool %q: expected phase %q, got %q", tool, wantPhase, got)
-		}
-		if detailByTool[tool] == "" {
-			t.Errorf("tool %q: expected non-empty detail (cheap counter), got empty", tool)
+	for _, want := range []string{"retrieve", "filter", "distill", "compose"} {
+		if !seenPhase[want] {
+			t.Errorf("expected a progress event with abstract phase %q, seen=%v", want, seenPhase)
 		}
 	}
 
-	// —— 具体 detail 格式抽样验证(不硬编码全串,只查关键子串) ——
-	if !strings.Contains(detailByTool["fetch_channel"], "128") {
-		t.Errorf("fetch_channel detail should contain 128, got %q", detailByTool["fetch_channel"])
+	// —— 安全整型计数抽样:检索128 / 筛选20 / 汇总5;提炼阶段无计数 ——
+	if countByPhase["retrieve"] != 128 {
+		t.Errorf("retrieve phase count: want 128, got %d", countByPhase["retrieve"])
 	}
-	if !strings.Contains(detailByTool["filter_relevant"], "20") {
-		t.Errorf("filter_relevant detail should contain 20, got %q", detailByTool["filter_relevant"])
+	if countByPhase["filter"] != 20 {
+		t.Errorf("filter phase count: want 20, got %d", countByPhase["filter"])
 	}
-	if !strings.Contains(detailByTool["merge_summaries"], "5") {
-		t.Errorf("merge_summaries detail should contain 5, got %q", detailByTool["merge_summaries"])
+	if countByPhase["compose"] != 5 {
+		t.Errorf("compose phase count: want 5, got %d", countByPhase["compose"])
 	}
-	// summarize_chunk 是 "N/M" 格式,只查有 "/"
-	if !strings.Contains(detailByTool["summarize_chunk"], "/") {
-		t.Errorf("summarize_chunk detail should be N/M format, got %q", detailByTool["summarize_chunk"])
+	if countByPhase["distill"] != 0 {
+		t.Errorf("distill phase should carry no count, got %d", countByPhase["distill"])
 	}
 }
