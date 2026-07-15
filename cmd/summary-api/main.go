@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/handler"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/router"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/auth"
@@ -139,6 +140,13 @@ func main() {
 			log.Fatalf("[api] internal server: %v", err)
 		}
 	}()
+
+	// Start agent_message 24h cleanup (每 24h 清一次超过 24h 未活动的 session)。
+	// 见 internal/api/handler/agent_session_cleanup.go 顶部注释 + 主人 2026-07-15
+	// 决策 D1..D5。用 shutdownCtx 保证 SIGTERM 时干净退出 goroutine。
+	shutdownCtx, cancelShutdown := context.WithCancel(context.Background())
+	defer cancelShutdown()
+	handler.StartAgentSessionCleanup(shutdownCtx, summaryDB)
 
 	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
