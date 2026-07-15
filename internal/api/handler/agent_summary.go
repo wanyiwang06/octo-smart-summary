@@ -198,6 +198,20 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		return
 	}
 
+	// Strip conversational preamble that agents sometimes leak despite prompt
+	// discipline. Defense-in-depth — see agent_content_strip.go for the
+	// heuristic (first heading / rule wins, capped at 500 chars) and
+	// CHAT-REFERENCE-PREVIEW-AND-RANGE-SAVE-v1 Q1=A+B / Q2=default-on decisions.
+	// Owner reported task 51 (2026-07-15) where agent output opened with
+	//   「好的。根据引用的老总结内容,我现在将其转化为...」
+	// then the actual `## Summary 服务上线项目总结报告`. Stripping the opener
+	// keeps the deliverable clean without asking users to hand-edit each time.
+	stripped := stripAgentPreamble(content)
+	if stripped != content {
+		log.Printf("[handler] CreateAgentSummary session %s: stripped %d chars of preamble", req.SessionID, len(content)-len(stripped))
+	}
+	content = stripped
+
 	// --- title fallback: caller may skip, we generate the same way the
 	// traditional endpoint does so the two look identical in list views. ---
 	taskNo := service.GenerateTaskNo()
