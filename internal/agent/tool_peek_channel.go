@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
@@ -25,7 +26,7 @@ func PeekChannelTool() (Tool, Handler) {
 					},
 					"channel_type": map[string]interface{}{
 						"type":        "integer",
-						"description": "频道类型：1=群组, 2=私聊",
+						"description": "频道类型(WuKongIM 存储层协议)：1=DM(私聊), 2=Group(群), 5=Thread(子区)。**必须显式传递**,禁止省略。",
 					},
 					"limit": map[string]interface{}{
 						"type":        "integer",
@@ -64,8 +65,10 @@ func PeekChannelTool() (Tool, Handler) {
 			return "", fmt.Errorf("missing user identity in context")
 		}
 
+		// Same enforcement as fetch_channel — see rationale there.
 		if req.ChannelType == 0 {
-			req.ChannelType = 1
+			log.Printf("[peek_channel] rejecting call: agent did not supply channel_type. channel=%s", req.ChannelID)
+			return "", fmt.Errorf("channel_type is required (1=DM, 2=Group, 5=Thread); check reference material's candidate channels for the correct value")
 		}
 		if req.Limit <= 0 {
 			req.Limit = 10

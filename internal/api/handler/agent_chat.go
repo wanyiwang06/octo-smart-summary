@@ -44,6 +44,7 @@ type AgentChatHandler struct {
 	llmTimeout   int
 	llmMaxTokens int
 
+	db     *gorm.DB          // 用于 fetch 引用总结的产物 + 快照(见 CHAT-REFERENCE-BASED-DESIGN-v1)
 	store  agentHistoryStore // 多轮记忆读写（生产为 gorm 实现，测试可注入 mock）
 	window int               // 滑窗保留的最近轮数
 
@@ -72,6 +73,7 @@ func NewAgentChatHandler(db *gorm.DB, llmApiURL, llmApiKey, llmModel string, llm
 		llmModel:     llmModel,
 		llmTimeout:   llmTimeout,
 		llmMaxTokens: llmMaxTokens,
+		db:           db,
 		store:        newAgentMessageRepo(db),
 		window:       agent.HistoryWindow(),
 	}
@@ -90,7 +92,7 @@ func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid string) (*agen
 	}
 
 	var reg *agent.Registry
-	if profileName == "summary" && uid != "" {
+	if (profileName == "summary" || profileName == "summary_refine") && uid != "" {
 		reg, err = h.buildSummaryRegistryWithUID(uid)
 	} else {
 		reg, err = agent.BuildRegistry(profile.Tools)
@@ -145,10 +147,15 @@ func (h *AgentChatHandler) buildSummaryRegistryWithUID(uid string) (*agent.Regis
 
 // agentChatRequest 是聊天入参。session_id 由前端生成并必传，后端据此串联多轮历史。
 // profile 可选，指定使用的场景名（默认 "chat"）；总结场景传 "summary" 以挂载真实工具。
+// referenced_task_ids 可选：每轮都会重新 fetch 引用总结,拼进 system prompt。
+// 前端可全程带此字段(引用锁定后每轮都用相同 id),后端每轮拉最新版本;
+// 若空数组或字段缺,当轮 chat 无引用材料(等同普通 chat)。
+// 见 CHAT-REFERENCE-BASED-DESIGN-v1。
 type agentChatRequest struct {
-	Message   string `json:"message"`
-	SessionID string `json:"session_id"`
-	Profile   string `json:"profile,omitempty"`
+	Message           string  `json:"message"`
+	SessionID         string  `json:"session_id"`
+	Profile           string  `json:"profile,omitempty"`
+	ReferencedTaskIDs []int64 `json:"referenced_task_ids,omitempty"`
 }
 
 // Chat 处理 POST /api/v1/agent/chat：非流式一问一答，携带多轮历史。
@@ -218,6 +225,24 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "agent chat failed"})
 		return
 	}
+
+	// 每轮 chat 都重新拼引用进 system(每次拉最新版本、多轮迭代持续可见)。
+	// system 每轮独立传给 LLM 不会自动继承 —— 首轮限定的老实现会导致
+	// 第 2+ 轮 agent 看不到引用材料(见 CHAT-REFERENCE-BASED-DESIGN-v1
+	// 多轮上下文修复)。token 增量按引用大小约 5-15K/轮,可接受。
+	if len(req.ReferencedTaskIDs) > 0 {
+		spaceID := middleware.GetSpaceID(c)
+		refContext, loaded, refErr := buildReferencedSummariesContext(
+			ctx, h.db, spaceID, uid, req.ReferencedTaskIDs)
+		if refErr != nil {
+			log.Printf("[agent] chat build reference context error: %v", refErr)
+			// 引用加载失败不阻断本次对话,agent 走无引用路径
+		} else if refContext != "" {
+			system = system + refContext
+			log.Printf("[agent] chat session=%s loaded %d referenced tasks: %v", req.SessionID, len(loaded), loaded)
+		}
+	}
+
 	history = agent.TruncateHistory(history, h.window)
 
 	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
@@ -405,6 +430,21 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		h.writeSSEErrorViaSink(sink, 50000, "agent chat failed")
 		return
 	}
+
+	// 每轮 chat 都重新拼引用进 system —— 与 Chat 逻辑严格一致
+	// (见 CHAT-REFERENCE-BASED-DESIGN-v1 多轮上下文修复)。
+	if len(req.ReferencedTaskIDs) > 0 {
+		spaceID := middleware.GetSpaceID(c)
+		refContext, loaded, refErr := buildReferencedSummariesContext(
+			ctx, h.db, spaceID, uid, req.ReferencedTaskIDs)
+		if refErr != nil {
+			log.Printf("[agent] chat/stream build reference context error: %v", refErr)
+		} else if refContext != "" {
+			system = system + refContext
+			log.Printf("[agent] chat/stream session=%s loaded %d referenced tasks: %v", req.SessionID, len(loaded), loaded)
+		}
+	}
+
 	history = agent.TruncateHistory(history, h.window)
 
 	// Run agent with history
