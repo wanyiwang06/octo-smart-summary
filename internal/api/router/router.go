@@ -6,12 +6,16 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/handler"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
 
 // SetupPublic configures the public API router on :8080.
-func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule bool, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int) *gin.Engine {
+// SetupPublic configures the public API router on :8080.
+// 合并上游后统一签名：customTemplateLimit(上游模板) + agent 原始 LLM 配置(agent chat/summary handler 用)
+// + 变参 llm(上游 refine/personal 用的 *service.LLMClient，可选，须置于末尾)。
+func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middleware.TokenResolver, workerTriggerURL string, candidateQueryLimit int, featureTeamSchedule bool, customTemplateLimit int, llmApiURL, llmApiKey, llmModel string, llmTimeout, llmMaxTokens int, llm ...*service.LLMClient) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
@@ -37,9 +41,15 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 
 	// API routes
 	taskH := handler.NewTaskHandler(db, imDB, workerTriggerURL)
+	taskH.SetCustomTemplateLimit(customTemplateLimit)
 	schedH := handler.NewScheduleHandlerWithFlag(db, featureTeamSchedule)
 	personalH := handler.NewPersonalHandler(db, workerTriggerURL, hub)
-	editH := handler.NewEditHandler(db)
+	var refineLLM *service.LLMClient
+	if len(llm) > 0 {
+		refineLLM = llm[0]
+	}
+	editH := handler.NewEditHandler(db, refineLLM)
+	personalH.SetLLM(refineLLM)
 
 	v1 := r.Group("/api/v1")
 	v1.Use(middleware.StrictAuthMiddleware(authResolver), middleware.StrictSpaceMiddleware())
@@ -54,6 +64,15 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		v1.GET("/summaries/:id", taskH.GetSummary)
 		v1.GET("/summaries/:id/result", taskH.GetResult)
 		v1.POST("/summaries/:id/regenerate", taskH.Regenerate)
+		v1.POST("/summaries/:id/refine", editH.RefineSummary)
+		v1.GET("/summaries/:id/versions", editH.ListSummaryVersions)
+		v1.GET("/summaries/:id/versions/:result_id", editH.GetSummaryVersion)
+		v1.POST("/summaries/:id/versions/:result_id/restore", editH.RestoreSummaryVersion)
+		v1.POST("/summaries/:id/personal-refine", personalH.RefinePersonalSummary)
+		v1.POST("/summaries/:id/personal-regenerate", personalH.RegeneratePersonalSummary)
+		v1.GET("/summaries/:id/personal-versions", personalH.ListPersonalVersions)
+		v1.GET("/summaries/:id/personal-versions/:version_id", personalH.GetPersonalVersion)
+		v1.POST("/summaries/:id/personal-versions/:version_id/restore", personalH.RestorePersonalVersion)
 		v1.PUT("/summaries/:id/edit", editH.EditSummary)
 		// need3/need6: a participant edits their OWN personal report -> triggers team recompute.
 		v1.PUT("/summaries/:id/personal-edit", personalH.PersonalEdit)
@@ -72,6 +91,11 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		v1.GET("/summary-member-candidates", handler.NewCandidateHandler(imDB, candidateQueryLimit).SearchCandidates)
 		v1.GET("/summary-chat-candidates", handler.NewCandidateHandler(imDB, candidateQueryLimit).SearchChatCandidates)
 		v1.GET("/summary-templates", taskH.GetTemplates)
+		v1.POST("/summary-templates/my", taskH.CreateCustomTemplate)
+		v1.PUT("/summary-templates/my/:id", taskH.UpdateCustomTemplate)
+		v1.DELETE("/summary-templates/my/:id", taskH.DeleteCustomTemplate)
+		v1.PUT("/summary-templates/:id/my", taskH.UpdateMyTemplate)
+		v1.DELETE("/summary-templates/:id/my", taskH.DeleteMyTemplate)
 
 		v1.POST("/summary-schedules", schedH.CreateSchedule)
 		v1.GET("/summary-schedules", schedH.ListSchedules)

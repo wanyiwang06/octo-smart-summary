@@ -76,6 +76,10 @@ type Config struct {
 	// Candidate search query limit (-1 = no limit, >0 = use as SQL LIMIT)
 	CandidateQueryLimit int
 
+	// SummaryCustomTemplateLimit caps per-user custom summary templates per space.
+	// Default 30. Values <=0 fall back to the default in handler.
+	SummaryCustomTemplateLimit int
+
 	// Fetch concurrency for parallel channel message retrieval
 	FetchConcurrency int
 
@@ -122,8 +126,7 @@ type Config struct {
 	// summary_notification.last_error. Prod + NotifyEnabled but empty => startup
 	// fatal (fail-fast on misconfig); dev only warns.
 	NotifyInternalToken string
-	// SummaryWebBaseURL is the base for a result link in the notification text.
-	// Empty => no link appended.
+	// SummaryWebBaseURL is retained for compatibility; the server card path builds deep links.
 	SummaryWebBaseURL string
 	// AppEnv is the deployment environment ("prod" | "dev"). Drives the
 	// prod-fatal / dev-warn handling of a missing NotifyInternalToken.
@@ -175,6 +178,8 @@ func Load() *Config {
 
 		CandidateQueryLimit: envInt("SUMMARY_CHAT_CANDIDATE_LIMIT", -1),
 
+		SummaryCustomTemplateLimit: envInt("SUMMARY_CUSTOM_TEMPLATE_LIMIT", 30),
+
 		FetchConcurrency: envInt("FETCH_CONCURRENCY", 10),
 
 		MessageFetchBackend: strings.ToLower(strings.TrimSpace(envStr("MESSAGE_FETCH_BACKEND", "batch"))),
@@ -198,7 +203,7 @@ func Load() *Config {
 		KimiAPIKey:             envStr("KIMI_API_KEY", ""),
 		TokenizerHTTPTimeout:   envInt("TOKENIZER_HTTP_TIMEOUT", 10),
 
-		NotifyEnabled:       envBool("SUMMARY_NOTIFY_ENABLED", false),
+		NotifyEnabled: envBool("SUMMARY_NOTIFY_ENABLED", false),
 		// Custom env name (老板拍板): distinct from matter's NOTIFY_INTERNAL_TOKEN.
 		// Header contract X-Internal-Token is unchanged; only the source env differs.
 		NotifyInternalToken: envStr("SUMMARY_NOTIFY_TOKEN", ""),

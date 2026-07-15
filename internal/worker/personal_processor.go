@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timing"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/tokenizer"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func escapeCitationMarkers(content string) string {
@@ -54,7 +55,8 @@ func shouldSkipScheduledPlaceholderResult(triggerType int, content string) bool 
 
 func completedPersonalResultUpdates(pr model.PersonalResult, content string, citations []model.Citation, msgCount, totalTokens int, modelVer string, genAt time.Time, skipContent bool) map[string]interface{} {
 	updates := map[string]interface{}{
-		"worker_status": model.PersonalStatusCompleted,
+		"worker_status":  model.PersonalStatusCompleted,
+		"workflow_stage": model.WorkflowStageGenerateSummary,
 	}
 	if skipContent {
 		return updates
@@ -69,8 +71,100 @@ func completedPersonalResultUpdates(pr model.PersonalResult, content string, cit
 	return updates
 }
 
+func (p *Processor) updatePersonalWorkflowStage(personalResultID int64, stage string) {
+	if personalResultID == 0 || stage == "" {
+		return
+	}
+	if err := p.db.Model(&model.PersonalResult{}).
+		Where("id = ? AND worker_status = ?", personalResultID, model.PersonalStatusProcessing).
+		Update("workflow_stage", stage).Error; err != nil {
+		log.Printf("[personal-worker] update workflow stage pr=%d stage=%s: %v", personalResultID, stage, err)
+	}
+}
+
+func (p *Processor) persistCompletedPersonalResult(task model.SummaryTask, pr model.PersonalResult, content string, citations []model.Citation, msgCount, totalTokens int, modelVer string, genAt time.Time, skipContent bool) error {
+	updates := completedPersonalResultUpdates(pr, content, citations, msgCount, totalTokens, modelVer, genAt, skipContent)
+	if skipContent {
+		return p.db.Transaction(func(tx *gorm.DB) error {
+			var lockedPR model.PersonalResult
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, pr.TaskID, pr.UserID).
+				First(&lockedPR).Error; err != nil {
+				return err
+			}
+			var latest model.PersonalResultVersion
+			if err := tx.Where("task_id = ? AND user_id = ?", lockedPR.TaskID, lockedPR.UserID).
+				Order("version DESC").Order("id DESC").First(&latest).Error; err == nil {
+				updates["content"] = latest.Content
+				updates["citations_json"] = latest.CitationsJSON
+				updates["msg_count"] = latest.MsgCount
+				updates["total_token_used"] = latest.TotalTokenUsed
+				updates["model_version"] = latest.ModelVersion
+				updates["current_version_id"] = latest.ID
+				updates["generated_at"] = latest.GeneratedAt
+			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			return tx.Model(&lockedPR).Updates(updates).Error
+		})
+	}
+
+	return p.db.Transaction(func(tx *gorm.DB) error {
+		var lockedPR model.PersonalResult
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND task_id = ? AND user_id = ?", pr.ID, pr.TaskID, pr.UserID).
+			First(&lockedPR).Error; err != nil {
+			return err
+		}
+		nextVer, err := service.GetNextPersonalVersion(tx, lockedPR.TaskID, lockedPR.UserID)
+		if err != nil {
+			return err
+		}
+		operationType := "regenerate"
+		operationNote := task.Title
+		if nextVer <= 1 {
+			operationType = "generate"
+		} else if task.TriggerType == model.TriggerScheduled {
+			operationType = "scheduled_generate"
+			operationNote = p.scheduledOperationNote(task)
+		}
+
+		version := model.PersonalResultVersion{
+			TaskID:           lockedPR.TaskID,
+			ParticipantRefID: lockedPR.ParticipantRefID,
+			UserID:           lockedPR.UserID,
+			Content:          content,
+			MsgCount:         msgCount,
+			TotalTokenUsed:   totalTokens,
+			ModelVersion:     modelVer,
+			Version:          nextVer,
+			OperationType:    operationType,
+			OperationNote:    operationNote,
+			CreatedBy:        lockedPR.UserID,
+			GeneratedAt:      genAt,
+		}
+		version.SetCitations(citations)
+		if err := tx.Create(&version).Error; err != nil {
+			return err
+		}
+		updates["current_version_id"] = version.ID
+		if err := tx.Model(&lockedPR).Updates(updates).Error; err != nil {
+			return err
+		}
+		return service.PrunePersonalResultVersions(tx, lockedPR.TaskID, lockedPR.UserID, service.PersonalResultVersionKeepLimit)
+	})
+}
+
 func (p *Processor) processPersonalSummary(ctx context.Context, taskID, participantRefID int64) {
-	log.Printf("[personal-worker] start task=%d participant=%d", taskID, participantRefID)
+	p.processPersonalSummaryWithOptions(ctx, taskID, participantRefID, false)
+}
+
+func (p *Processor) processPersonalSummaryAllowCompleted(ctx context.Context, taskID, participantRefID int64) {
+	p.processPersonalSummaryWithOptions(ctx, taskID, participantRefID, true)
+}
+
+func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskID, participantRefID int64, allowCompletedTask bool) {
+	log.Printf("[personal-worker] start task=%d participant=%d allow_completed=%t", taskID, participantRefID, allowCompletedTask)
 
 	// Load participant
 	var participant model.SummaryParticipant
@@ -100,7 +194,11 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 		"worker_started_at": now,
 	})
 
-	// CAS update task status to PROCESSING (from any earlier state)
+	// CAS update task status to PROCESSING (from any earlier state).
+	// personal_regenerate is allowed to run against an already-Completed task
+	// without flipping the whole task back to Processing; the user will explicitly
+	// submit the regenerated personal result later, and Submit revives the task for
+	// meta recompute at that point.
 	deadline := timezone.Now().Add(time.Duration(p.cfg.WorkerLeaseMinutes) * time.Minute)
 	taskCAS := p.db.Model(&model.SummaryTask{}).
 		Where("id = ? AND status IN (?, ?)", taskID, model.StatusPending, model.StatusWaitingConfirm).
@@ -114,13 +212,16 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	}
 	if taskCAS.RowsAffected == 0 {
 		var currentTask model.SummaryTask
-		if err := p.db.Select("status").First(&currentTask, taskID).Error; err != nil || currentTask.Status != model.StatusProcessing {
-			log.Printf("[personal-worker] task=%d not in processing state, aborting", taskID)
+		if err := p.db.Select("status").First(&currentTask, taskID).Error; err != nil ||
+			(currentTask.Status != model.StatusProcessing && !(allowCompletedTask && currentTask.Status == model.StatusCompleted)) {
+			log.Printf("[personal-worker] task=%d not in runnable state, aborting", taskID)
 			return
 		}
-		// Refresh deadline for already-processing task (prevents scheduler false-positive)
-		p.db.Model(&model.SummaryTask{}).Where("id = ?", taskID).
-			Update("processing_deadline", deadline)
+		if currentTask.Status == model.StatusProcessing {
+			// Refresh deadline for already-processing task (prevents scheduler false-positive)
+			p.db.Model(&model.SummaryTask{}).Where("id = ?", taskID).
+				Update("processing_deadline", deadline)
+		}
 	}
 
 	// Load task
@@ -131,8 +232,54 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 		return
 	}
 
+	nonNegativeMs := func(start time.Time) int64 {
+		if start.IsZero() {
+			return 0
+		}
+		d := now.Sub(start)
+		if d < 0 {
+			return 0
+		}
+		return d.Milliseconds()
+	}
+	taskWaitMs := nonNegativeMs(task.CreatedAt)
+	prWaitMs := nonNegativeMs(pr.CreatedAt)
+	participantWaitMs := nonNegativeMs(participant.CreatedAt)
+	timing.GetContext(task.TaskNo).Update(func(c *timing.TaskContext) {
+		c.TaskCreatedToWorkerStartMs = taskWaitMs
+		c.PersonalResultCreatedToWorkerStartMs = prWaitMs
+		c.ParticipantCreatedToWorkerStartMs = participantWaitMs
+	})
+	log.Printf("[personal-worker] pre-worker wait task=%s task_created_to_start=%dms personal_result_created_to_start=%dms participant_created_to_start=%dms",
+		task.TaskNo, taskWaitMs, prWaitMs, participantWaitMs)
+
+	workerStartAt := now
+	lastWorkflowStageAt := workerStartAt
+	reportStage := func(stage string) {
+		stageAt := timezone.Now()
+		sinceWorkerStartMs := stageAt.Sub(workerStartAt).Milliseconds()
+		deltaMs := stageAt.Sub(lastWorkflowStageAt).Milliseconds()
+		if sinceWorkerStartMs < 0 {
+			sinceWorkerStartMs = 0
+		}
+		if deltaMs < 0 {
+			deltaMs = 0
+		}
+		lastWorkflowStageAt = stageAt
+		timing.GetContext(task.TaskNo).Update(func(c *timing.TaskContext) {
+			c.WorkflowStages = append(c.WorkflowStages, timing.WorkflowStageMs{
+				Stage:              stage,
+				SinceWorkerStartMs: sinceWorkerStartMs,
+				DeltaMs:            deltaMs,
+			})
+		})
+		log.Printf("[personal-worker] workflow stage task=%s pr=%d stage=%s since_worker_start=%dms delta=%dms",
+			task.TaskNo, pr.ID, stage, sinceWorkerStartMs, deltaMs)
+		p.updatePersonalWorkflowStage(pr.ID, stage)
+	}
+
 	// Execute pipeline
-	content, citations, msgCount, totalTokens, modelVer, err := p.executePersonalPipeline(ctx, task, participant.UserID)
+	content, citations, msgCount, totalTokens, modelVer, err := p.executePersonalPipeline(ctx, task, participant.UserID, reportStage)
 	if err != nil {
 		log.Printf("[personal-worker] pipeline error task=%d user=%s: %v", taskID, participant.UserID, err)
 		p.markPersonalFailed(&pr, &participant, err.Error())
@@ -146,14 +293,18 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	// Best-effort check: abort early if task is no longer Processing.
 	// Final safety is guaranteed by the task-level CAS in the completion path below.
 	var taskCheck model.SummaryTask
-	if err := p.db.Select("status").First(&taskCheck, taskID).Error; err != nil || taskCheck.Status != model.StatusProcessing {
-		log.Printf("[personal-worker] task=%d no longer processing before result write, aborting", taskID)
+	if err := p.db.Select("status").First(&taskCheck, taskID).Error; err != nil ||
+		(taskCheck.Status != model.StatusProcessing && !(allowCompletedTask && taskCheck.Status == model.StatusCompleted)) {
+		log.Printf("[personal-worker] task=%d no longer runnable before result write, aborting", taskID)
 		return
 	}
 
 	genAt := timezone.Now()
 	persistStart := time.Now()
-	p.db.Model(&pr).Updates(completedPersonalResultUpdates(pr, content, citations, msgCount, totalTokens, modelVer, genAt, isScheduledEmptyWindow))
+	if err := p.persistCompletedPersonalResult(task, pr, content, citations, msgCount, totalTokens, modelVer, genAt, isScheduledEmptyWindow); err != nil {
+		log.Printf("[personal-worker] persist personal result task=%d pr=%d: %v", taskID, pr.ID, err)
+		return
+	}
 	p.db.Model(&participant).Updates(map[string]interface{}{
 		"status": model.ParticipantCompleted,
 	})
@@ -217,6 +368,11 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 		// completeTaskWithoutNewResult succeeded). Fire the terminal notification.
 		p.notifyTaskTerminal(taskID, model.StatusCompleted)
 		log.Printf("[personal-worker] task %d single-person completed directly", taskID)
+	} else if allowCompletedTask && taskCheck.Status == model.StatusCompleted {
+		// Personal-only regenerate: keep the team summary as-is until the user
+		// explicitly submits this regenerated personal result. Submit will revive
+		// the task and trigger meta recompute.
+		log.Printf("[personal-worker] task=%d user=%s personal regenerate completed; waiting for submit", taskID, participant.UserID)
 	} else {
 		// Multi-person mode: trigger meta-summary to check if all participants completed.
 		//
@@ -229,8 +385,8 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 		// submit_source=2 (system) when the participant has confirmed (status NOT IN
 		// Pending,Declined -- same gate as meta's totalAccepted), idempotently
 		// (WHERE submitted_at IS NULL, so a racing manual /submit is never overwritten).
-		if task.TriggerType == model.TriggerScheduled {
-			p.backfillScheduledSubmittedAt(taskID, &pr)
+		if task.TriggerType == model.TriggerScheduled || pr.SubmitSource == model.SubmitSourceSystem {
+			p.backfillSystemSubmittedAt(taskID, &pr)
 		}
 		p.meta.TriggerMetaSummary(taskID)
 	}
@@ -238,8 +394,8 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 	log.Printf("[personal-worker] completed task=%d user=%s msgs=%d", taskID, participant.UserID, msgCount)
 }
 
-// backfillScheduledSubmittedAt system-back-fills submitted_at for a scheduled
-// multi-person personal result so the meta gate (submitted_at IS NOT NULL) can
+// backfillSystemSubmittedAt system-back-fills submitted_at for a scheduled
+// or task-level-regenerated multi-person personal result so the meta gate (submitted_at IS NOT NULL) can
 // progress without a manual /submit (§4.4-2). It runs in a single transaction:
 //   - re-reads the participant's current status under the same tx (the confirm
 //     gate must reflect committed state, not the in-memory pr loaded earlier);
@@ -251,7 +407,7 @@ func (p *Processor) processPersonalSummary(ctx context.Context, taskID, particip
 //
 // participantCount>1 is the caller's branch invariant (this is only reached from
 // the multi-person path), so it is not re-checked here.
-func (p *Processor) backfillScheduledSubmittedAt(taskID int64, pr *model.PersonalResult) {
+func (p *Processor) backfillSystemSubmittedAt(taskID int64, pr *model.PersonalResult) {
 	now := timezone.Now()
 	err := p.db.Transaction(func(tx *gorm.DB) error {
 		var status int
@@ -345,8 +501,9 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 			// retry_count was already atomically incremented above; only the remaining
 			// columns are written here (do not re-set retry_count to an app-layer value).
 			if err := tx.Model(pr).Updates(map[string]interface{}{
-				"worker_status": model.PersonalStatusPending,
-				"error_message": &sanitized,
+				"worker_status":  model.PersonalStatusPending,
+				"workflow_stage": "",
+				"error_message":  &sanitized,
 			}).Error; err != nil {
 				return err
 			}
@@ -449,7 +606,7 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 	log.Printf("[personal-worker] task=%d marked failed (terminal), sanitizedMsg=%s", pr.TaskID, sanitized)
 }
 
-func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string) (string, []model.Citation, int, int, string, error) {
+func (p *Processor) executePersonalPipeline(ctx context.Context, task model.SummaryTask, userID string, reportStage func(string)) (string, []model.Citation, int, int, string, error) {
 	totalStart := time.Now()
 	taskNo := task.TaskNo
 	defer func() {
@@ -510,7 +667,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		task.TimeRangeStart, task.TimeRangeEnd,
 		p.imDB, p.octoClient, p.cfg.MessageFetchBackend, toolCallFn, llmFn,
 		p.cfg.MsgTableCount, p.cfg.MaxMessagesPerChannel, p.cfg.FetchConcurrency, p.cfg.OctoSearchPollSec,
-		channelScopeOpts,
+		channelScopeOpts, reportStage,
 	)
 	timing.Observe(taskNo, "fetch_messages", fetchStart)
 	if err != nil {
@@ -648,6 +805,10 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		targetMsgCount = len(userMessages)
 	}
 
+	if reportStage != nil {
+		reportStage(model.WorkflowStageAnalyzeChatContent)
+	}
+
 	// Create tokenizer for token counting
 	tokCfg := tokenizer.Config{
 		CharsPerTokenCJK:   p.cfg.ResolveCharsPerTokenCJK(),
@@ -748,6 +909,8 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		userName = userID
 	}
 
+	generationTopic := p.generationTopic(task)
+
 	var finalContent string
 	var totalTokens int
 
@@ -760,12 +923,16 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				escapeCitationMarkers(m.Content)))
 		}
 
+		if reportStage != nil {
+			reportStage(model.WorkflowStageGenerateSummary)
+		}
+
 		mapStart := time.Now()
 		mapCallStart := time.Now()
 		var err error
 		finalContent, totalTokens, err = p.llm.CallMap(ctx,
 			joinStrings(formatted), sourceName, 0, len(userMessages),
-			startTime, endTime, task.Title, userName,
+			startTime, endTime, generationTopic, userName,
 		)
 		timing.RecordLLMSince(taskNo, "Map: 单次总结(跳过Map-Reduce)", mapCallStart, totalTokens)
 		timing.Observe(taskNo, "llm_map_summary", mapStart)
@@ -796,6 +963,12 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 		mapSem := make(chan struct{}, concurrency)
 		var mapWg sync.WaitGroup
 
+		if len(chunks) == 1 && reportStage != nil {
+			// Single-chunk fast path: the Map call produces the final user-facing summary.
+			// Attribute its latency to generate_summary instead of analyze_chat_content.
+			reportStage(model.WorkflowStageGenerateSummary)
+		}
+
 		mapStart := time.Now()
 		for i, chunk := range chunks {
 			mapWg.Add(1)
@@ -820,7 +993,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 				callStart := time.Now()
 				summary, tokens, err := p.llm.CallMap(ctx,
 					joinStrings(formatted), sourceName, idx, len(c),
-					startTime, endTime, task.Title, userName,
+					startTime, endTime, generationTopic, userName,
 				)
 				timing.RecordLLMSince(taskNo, fmt.Sprintf("Map: 分块总结 chunk#%d", idx), callStart, tokens)
 				if err != nil {
@@ -863,6 +1036,10 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 			return "", nil, 0, 0, "", fmt.Errorf("all %d chunk(s) failed during Map phase (LLM unreachable)", len(results))
 		}
 
+		if len(chunks) > 1 && reportStage != nil {
+			reportStage(model.WorkflowStageGenerateSummary)
+		}
+
 		// Reduce phase
 		reduceStart := time.Now()
 		var reduceTokens int
@@ -877,7 +1054,7 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 			var err error
 			reduceCallStart := time.Now()
 			finalContent, reduceTokens, err = p.llm.CallReduce(ctx,
-				chunkSummaries, sourceName, startTime, endTime, targetMsgCount, task.Title,
+				chunkSummaries, sourceName, startTime, endTime, targetMsgCount, generationTopic,
 			)
 			timing.RecordLLMSince(taskNo, "Reduce: 合并分块总结", reduceCallStart, reduceTokens)
 			if err != nil {

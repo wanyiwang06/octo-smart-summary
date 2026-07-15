@@ -174,3 +174,17 @@ func TestSnapshot_SerializationSymmetry(t *testing.T) {
 
 func intPtr(v int) *int       { return &v }
 func strPtr(s string) *string { return &s }
+func TestWorkflowStageConstants(t *testing.T) {
+	tests := []string{
+		WorkflowStageUnderstandQuestion,
+		WorkflowStageFindRelevantChats,
+		WorkflowStageFilterUsefulContent,
+		WorkflowStageAnalyzeChatContent,
+		WorkflowStageGenerateSummary,
+	}
+	for _, stage := range tests {
+		if stage == "" {
+			t.Fatal("workflow stage must not be empty")
+		}
+	}
+}

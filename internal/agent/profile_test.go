@@ -46,8 +46,8 @@ func TestGetProfile_SummaryRefine(t *testing.T) {
 	if profile.Policy.MaxSteps != 15 {
 		t.Errorf("Policy.MaxSteps = %d, want 15", profile.Policy.MaxSteps)
 	}
-	if profile.Policy.MaxTokens != 40000 {
-		t.Errorf("Policy.MaxTokens = %d, want 40000", profile.Policy.MaxTokens)
+	if profile.Policy.MaxTokens != 120000 {
+		t.Errorf("Policy.MaxTokens = %d, want 120000", profile.Policy.MaxTokens)
 	}
 	if profile.Policy.StepTimeout != 60e9 {
 		t.Errorf("Policy.StepTimeout = %d, want 60e9", profile.Policy.StepTimeout)
@@ -65,12 +65,12 @@ func TestLoadPrompt_SummaryRefine(t *testing.T) {
 		t.Fatal("LoadPrompt returned empty content")
 	}
 
-	// 验证关键文本是否存在
+	// 验证关键文本是否存在（对齐当前引用式 summary_refine 提示词）
 	expectedPhrases := []string{
-		"基于已有产物的增量修改",
-		"决策规则",
-		"直接改,不调工具",
-		"fetch_channel/search_messages 验证",
+		"引用 ≠ 增量修改",
+		"参考素材",
+		"自主决策权",
+		"get_current_time",
 	}
 
 	for _, phrase := range expectedPhrases {
