@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
@@ -25,7 +26,7 @@ func FetchChannelTool() (Tool, Handler) {
 					},
 					"channel_type": map[string]interface{}{
 						"type":        "integer",
-						"description": "频道类型：1=群组(Group), 2=子区(Thread), 3=私聊(DM)",
+						"description": "频道类型(WuKongIM 存储层协议)：1=DM(私聊), 2=Group(群), 5=Thread(子区)。**必须显式传递**,禁止省略。",
 					},
 					"time_start": map[string]interface{}{
 						"type":        "string",
@@ -64,8 +65,13 @@ func FetchChannelTool() (Tool, Handler) {
 			return "", fmt.Errorf("missing user identity in context")
 		}
 
+		// channel_type must be explicitly supplied — silently defaulting to 1
+		// (Group) caused SQL mismatch when the real channel was Thread (type=5)
+		// or DM (type=1), returning 0 rows and misleading agent into "no
+		// messages" answers. See CHAT-REFERENCE-BASED-DESIGN-v1 diagnostic.
 		if req.ChannelType == 0 {
-			req.ChannelType = 1
+			log.Printf("[fetch_channel] rejecting call: agent did not supply channel_type. channel=%s", req.ChannelID)
+			return "", fmt.Errorf("channel_type is required (1=DM, 2=Group, 5=Thread); check reference material's candidate channels for the correct value")
 		}
 
 		timeStart, err := time.Parse(time.RFC3339, req.TimeStart)

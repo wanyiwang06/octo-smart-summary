@@ -93,20 +93,20 @@ func buildReferencedSummariesContext(
 				sb.WriteString("- 老需求: " + snap.Requirement + "\n")
 			}
 			// channel_ids: candidate pool the agent may choose from.
-			// Include channel_type from SummaryTask.OriginChannelType so agent
-			// knows to pass the correct type to fetch_channel/peek_channel/etc.
-			// (Reference-based flows previously showed only channel_ids without
-			// type, agent guessed type=1 group but data was type=2 thread → 0 rows.)
+			// IMPORTANT: SummaryTask.OriginChannelType is application-layer
+			// (1=Group, 2=Thread, 3=DM); the fetch_channel tool expects
+			// storage-layer channel_type (1=DM, 2=Group, 5=Thread) —
+			// translate here so the value we hand the agent is directly
+			// usable as a tool argument.
 			if len(snap.Scope.ChannelIDs) > 0 {
+				storageType := appOriginToStorageChannelType(task.OriginChannelType)
 				sb.WriteString("- 候选频道 (candidate channels):\n")
 				for _, cid := range snap.Scope.ChannelIDs {
-					// Look up type from the referenced task's origin_channel_type
-					// column. Assumes single-channel-per-summary (v1 convention).
 					sb.WriteString(fmt.Sprintf("  * channel_id=%s channel_type=%d %s\n",
-						cid, task.OriginChannelType, channelTypeLabel(task.OriginChannelType)))
+						cid, storageType, channelTypeLabel(storageType)))
 				}
 				sb.WriteString("  (你可以复用其中一个,或让用户明确,或用 list_channels 探索其他)\n")
-				sb.WriteString("  ⚠️ 调用 fetch_channel/peek_channel 时必须传对应的 channel_type,别默认 1\n")
+				sb.WriteString("  ⚠️ 调用 fetch_channel/peek_channel 时必须**原样复制**上面的 channel_type 数字,不要猜、不要默认 1\n")
 			}
 			// time_range: OLD/HISTORICAL window, must NOT be reused as fetch params
 			sb.WriteString(fmt.Sprintf("- ⚠️ 老时间窗 (已过期,不要复制作为 fetch 参数): %s ~ %s\n",
@@ -145,19 +145,47 @@ func buildReferencedSummariesContext(
 	return sb.String(), loaded, nil
 }
 
-// channelTypeLabel returns a human-readable label for a channel_type value
-// so the agent knows exactly which one it's looking at without having to
-// remember the numeric mapping.
+// channelTypeLabel returns a human-readable label for a **storage-layer**
+// channel_type value (as used in WuKongIM message table and passed to
+// fetch_channel/peek_channel tool handlers).
+//
+// Note: this operates on storage-layer values (1=DM, 2=Group, 5=Thread),
+// NOT the application-layer OriginChannel* enum (1=Group, 2=Thread, 3=DM).
+// Use appOriginToStorageChannelType() to convert first.
 func channelTypeLabel(t int) string {
 	switch t {
-	case model.OriginChannelGroup: // 1
-		return "(Group 群组)"
-	case model.OriginChannelThread: // 2
-		return "(Thread 子区)"
-	case model.OriginChannelDM: // 3
+	case model.ChannelTypeDM: // 1
 		return "(DM 私聊)"
+	case model.ChannelTypeGroup: // 2
+		return "(Group 群)"
+	case model.ChannelTypeThread: // 5
+		return "(Thread 子区)"
 	default:
 		return "(未知类型)"
+	}
+}
+
+// appOriginToStorageChannelType maps SummaryTask.OriginChannelType
+// (application-layer, user-facing origin enum) to WuKongIM storage-layer
+// channel_type used in message tables and tool arguments.
+//
+// Application layer → Storage layer:
+//
+//	OriginChannelGroup  (1) → ChannelTypeGroup  (2)
+//	OriginChannelThread (2) → ChannelTypeThread (5)
+//	OriginChannelDM     (3) → ChannelTypeDM     (1)
+//
+// Returns 0 for unknown / OriginChannelGlobal (which has no single channel).
+func appOriginToStorageChannelType(origin int) int {
+	switch origin {
+	case model.OriginChannelGroup:
+		return model.ChannelTypeGroup
+	case model.OriginChannelThread:
+		return model.ChannelTypeThread
+	case model.OriginChannelDM:
+		return model.ChannelTypeDM
+	default:
+		return 0
 	}
 }
 

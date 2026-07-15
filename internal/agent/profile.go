@@ -62,7 +62,13 @@ var profiles = map[string]Profile{
 	"summary_refine": {
 		PromptFile: "summary_refine",
 		Tools:      []string{"list_channels", "narrow_channels_by_topic", "find_shared_channels", "peek_channel", "fetch_channel", "search_messages", "filter_relevant", "summarize_chunk", "merge_summaries", "get_current_time", "extract_time_range"},
-		Policy:     Policy{MaxSteps: 15, MaxTokens: 40000, StepTimeout: 60e9},
+		// MaxTokens bumped from 40000 to 120000: reference-based flows inject
+		// the old summary's content + snapshot + citations JSON into every
+		// turn's system message (~21K tokens/turn observed), so a 2-3 step
+		// refine (get_time + fetch + answer) blew through 40K by step 2 and
+		// triggered "已达 token 预算" mid-flow. 120K gives room for 4-5 tool
+		// steps at ~25K each. See CHAT-REFERENCE-BASED-DESIGN-v1 diagnostic.
+		Policy: Policy{MaxSteps: 15, MaxTokens: 120000, StepTimeout: 60e9},
 	},
 }
 

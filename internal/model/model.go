@@ -111,9 +111,13 @@ const (
 )
 
 // Channel type constants (aligned with the IM server protocol).
+// These are the values stored in the WuKongIM message table's channel_type
+// column. Different from OriginChannel* above (which is the application-layer
+// "user-facing origin" enum) — see appToStorageChannelType() for mapping.
 const (
-	ChannelTypeDM    = 1
-	ChannelTypeGroup = 2
+	ChannelTypeDM     = 1
+	ChannelTypeGroup  = 2
+	ChannelTypeThread = 5 // WuKongIM reserves 3/4 so thread jumps to 5
 )
 
 // SummaryTask represents a summary generation task.
