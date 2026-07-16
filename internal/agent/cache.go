@@ -124,3 +124,17 @@ func safeHandleUID(uid string) string {
 func GetMessageCache() *msgCache {
 	return messageCache
 }
+
+// ResetForTest empties the global message cache. Test-only helper —
+// handlers/tests that assert on cache miss must call this in setup
+// to isolate from sibling tests that populate the cache (necessary
+// because -shuffle=on can interleave test order).
+//
+// Not exported via a _test.go file because it must be callable from
+// sibling packages (e.g. internal/api/handler).
+func ResetForTest() {
+	messageCache.mu.Lock()
+	defer messageCache.mu.Unlock()
+	messageCache.store = make(map[string]cacheEntry)
+	messageCache.counter = 0
+}

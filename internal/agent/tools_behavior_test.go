@@ -9,10 +9,7 @@ import (
 // TestMessageCache_BasicOperations tests cache store/retrieve with uid isolation.
 func TestMessageCache_BasicOperations(t *testing.T) {
 	// Clear cache
-	messageCache.mu.Lock()
-	messageCache.store = make(map[string]cacheEntry)
-	messageCache.counter = 0
-	messageCache.mu.Unlock()
+	ResetForTest()
 
 	// Store messages with uid
 	msgs := []pipeline.Message{
@@ -51,11 +48,7 @@ func TestMessageCache_BasicOperations(t *testing.T) {
 // TestMessageCache_StoreRetrieveCycle tests multiple store/retrieve cycles with uid isolation.
 func TestMessageCache_StoreRetrieveCycle(t *testing.T) {
 	// Clear cache
-	messageCache.mu.Lock()
-	messageCache.store = make(map[string]cacheEntry)
-	messageCache.counter = 0
-	messageCache.mu.Unlock()
-
+	ResetForTest()
 	uid1 := "user-aaa"
 	uid2 := "user-bbb"
 
