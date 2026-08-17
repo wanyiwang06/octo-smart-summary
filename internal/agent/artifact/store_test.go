@@ -205,3 +205,25 @@ func TestGetLatestBySession(t *testing.T) {
 		t.Fatal("cross-user GetLatestBySession should not find")
 	}
 }
+
+func TestGetLatestArtifactBySession(t *testing.T) {
+	db := newArtifactTestDB(t)
+	if db == nil {
+		return
+	}
+	s := NewStore(db)
+	ctx := context.Background()
+
+	if _, found, err := s.GetLatestArtifactBySession(ctx, "u1", "sess1"); err != nil || found {
+		t.Fatalf("pre-freeze: found=%v err=%v", found, err)
+	}
+	s.FreezeFromPool(ctx, "run1", "u1", "sess1", pool(), FreezeMeta{Truncated: true})
+
+	art, found, err := s.GetLatestArtifactBySession(ctx, "u1", "sess1")
+	if err != nil || !found || !art.Truncated || art.ChannelCount != 2 {
+		t.Fatalf("session artifact: found=%v err=%v trunc=%v ch=%d", found, err, art != nil && art.Truncated, art.ChannelCount)
+	}
+	if _, found, _ := s.GetLatestArtifactBySession(ctx, "attacker", "sess1"); found {
+		t.Fatal("cross-user GetLatestArtifactBySession should not find")
+	}
+}
