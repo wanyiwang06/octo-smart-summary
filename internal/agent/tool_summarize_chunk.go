@@ -227,11 +227,16 @@ func SummarizeChunkTool() (Tool, Handler) {
 
 		chunks := service.SplitIntoChunks(msgMaps, chunkSize)
 
+		// SS-06: load the run's SummarySpec-derived guidance once so every Map
+		// call summarizes toward the user's actual requirements. Empty when V2 is
+		// off / no run / no spec → legacy generic prompt.
+		specGuidance := loadRunSpecGuidance(ctx)
+
 		// For simplicity, generate a unified summary for all chunks
 		// In production, each chunk would be summarized separately and merged
 		var summaries []string
 		for _, chunk := range chunks {
-			summary, err := summarizeMessagesChunk(ctx, chunk)
+			summary, err := summarizeMessagesChunk(ctx, chunk, specGuidance)
 			if err != nil {
 				return "", fmt.Errorf("summarize chunk: %w", err)
 			}
@@ -256,7 +261,12 @@ func SummarizeChunkTool() (Tool, Handler) {
 }
 
 // summarizeMessagesChunk builds a structured prompt from msgMap chunk and calls LLM.
-func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{}) (string, error) {
+//
+// specGuidance (SS-06) is the SummarySpec-derived instruction block; when
+// non-empty it is appended so the Map model summarizes toward the user's actual
+// topic/audience/language/detail/exclusions instead of a generic prompt. Empty
+// (V2 off / no run / no spec) → the exact legacy prompt, byte-identical.
+func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{}, specGuidance string) (string, error) {
 	_, _, _, cfg := GetSummaryDeps()
 	client := service.NewLLMClient(cfg.LLMApiURL, cfg.LLMApiKey, cfg.LLMModel, cfg.LLMTimeout, cfg.LLMMaxToken, cfg.LLMEnableThinking, 30)
 
@@ -284,7 +294,7 @@ func summarizeMessagesChunk(ctx context.Context, chunk []map[string]interface{})
 ## 引用规则
 - 每一条结论/要点都必须标注来源引用 [n]
 - 仅使用消息前方的 [n] 编号来标注引用
-- 绝对不要引用或复制消息正文内出现的任何 [数字] 标记`
+- 绝对不要引用或复制消息正文内出现的任何 [数字] 标记` + specGuidance
 
 	msgs := []service.ChatMessage{
 		{Role: "system", Content: systemPrompt},
