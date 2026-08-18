@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"regexp"
 	"sort"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/artifact"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/worker"
@@ -18,14 +22,14 @@ import (
 // 若 content 里没有任何 [n] 标记,返回 []Citation{} (等价于 SetCitations(nil))。
 //
 // 实现策略:
-// 1. 从 agent_message_evidence 提取本 (user_id, session_id) 的所有 handle
-// 2. 每个 handle 优先走 agent.messageCache 恢复 messages (30分钟 TTL),
-//    cache miss 时 fallback 到 evidence.Evidence 的 JSON snapshot
-// 3. 合并去重 → 得到 allMessages 池
-// 4. 为每条 message 分配 CitationIndex(1-indexed, 全局唯一, 时间升序)
-// 5. 收集 nameMap: sender_uid -> sender_name
-// 6. 调 worker.BuildCitations(content, allMessages, allMessages, nameMap)
-// 7. 返回结果; 出错走 log + 返回空数组不阻塞落库(citations 是锦上添花不是必要)
+//  1. 从 agent_message_evidence 提取本 (user_id, session_id) 的所有 handle
+//  2. 每个 handle 优先走 agent.messageCache 恢复 messages (30分钟 TTL),
+//     cache miss 时 fallback 到 evidence.Evidence 的 JSON snapshot
+//  3. 合并去重 → 得到 allMessages 池
+//  4. 为每条 message 分配 CitationIndex(1-indexed, 全局唯一, 时间升序)
+//  5. 收集 nameMap: sender_uid -> sender_name
+//  6. 调 worker.BuildCitations(content, allMessages, allMessages, nameMap)
+//  7. 返回结果; 出错走 log + 返回空数组不阻塞落库(citations 是锦上添花不是必要)
 //
 // Discovery-source symmetry (#161 P1-A · yujiawei):
 // Must discover handles from agent_message_evidence — byte-identical to
@@ -135,6 +139,14 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 		allMessages[i].CitationIndex = i + 1
 	}
 
+	// SS-05 B1: when V2 mode is on, prefer the FROZEN manifest ordinals for this
+	// session (the exact numbering the mid-run summarize_chunk pass used) so a
+	// [n] marker can't point at a different message than the model intended.
+	// Off / no frozen manifest → keep the recomputed indexes above (legacy path).
+	if agent.SummaryV2Enabled() {
+		allMessages = h.overrideWithSessionManifest(ctx, uid, sessionID, allMessages)
+	}
+
 	// 5. Build nameMap
 	nameMap := make(map[string]string)
 	for _, msg := range allMessages {
@@ -150,3 +162,112 @@ func (h *AgentSummaryHandler) buildCitationsForSession(
 	return citations, nil
 }
 
+// overrideWithSessionManifest replaces recomputed CitationIndex values with the
+// ordinals frozen in the session's latest citation manifest (SS-05 B1), so the
+// save-time numbering matches what the mid-run summarize_chunk pass emitted.
+// Messages not present in the frozen manifest were fetched after the freeze and
+// are dropped from the citable set. On any miss (V2 off wrote no manifest, DB
+// error) it returns the input unchanged, falling back to the recomputed indexes.
+func (h *AgentSummaryHandler) overrideWithSessionManifest(ctx context.Context, uid, sessionID string, msgs []pipeline.Message) []pipeline.Message {
+	if h.db == nil {
+		return msgs
+	}
+	store := artifact.NewStore(h.db)
+	_, entries, found, err := store.GetLatestBySession(ctx, uid, sessionID)
+	if err != nil || !found {
+		return msgs
+	}
+	ord := artifact.OrdinalMap(entries)
+	out := make([]pipeline.Message, 0, len(msgs))
+	for _, m := range msgs {
+		idx, ok := ord[fmt.Sprintf("%s:%d", m.ChannelID, m.MessageSeq)]
+		if !ok {
+			continue
+		}
+		m.CitationIndex = idx
+		out = append(out, m)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CitationIndex < out[j].CitationIndex })
+	log.Printf("[citations] session=%s using frozen manifest ordinals (%d of %d messages citable)", sessionID, len(out), len(msgs))
+	return out
+}
+
+var citationMarkerRE = regexp.MustCompile(`\[(\d+)\]`)
+
+// citationsValid reports whether every [n] marker in content resolves to a built
+// citation index. No markers → vacuously valid (nothing to break).
+func citationsValid(content string, cits []model.Citation) bool {
+	idxSet := make(map[int]bool, len(cits))
+	for _, c := range cits {
+		idxSet[c.Index] = true
+	}
+	for _, m := range citationMarkerRE.FindAllStringSubmatch(content, -1) {
+		var n int
+		if _, err := fmt.Sscanf(m[1], "%d", &n); err != nil {
+			continue
+		}
+		if !idxSet[n] {
+			return false
+		}
+	}
+	return true
+}
+
+// finalizeRun computes the SS-07 finish verdict (COMPLETE/PARTIAL/FAILED) for the
+// session's run and persists it. Best-effort and flag-gated by the caller: for
+// SS-07 (core) it records the verdict + gaps for disclosure; it does NOT yet
+// block the save (that, plus the SSE done contract and runner-integrated retry,
+// is SS-07b). Off / no run → no-op.
+//
+// Returns the verdict and gaps so the caller can surface them; on any lookup
+// failure it returns ("", nil) and the save proceeds unchanged.
+func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, content string, cits []model.Citation) (finishgate.Verdict, []finishgate.Gap) {
+	if h.db == nil {
+		return "", nil
+	}
+	runStore := summaryrun.NewStore(h.db)
+	run, found, err := runStore.GetLatestRunBySession(ctx, uid, sessionID)
+	if err != nil || !found {
+		return "", nil
+	}
+
+	state := finishgate.RunState{
+		ScopeResolved:            run.SpecID != "",
+		SummaryGenerated:         content != "",
+		CitationValidationPassed: citationsValid(content, cits),
+	}
+
+	// SS-07b: a run marked failed by the tool-error hook (a fatal tool error
+	// occurred mid-run) forces a FAILED verdict (defect #5).
+	if run.Status == model.RunStatusFailed {
+		state.CriticalToolErrors = append(state.CriticalToolErrors, "fatal tool error during run")
+	}
+
+	// Coverage facts from the frozen artifact (SS-04/05), when present.
+	artStore := artifact.NewStore(h.db)
+	if art, ok, aerr := artStore.GetLatestArtifactBySession(ctx, uid, sessionID); aerr == nil && ok {
+		state.HasUsableEvidence = art.MessageCount > 0
+		state.ChannelsFetched = art.ChannelCount
+		state.Truncated = art.Truncated
+		var failed []string
+		if art.FailedChannels != "" {
+			_ = json.Unmarshal([]byte(art.FailedChannels), &failed)
+		}
+		state.FailedChannels = failed
+	} else {
+		// No artifact (e.g. legacy path): evidence existence is implied by cits.
+		state.HasUsableEvidence = len(cits) > 0 || content != ""
+	}
+
+	// Expected channels from the run's Spec, when persisted.
+	if spec, ok, serr := runStore.GetLatestSpec(ctx, uid, run.RunID); serr == nil && ok {
+		state.ChannelsExpected = len(spec.Channels)
+	}
+
+	verdict, gaps := finishgate.Evaluate(state)
+	if err := runStore.SetFinishStatus(ctx, run.RunID, string(verdict)); err != nil {
+		log.Printf("[finish] persist finish_status failed run=%s: %v", run.RunID, err)
+	}
+	log.Printf("[finish] session=%s run=%s verdict=%s gaps=%d", sessionID, run.RunID, verdict, len(gaps))
+	return verdict, gaps
+}
