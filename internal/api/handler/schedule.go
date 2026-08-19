@@ -495,8 +495,20 @@ func (h *ScheduleHandler) CreateSchedule(c *gin.Context) {
 		return
 	}
 
-	if utf8.RuneCountInString(req.Title) > maxSummaryTopicRunes {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "title 不能超过 2300 字符"})
+	// SUM-BE1 (revised per SUM-9): call the shared validator with the ACTUAL
+	// model.SnapshotScope + the recurrence primitives the deep schedule
+	// checks below consume. No parallel DTO. Deep recurrence / anchor /
+	// run-time / day-of-week / day-of-month / time-range-type checks still
+	// run below via service.ValidateInterval* etc. — the shared validator
+	// only widens the top of the funnel with actor + title cap + "at least
+	// one of cron_expr / interval_days / interval_months" presence.
+	if bizE := service.ValidateScheduledWorkflow(
+		userID,
+		req.Title,
+		scheduleScopeFromReq(req),
+		req.CronExpr, req.IntervalDays, req.IntervalMonths,
+	); bizE != nil {
+		bizErr(c, bizE)
 		return
 	}
 	generationInstruction, err := normalizeScheduleGenerationInstruction(req.GenerationInstruction)
