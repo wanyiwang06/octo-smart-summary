@@ -7,6 +7,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
@@ -370,6 +371,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 		// off / no run / no spec → legacy generic prompt.
 		specGuidance := loadRunSpecGuidance(ctx)
 		var summaries []string
+		mapStart := time.Now()
 		for _, chunk := range chunks {
 			summary, processed, oversized, err := summarizeMessagesChunk(ctx, chunk, specGuidance)
 			if err != nil {
@@ -379,6 +381,11 @@ func SummarizeChunkTool() (Tool, Handler) {
 			cov.ProcessedCount += processed
 			cov.OversizedMessageCount += oversized
 		}
+		// summarize_chunk is itself an LLM pipeline, so its own cost needs a
+		// breakdown in the run trace — otherwise it shows up as one opaque
+		// tool span and a slow Map is indistinguishable from a slow planner.
+		TraceFromContext(ctx).AddSubPhase(fmt.Sprintf("map(%dchunks)", len(chunks)),
+			time.Since(mapStart).Milliseconds())
 		cov.DroppedCount = cov.InputCount - cov.ProcessedCount
 		cov.Truncated = cov.DroppedCount > 0
 		recordDroppedMessages(ctx, uid, runID, cov.DroppedCount)
