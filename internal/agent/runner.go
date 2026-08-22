@@ -315,6 +315,14 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps int) []string {
 	results := make([]string, len(calls))
 	hookOutcomes := make([]toolHookOutcome, len(calls))
+	// Every tool call chosen by one planner turn shares the same immutable step
+	// metadata. The pre-freeze coverage gate uses this to make one decision for
+	// the whole fan-out, regardless of worker width or completion order.
+	//
+	// withSummaryToolStep (#208) carries the same step for Map failure/success
+	// bookkeeping. Both are loop-invariant, so they are composed once here rather
+	// than rebuilt per worker.
+	toolCtx := withCoverageGateStep(withSummaryToolStep(ctx, step), step, ofSteps)
 	var wg sync.WaitGroup
 	for i, tc := range calls {
 		wg.Add(1)
@@ -332,7 +340,6 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 				})
 			}
 
-			toolCtx := withSummaryToolStep(ctx, step)
 			out, err := r.reg.Dispatch(toolCtx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
 			if tc.Function.Name == "summarize_chunk" {
 				if store, storeErr := summaryHandleStoreFromContext(ctx); storeErr == nil {
