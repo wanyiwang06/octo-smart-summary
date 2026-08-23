@@ -449,13 +449,15 @@ func TestStripUnresolvedCitationMarkers_StripsRealMarkers(t *testing.T) {
 }
 
 func TestStripUnresolvedCitationMarkers_AdjacentAndInlineColonRegressions(t *testing.T) {
-	markers := citationMarkerSet{"1": {}, "2": {}, "3": {}}
+	markers := citationMarkerSet{"1": {}, "2": {}, "3": {}, "P1": {}, "P2": {}}
 	cases := []struct {
 		name string
 		in   string
 		want string
 	}{
 		{name: "adjacent numeric markers", in: "结论 [1][2] 成立", want: "结论  成立"},
+		{name: "adjacent team markers", in: "团队 [P1][P2] 成立", want: "团队  成立"},
+		{name: "mixed adjacent markers", in: "混合 [1][P2] 成立", want: "混合  成立"},
 		{name: "inline ascii colon", in: "根据 [3]: 该结论成立", want: "根据 : 该结论成立"},
 		{name: "unterminated second label", in: "见 [1][ 未闭合", want: "见 [ 未闭合"},
 	}
@@ -469,8 +471,8 @@ func TestStripUnresolvedCitationMarkers_AdjacentAndInlineColonRegressions(t *tes
 }
 
 func TestStripUnresolvedCitationMarkers_PreservesRealReferenceSyntax(t *testing.T) {
-	markers := citationMarkerSet{"1": {}, "2": {}}
-	in := "see [1][docs]\nsee [1][2]\n\n[2]: https://example.com/doc"
+	markers := citationMarkerSet{"1": {}, "2": {}, "P1": {}, "P2": {}}
+	in := "see [1][docs]\nsee [P1][docs]\nsee [1][2]\nsee [P1][P2]\n\n[2]: https://example.com/numeric\n[P2]: https://example.com/team"
 	if got := stripUnresolvedCitationMarkers(in, markers); got != in {
 		t.Fatalf("reference syntax changed:\n in  = %q\n out = %q", in, got)
 	}

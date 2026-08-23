@@ -252,6 +252,29 @@ func TestExecuteAgentFinalize_HandleOrderQueryErrorPropagatesBeforeLLM(t *testin
 	}
 }
 
+func TestExecuteAgentFinalize_MissingPersistedEvidenceFailsBeforeLLM(t *testing.T) {
+	db := newFinalizeCoreDB(t)
+	at := time.Now()
+	if err := db.Create(&model.AgentMessage{
+		ID: 1, SessionID: "s1", UserID: "u1", Role: "tool",
+		Content: `{"messages_handle":"msg_u1_1"}`, CreatedAt: at,
+	}).Error; err != nil {
+		t.Fatalf("seed tool row: %v", err)
+	}
+	seedReply(t, db, 2, at, "片段一 [1]")
+	llm := &stubFinalizeLLM{out: "正文 [1]"}
+	p := newFinalizeCoreProcessor(db, llm)
+
+	_, _, _, _, _, err := p.executeAgentFinalize(context.Background(),
+		model.SummaryTask{ID: 7, AgentSessionID: "s1", AgentMessageID: 2}, "u1")
+	if err == nil || !strings.Contains(err.Error(), "evidence is incomplete") {
+		t.Fatalf("a returned handle without its evidence row must fail closed, got %v", err)
+	}
+	if llm.calls != 0 {
+		t.Fatalf("LLM calls = %d, want 0 when frozen evidence is incomplete", llm.calls)
+	}
+}
+
 func TestExecuteAgentFinalize_NewOutputMarkerFailsClosed(t *testing.T) {
 	db := newFinalizeCoreDB(t)
 	at := time.Now()

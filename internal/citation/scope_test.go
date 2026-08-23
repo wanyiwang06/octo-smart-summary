@@ -58,6 +58,29 @@ func TestRewriteMarkers_AdjacentNumericMarkersAreNotMistakenForReferenceLink(t *
 	}
 }
 
+func TestRewriteMarkers_AdjacentTeamMarkersAreNotMistakenForReferenceLink(t *testing.T) {
+	rewrite := func(token string) (string, bool) { return "[R" + token + "]", true }
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		{in: "团队 [P1][P2]", want: "团队 [RP1][RP2]"},
+		{in: "混合 [1][P2]", want: "混合 [R1][RP2]"},
+	} {
+		if got := RewriteMarkers(tc.in, rewrite); got != tc.want {
+			t.Errorf("RewriteMarkers(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestRewriteMarkers_TeamReferenceLinkWithDefinitionIsPreserved(t *testing.T) {
+	in := "see [P1][P2] for details\n\n[P2]: https://example.com/doc"
+	got := RewriteMarkers(in, func(string) (string, bool) { return "<GONE>", true })
+	if got != in {
+		t.Fatalf("team reference link with a real definition changed:\n in  = %q\n out = %q", in, got)
+	}
+}
+
 func TestRewriteMarkers_NumericReferenceLinkWithDefinitionIsPreserved(t *testing.T) {
 	in := "see [1][2] for details\n\n[2]: https://example.com/doc"
 	got := RewriteMarkers(in, func(string) (string, bool) { return "<GONE>", true })

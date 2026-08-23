@@ -41,8 +41,9 @@ type MarkerRewriter func(token string) (replacement string, rewrite bool)
 //   - a markdown inline link `[1](url)` is content, never a marker — deleting
 //     or renumbering the `[1]` silently corrupts the link;
 //   - a named reference-style link `[1][docs]` is content for the same reason;
-//   - `[1][2]` is treated as two adjacent markers unless `[2]: ...` is really
-//     defined elsewhere in the document;
+//   - `[1][2]`, `[P1][P2]` and mixed citation-shaped pairs are treated as
+//     adjacent markers unless the second label is really defined elsewhere in
+//     the document;
 //   - a reference definition `[1]: https://…` is exempt only at line start
 //     (with up to three leading spaces), not in prose such as `根据 [1]: ...`;
 //   - an unterminated `[` is copied verbatim, but does not hide a complete
@@ -110,16 +111,16 @@ func rewriteMarkersInLine(line string, definitions map[string]struct{}, fn Marke
 					continue
 				}
 			case '[':
-				// A named reference link such as [1][docs] is content. A bare
-				// numeric second label, however, is also the repository's real
-				// adjacent-citation shape ([1][2]). Treat it as a link only when
-				// the document actually defines that numeric label; otherwise
-				// both bracketed numbers are offered independently to fn.
+				// A named reference link such as [1][docs] is content. A
+				// citation-shaped second label (numeric or P+numeric), however,
+				// is also the repository's adjacent-citation shape ([1][2],
+				// [P1][P2]). Treat it as a link only when the document actually
+				// defines that label; otherwise both tokens are offered to fn.
 				if labelEnd := strings.IndexByte(line[end+1:], ']'); labelEnd >= 0 {
 					labelEnd += end + 1
 					label := line[end+2 : labelEnd]
-					_, numericDefinition := definitions[normalizeReferenceLabel(label)]
-					if !isBareDecimal(label) || numericDefinition {
+					_, definedReference := definitions[normalizeReferenceLabel(label)]
+					if !isCitationLikeLabel(label) || definedReference {
 						b.WriteString(line[i : labelEnd+1])
 						i = labelEnd + 1
 						continue
@@ -206,6 +207,10 @@ func isBareDecimal(s string) bool {
 		}
 	}
 	return true
+}
+
+func isCitationLikeLabel(s string) bool {
+	return isBareDecimal(s) || (len(s) > 1 && s[0] == 'P' && isBareDecimal(s[1:]))
 }
 
 func normalizeReferenceLabel(s string) string {

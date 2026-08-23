@@ -386,6 +386,16 @@ func TestBuildFinalizeCitations_UsesScopedMarkerSyntax(t *testing.T) {
 	})
 }
 
+func TestValidateFinalizeEvidenceCompleteness_ChecksEveryReturnedHandle(t *testing.T) {
+	rows := []model.AgentMessageEvidence{{Handle: "h1", Evidence: "[]"}}
+	if err := validateFinalizeEvidenceCompleteness(rows, map[string]int64{"h1": 1}); err != nil {
+		t.Fatalf("an empty but persisted evidence row is complete: %v", err)
+	}
+	if err := validateFinalizeEvidenceCompleteness(rows, map[string]int64{"h1": 1, "h2": 2}); err == nil {
+		t.Fatal("a partially missing persisted handle must fail closed")
+	}
+}
+
 // --- P2-7: the TriggerAgentFinalize routing branch ------------------------
 
 // A finalize task must NOT run executePipeline. executePipeline exists to

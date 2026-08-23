@@ -158,11 +158,14 @@ func (p *Processor) executeAgentFinalize(ctx context.Context, task model.Summary
 	if err != nil {
 		return "", nil, 0, 0, modelVer, fmt.Errorf("load session evidence: %w", err)
 	}
-	pool := buildPoolFromEvidenceRows(evidenceRows)
 	handleOrder, err := loadEvidenceHandleOrder(ctx, p.db, userID, sessionID, task.AgentMessageID)
 	if err != nil {
 		return "", nil, 0, 0, modelVer, fmt.Errorf("load evidence handle order: %w", err)
 	}
+	if err := validateFinalizeEvidenceCompleteness(evidenceRows, handleOrder); err != nil {
+		return "", nil, 0, 0, modelVer, err
+	}
+	pool := buildPoolFromEvidenceRows(evidenceRows)
 	replies, droppedMarkers := remapFinalizeCitations(replies, evidenceRows, pool, handleOrder)
 	if droppedMarkers > 0 {
 		log.Printf("[finalize] task %d session %s: dropped %d unresolvable citation marker(s) during cross-turn remap",
@@ -282,6 +285,33 @@ func validateFinalizeOutputMarkers(content string, replies []model.AgentMessage)
 	}
 	sort.Ints(invalid)
 	return fmt.Errorf("finalize output contains citation markers absent from the remapped input: %v", invalid)
+}
+
+// validateFinalizeEvidenceCompleteness distinguishes a genuinely evidence-free
+// session from evidence that was deleted after the agent used it. Every
+// messages_handle returned by a tool inside the freeze bound is persisted to
+// agent_message_evidence before the tool returns. A missing row therefore means
+// the numbering source is incomplete; retry rather than reconstructing a
+// plausible-looking but wrong pool. Orphan evidence rows without a tool record
+// remain handled by the existing per-fragment ambiguity fallback.
+func validateFinalizeEvidenceCompleteness(rows []model.AgentMessageEvidence, handleOrder map[string]int64) error {
+	if len(handleOrder) == 0 {
+		return nil
+	}
+	evidenceHandles := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		evidenceHandles[row.Handle] = struct{}{}
+	}
+	missing := 0
+	for handle := range handleOrder {
+		if _, ok := evidenceHandles[handle]; !ok {
+			missing++
+		}
+	}
+	if missing > 0 {
+		return fmt.Errorf("finalize evidence is incomplete: %d persisted tool handle(s) have no evidence row", missing)
+	}
+	return nil
 }
 
 // remapFinalizeCitations rewrites each fragment's [n] markers from the numbering
