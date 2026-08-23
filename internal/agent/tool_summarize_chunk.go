@@ -141,14 +141,12 @@ func ProbeChunkCoverageDefault(msgMaps []map[string]interface{}, requestedChunkS
 // The pre-assigned CitationIndex here (mid-run) and the rebuilt index in
 // buildCitationsForSession (save-time) are only guaranteed to match if the
 // evidence row set does not change between the two phases. In practice this
-// is upheld by the profile ordering `fetch/search/filter → summarize_chunk →
-// merge_summaries → answer`: any handle-producing tool runs BEFORE
-// summarize_chunk in the same or an earlier step, so no evidence row is
-// added after summarize_chunk's pool snapshot. If a future profile ever
-// interleaves a data-fetching tool after summarize_chunk in the same turn,
-// the newly-persisted evidence would appear only at save time, shifting
-// CitationIndex and breaking the [n]-marker alignment. Enforce this
-// invariant at profile design time — the runner does not check it.
+// is upheld by both the profile ordering `fetch/search/filter →
+// summarize_chunk → merge_summaries → answer` and Runner.runTools' causal
+// barrier: when fetch_channel and summarize_chunk occur in one planner turn,
+// every fetch completes (including evidence persistence) before any summarize
+// starts. Thus no same-turn fetch can appear only at save time and shift the
+// [n]-marker alignment.
 func getSessionMessagePool(sessionID, uid string) ([]pipeline.Message, error) {
 	summaryDB, _, _, _ := GetSummaryDeps()
 

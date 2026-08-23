@@ -216,15 +216,18 @@ func TestAdmitCoverageBlock_ReservesStepsForRecoveryAndFinalAnswer(t *testing.T)
 	forgetCoverageGateRun(runID)
 	t.Cleanup(func() { forgetCoverageGateRun(runID) })
 
-	if block, _, reason := admitCoverageBlock(runID, "sig", 17, 20, 2); block || reason != "step_budget_reserved" {
-		t.Fatalf("block=%v reason=%q, want false/step_budget_reserved with only 3 steps left", block, reason)
+	if block, _, reason := admitCoverageBlock(runID, "sig", 13, 20, 2); block || reason != "step_budget_reserved" {
+		t.Fatalf("block=%v reason=%q, want false/step_budget_reserved with only 7 steps left for two possible repair rounds", block, reason)
 	}
 
 	boundaryRunID := "run-step-budget-boundary"
 	forgetCoverageGateRun(boundaryRunID)
 	t.Cleanup(func() { forgetCoverageGateRun(boundaryRunID) })
-	if block, _, reason := admitCoverageBlock(boundaryRunID, "sig", 16, 20, 2); !block || reason != "blocked" {
-		t.Fatalf("block=%v reason=%q, want true/blocked with exactly 4 steps left", block, reason)
+	if block, _, reason := admitCoverageBlock(boundaryRunID, "sig", 12, 20, 2); !block || reason != "blocked" {
+		t.Fatalf("block=%v reason=%q, want true/blocked with exactly 8 steps left", block, reason)
+	}
+	if block, round, reason := admitCoverageBlock(boundaryRunID, "sig-progress", 15, 20, 2); block || round != 1 || reason != "step_budget_reserved" {
+		t.Fatalf("second round: block=%v round=%d reason=%q, want false/1/step_budget_reserved with only 5 steps left", block, round, reason)
 	}
 }
 

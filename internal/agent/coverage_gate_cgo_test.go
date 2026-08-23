@@ -24,6 +24,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/artifact"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
@@ -139,7 +140,8 @@ func (f *coverageGateFixture) seedFetched(t *testing.T, channelID string, msgs [
 func (f *coverageGateFixture) toolCtx() context.Context {
 	ctx := context.WithValue(context.Background(), ContextKeyUID, f.uid)
 	ctx = context.WithValue(ctx, ContextKeySessionID, f.sessionID)
-	return context.WithValue(ctx, ContextKeyRunID, f.runID)
+	ctx = context.WithValue(ctx, ContextKeyRunID, f.runID)
+	return withSummaryHandleStore(ctx)
 }
 
 func (f *coverageGateFixture) toolCtxAtStep(step int) context.Context {
@@ -321,6 +323,103 @@ func TestCoverageGate_RepairedChannelIsCitable(t *testing.T) {
 		if ord[key] < 1 {
 			t.Fatalf("%s missing from the frozen manifest (ordinals=%v) — it would be uncitable at save time", key, ord)
 		}
+	}
+}
+
+// A planner commonly answers the gate error with fetch_channel(B) AND a retry
+// of summarize_chunk(handleA) in the same tool-call turn. With unconstrained
+// fan-out, summarize can observe the previous step's unchanged coverage
+// signature, take the no-progress release, and freeze before the in-flight
+// fetch records B. This test uses the real fetch and summarize handlers and a
+// one-worker pool to make the old ordering deterministic: calls are supplied as
+// summarize-then-fetch, so without runTools' phase barrier B is absent from the
+// frozen manifest.
+func TestRunTools_FetchCompletesBeforeSameTurnManifestFreeze(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+	f := newCoverageGateFixture(t, true, twoChannelSpec)
+	if f == nil {
+		return
+	}
+
+	imDB := setupAgentImDB(t)
+	for _, stmt := range []string{
+		`CREATE TABLE message (message_seq INTEGER, from_uid TEXT, channel_id TEXT, channel_type INTEGER, timestamp INTEGER, payload BLOB, is_deleted INTEGER DEFAULT 0)`,
+		`CREATE TABLE user (uid TEXT, name TEXT)`,
+		`INSERT INTO "group" (group_no, name, space_id, status, creator) VALUES ('ch-B', '研发群', 'space', 1, 'u-gate')`,
+		`INSERT INTO group_member (group_no, uid, is_deleted, role) VALUES ('ch-B', 'u-gate', 0, 0)`,
+		`INSERT INTO user (uid, name) VALUES ('u-author', '研发同学')`,
+	} {
+		if err := imDB.Exec(stmt).Error; err != nil {
+			t.Fatalf("prepare IM DB: %v; sql=%s", err, stmt)
+		}
+	}
+	const bTimestamp = int64(1755001000)
+	if err := imDB.Exec(`INSERT INTO message (message_seq, from_uid, channel_id, channel_type, timestamp, payload, is_deleted) VALUES (?, ?, ?, ?, ?, ?, 0)`,
+		7, "u-author", "ch-B", 2, bTimestamp, []byte(`{"type":1,"content":"B fetched before freeze"}`)).Error; err != nil {
+		t.Fatalf("seed ch-B message: %v", err)
+	}
+
+	llm := newEchoLLM(t)
+	cfg := llm.cfg()
+	cfg.MsgTableCount = 1
+	cfg.MaxMessagesPerChannel = 10
+	SetSummaryDeps(f.db, imDB, nil, cfg)
+	t.Cleanup(func() { SetSummaryDeps(nil, nil, nil, config.Config{}) })
+
+	handleA := f.seedFetched(t, "ch-A", []pipeline.Message{
+		{ChannelID: "ch-A", MessageSeq: 1, Timestamp: 1755000500, Content: "A one"},
+	})
+	_, summarize := SummarizeChunkTool()
+	summarizeArgs, _ := json.Marshal(map[string]string{"messages_handle": handleA})
+	if _, err := summarize(f.toolCtxAtStep(1), summarizeArgs); err == nil {
+		t.Fatal("step 1 must establish the blocked coverage signature")
+	}
+	if f.frozen(t) {
+		t.Fatal("manifest froze on the initial blocked step")
+	}
+
+	reg := NewRegistry()
+	reg.Register(FetchChannelTool())
+	reg.Register(SummarizeChunkTool())
+	runner := NewRunner(nil, reg, NewPool(1), Policy{})
+	fetchArgs, _ := json.Marshal(map[string]interface{}{
+		"channel_id":   "ch-B",
+		"channel_type": 2,
+		"time_start":   time.Unix(1755000000, 0).Format(time.RFC3339),
+		"time_end":     time.Unix(1755086400, 0).Format(time.RFC3339),
+	})
+	results := runner.runTools(f.toolCtx(), []ToolCall{
+		mkToolCall("sum-A", "summarize_chunk", string(summarizeArgs)),
+		mkToolCall("fetch-B", "fetch_channel", string(fetchArgs)),
+	}, 2, profiles["summary"].Policy.MaxSteps)
+
+	if strings.Contains(results[0], "COVERAGE_INCOMPLETE") {
+		t.Fatalf("summarize still read stale coverage after the same-turn fetch: %s", results[0])
+	}
+	if strings.Contains(results[1], `"ok":false`) || !strings.Contains(results[1], `"channel_id":"ch-B"`) {
+		t.Fatalf("real fetch_channel failed: %s", results[1])
+	}
+	var fetched struct {
+		Handle string `json:"messages_handle"`
+	}
+	if err := json.Unmarshal([]byte(results[1]), &fetched); err != nil || fetched.Handle == "" {
+		t.Fatalf("decode fetch result: handle=%q err=%v result=%s", fetched.Handle, err, results[1])
+	}
+	t.Cleanup(func() {
+		messageCache.mu.Lock()
+		delete(messageCache.store, fetched.Handle)
+		messageCache.mu.Unlock()
+	})
+
+	_, entries, frozen, err := artifact.NewStore(f.db).GetFrozenManifestByRun(context.Background(), f.uid, f.runID)
+	if err != nil {
+		t.Fatalf("read frozen manifest: %v", err)
+	}
+	if !frozen {
+		t.Fatal("same-turn summarize did not freeze after fetch completed")
+	}
+	if artifact.OrdinalMap(entries)["ch-B:7"] < 1 {
+		t.Fatalf("ch-B missing from manifest: fetch did not causally precede freeze; entries=%+v", entries)
 	}
 }
 

@@ -310,8 +310,15 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 	return "", nil, errors.New("max steps exceeded")
 }
 
-// runTools 并发分发一跳内的全部 tool_calls，各自独立 ctx，错误转结果字符串（不中断）。
-// 结果写入预分配 slice 的固定索引，天然无写冲突；WaitGroup 收齐。
+// runTools 分发一跳内的全部 tool_calls，各自独立 ctx，错误转结果字符串（不中断）。
+//
+// Most turns keep full fan-out concurrency. The one causality-sensitive shape
+// is fetch_channel + summarize_chunk in the SAME turn: fetch_channel records
+// coverage and persists evidence only at the end, while summarize_chunk can
+// freeze the run's citation manifest. Running them concurrently lets the gate
+// read a stale coverage signature and freeze without the in-flight channel.
+// Therefore all fetch_channel calls form phase 1 and must finish before the
+// remaining calls start. Results still occupy their original indexes.
 func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps int) []string {
 	results := make([]string, len(calls))
 	hookOutcomes := make([]toolHookOutcome, len(calls))
@@ -323,10 +330,41 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 	// bookkeeping. Both are loop-invariant, so they are composed once here rather
 	// than rebuilt per worker.
 	toolCtx := withCoverageGateStep(withSummaryToolStep(ctx, step), step, ofSteps)
-	var wg sync.WaitGroup
+	all := make([]int, 0, len(calls))
+	fetches := make([]int, 0, len(calls))
+	rest := make([]int, 0, len(calls))
+	hasSummarize := false
 	for i, tc := range calls {
+		all = append(all, i)
+		if tc.Function.Name == "fetch_channel" {
+			fetches = append(fetches, i)
+		} else {
+			rest = append(rest, i)
+		}
+		if tc.Function.Name == "summarize_chunk" {
+			hasSummarize = true
+		}
+	}
+	// Hook outcomes are reported once, after every phase has finished, so the
+	// fatal-marker verdict stays independent of both worker completion order AND
+	// phase boundaries. Reporting per phase would let a phase-1 failure latch
+	// before a phase-2 success for the same (tool, target) could clear it.
+	defer r.reportToolHookOutcomes(hookOutcomes)
+	if len(fetches) > 0 && hasSummarize {
+		r.runToolBatch(toolCtx, calls, fetches, results, hookOutcomes, step, ofSteps)
+		r.runToolBatch(toolCtx, calls, rest, results, hookOutcomes, step, ofSteps)
+		return results
+	}
+	r.runToolBatch(toolCtx, calls, all, results, hookOutcomes, step, ofSteps)
+	return results
+}
+
+// runToolBatch executes one causally-independent phase concurrently.
+func (r *Runner) runToolBatch(toolCtx context.Context, calls []ToolCall, indexes []int, results []string, hookOutcomes []toolHookOutcome, step, ofSteps int) {
+	var wg sync.WaitGroup
+	for _, i := range indexes {
 		wg.Add(1)
-		i, tc := i, tc
+		i, tc := i, calls[i]
 		r.pool.Submit(func() {
 			defer wg.Done()
 
@@ -342,7 +380,10 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 
 			out, err := r.reg.Dispatch(toolCtx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
 			if tc.Function.Name == "summarize_chunk" {
-				if store, storeErr := summaryHandleStoreFromContext(ctx); storeErr == nil {
+				// toolCtx, not the caller's ctx: the store lives on the request-scoped
+				// context that toolCtx wraps, and using it keeps every lookup on this
+				// path reading the same context chain.
+				if store, storeErr := summaryHandleStoreFromContext(toolCtx); storeErr == nil {
 					target := toolCallTarget(tc.Function.Arguments)
 					if target == "" {
 						target = anonymousMapFailurePrefix + tc.ID
@@ -404,8 +445,6 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 		})
 	}
 	wg.Wait()
-	r.reportToolHookOutcomes(hookOutcomes)
-	return results
 }
 
 type toolHookOutcome struct {

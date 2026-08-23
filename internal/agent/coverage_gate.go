@@ -85,17 +85,18 @@ type CoverageGateError struct {
 
 func (e *CoverageGateError) Error() string { return e.Instruction }
 
-// coverageGateTTL bounds how long a run's gate bookkeeping is remembered. It
-// exceeds any plausible run wall-clock (StepTimeout 240s × MaxSteps 20) and
-// matches the message cache's own TTL, so state is evicted long after the run
-// it belongs to is gone but never while that run is still executing.
+// coverageGateTTL bounds how long a run's process-local gate bookkeeping is
+// remembered. It matches the message cache TTL: after this window the handles
+// needed to retry summarize_chunk are stale too. This is a best-effort
+// per-process bound, not a durable per-run guarantee across restarts.
 const coverageGateTTL = 30 * time.Minute
 
-// coverageRepairReservedSteps is the minimum planner budget left AFTER a gate
-// block: fetch the missing channel, retry Map, run Reduce, and emit the final
-// answer. Blocking with less headroom can turn an incomplete-but-disclosed
-// summary into `max steps exceeded`, which is strictly worse than allowing the
-// freeze and letting the finish gate report the gap.
+// coverageRepairReservedSteps is the downstream budget after all possible
+// coverage rounds: retry Map, run Reduce, tolerate one correction/nudge, and
+// emit the final answer. Each still-available coverage round additionally
+// reserves two planner steps (fetch + retried summarize). This prevents the
+// gate's own bounded repair overhead from pushing an otherwise deliverable
+// PARTIAL summary into the runner's hard step ceiling.
 const coverageRepairReservedSteps = 4
 
 type coverageStepContext struct {
@@ -159,10 +160,9 @@ func admitCoverageBlock(runID, signature string, step, maxSteps, maxRounds int) 
 	if runID == "" || maxRounds <= 0 {
 		return false, 0, "disabled"
 	}
-	now := coverageGateClock()
-
 	coverageGateMu.Lock()
 	defer coverageGateMu.Unlock()
+	now := coverageGateClock()
 	sweepCoverageGateLocked(now)
 
 	st, ok := coverageGateRuns[runID]
@@ -192,7 +192,7 @@ func admitCoverageBlock(runID, signature string, step, maxSteps, maxRounds int) 
 	if prevRounds >= maxRounds {
 		block = false
 		reason = "round_budget_exhausted"
-	} else if maxSteps-step < coverageRepairReservedSteps {
+	} else if maxSteps-step < coverageRepairReservedSteps+2*(maxRounds-prevRounds) {
 		block = false
 		reason = "step_budget_reserved"
 	}
@@ -321,6 +321,11 @@ func checkCoverageBeforeFreeze(ctx context.Context, uid, sessionID, runID string
 	// manifest can no longer make citable.
 	if _, _, frozen, ferr := artifact.NewStore(db).GetFrozenManifestByRun(ctx, uid, runID); ferr != nil {
 		log.Printf("[coverage_gate] run=%s session=%s: read frozen manifest failed: %v", runID, sessionID, ferr)
+		// Fail open, consistent with the run/spec reads above. The manifest may
+		// already be frozen; blocking on an uncertain read could make the planner
+		// fetch messages that applyFrozenManifest must then drop. The finish gate
+		// remains the honest disclosure fallback.
+		return nil
 	} else if frozen {
 		markCoverageGateSatisfied(runID)
 		return nil
