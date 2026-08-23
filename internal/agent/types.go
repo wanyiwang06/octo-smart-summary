@@ -35,11 +35,12 @@ type ToolCall struct {
 	} `json:"function"`
 }
 
-// AssistantTurn 是单轮 LLM 结果的归一化视图：内容 + 全部工具调用 + 本轮消耗 token。
+// AssistantTurn 是单轮 LLM 结果的归一化视图：内容 + 全部工具调用 + 本轮 token 用量。
 type AssistantTurn struct {
-	Content   string
-	ToolCalls []ToolCall
-	Tokens    int
+	Content          string
+	ToolCalls        []ToolCall
+	Tokens           int // usage.total_tokens; retained for the runner's existing budget semantics.
+	CompletionTokens int // usage.completion_tokens; used by diagnostics that report model output size.
 }
 
 // ContextKeyUID is the context key for storing user ID in request context.

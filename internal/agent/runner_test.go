@@ -116,8 +116,8 @@ func TestRunner_Run(t *testing.T) {
 		{
 			name: "token budget injects wrap-up",
 			turns: []AssistantTurn{
-				{ToolCalls: []ToolCall{mkToolCall("c1", "alpha", `{}`)}, Tokens: 999},
-				{Content: "wrapped", Tokens: 1},
+				{ToolCalls: []ToolCall{mkToolCall("c1", "alpha", `{}`)}, Tokens: 999, CompletionTokens: 1},
+				{Content: "wrapped", Tokens: 1, CompletionTokens: 1},
 			},
 			reg:     regWithEcho("alpha"),
 			policy:  Policy{MaxSteps: 5, MaxTokens: 500, StepTimeout: time.Second},

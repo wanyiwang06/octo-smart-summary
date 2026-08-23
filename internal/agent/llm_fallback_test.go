@@ -52,6 +52,27 @@ func newFallbackTestServer(t *testing.T, primaryModel string, primaryFailStatus 
 	}))
 }
 
+func TestChatSeparatesTotalAndCompletionTokens(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"done","tool_calls":null}}],"usage":{"prompt_tokens":90,"completion_tokens":7,"total_tokens":97}}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "test-key", "primary", 5, 512, nil)
+	c.http = &http.Client{Timeout: 2 * time.Second}
+	turn, err := c.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil)
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if turn.Tokens != 97 {
+		t.Fatalf("Tokens = %d, want total_tokens 97", turn.Tokens)
+	}
+	if turn.CompletionTokens != 7 {
+		t.Fatalf("CompletionTokens = %d, want completion_tokens 7", turn.CompletionTokens)
+	}
+}
+
 func TestChat_FailoverToFallbackAfterRetriesExhausted(t *testing.T) {
 	primary := "gpt-5.6-sol"
 	fallback := "claude-sonnet-4-6"

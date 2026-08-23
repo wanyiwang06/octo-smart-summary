@@ -70,7 +70,8 @@ type chatResponse struct {
 		} `json:"message"`
 	} `json:"choices"`
 	Usage struct {
-		TotalTokens int `json:"total_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
 	} `json:"usage"`
 }
 
@@ -169,8 +170,9 @@ func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, 
 	}
 	msg := cr.Choices[0].Message
 	return AssistantTurn{
-		Content:   msg.Content,
-		ToolCalls: msg.ToolCalls,
-		Tokens:    cr.Usage.TotalTokens,
+		Content:          msg.Content,
+		ToolCalls:        msg.ToolCalls,
+		Tokens:           cr.Usage.TotalTokens,
+		CompletionTokens: cr.Usage.CompletionTokens,
 	}, llmfallback.Success, nil
 }

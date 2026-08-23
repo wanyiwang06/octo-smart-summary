@@ -107,6 +107,30 @@ func TestTraceReportsPhaseSplit(t *testing.T) {
 	}
 }
 
+func TestRunnerTraceReportsCompletionTokens(t *testing.T) {
+	t.Setenv(TraceEnvVar, "1")
+	client := &fakeClient{turns: []AssistantTurn{{
+		Content:          "done",
+		Tokens:           321,
+		CompletionTokens: 17,
+	}}}
+	runner := NewRunner(client, NewRegistry(), NewPool(1), Policy{
+		MaxSteps: 1, MaxTokens: 1000, StepTimeout: time.Second,
+	})
+	ctx, tr := StartTrace(context.Background(), "sess-completion-tokens")
+	if _, _, err := runner.RunWithHistory(ctx, "system", nil, "hello"); err != nil {
+		t.Fatalf("RunWithHistory: %v", err)
+	}
+
+	out := captureLog(t, func() { tr.Report("ok") })
+	if !strings.Contains(out, "out_tokens=17") {
+		t.Fatalf("trace did not report completion_tokens:\n%s", out)
+	}
+	if strings.Contains(out, "out_tokens=321") {
+		t.Fatalf("trace mislabeled total_tokens as output tokens:\n%s", out)
+	}
+}
+
 // Hard privacy line: the trace records sizes, counts, durations, step names
 // and tool names — never content. This test feeds distinctive content into
 // every field that could plausibly leak and asserts none of it reaches the log.

@@ -145,7 +145,7 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 		turn, err := r.client.Chat(stepCtx, msgs, r.reg.Schemas())
 		planMs := time.Since(planStart).Milliseconds()
 		cancel()
-		trace.AddStep(step+1, planMs, promptChars, promptMsgs, turnTokens(turn, err))
+		trace.AddStep(step+1, planMs, promptChars, promptMsgs, turnCompletionTokens(turn, err))
 		if err != nil {
 			return "", nil, err
 		}
@@ -371,12 +371,12 @@ func extractToolCount(toolName, result string, idx, total int) int {
 	return 0
 }
 
-// turnTokens reports a turn's completion tokens, tolerating the error path
+// turnCompletionTokens reports a turn's completion tokens, tolerating the error path
 // (a failed turn has no usable token count, but its latency still matters and
 // the step is still recorded).
-func turnTokens(turn AssistantTurn, err error) int {
+func turnCompletionTokens(turn AssistantTurn, err error) int {
 	if err != nil {
 		return 0
 	}
-	return turn.Tokens
+	return turn.CompletionTokens
 }
