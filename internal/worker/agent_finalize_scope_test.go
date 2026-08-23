@@ -38,6 +38,68 @@ func TestRemapFinalizeCitations_PreservesNonCitationBrackets(t *testing.T) {
 	}
 }
 
+func TestRemapFinalizeCitations_MarkerFreeFormattingIsByteIdentical(t *testing.T) {
+	at := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	rows := []model.AgentMessageEvidence{
+		evidenceRow(t, "msg_u1_1", at, []pipeline.Message{poolMsg("alpha", 1, 1000, "a")}),
+	}
+	finalPool := buildPoolFromEvidenceRows(rows)
+	fragment := "## 结论\n- 顶层\n  - 二级\n    - 三级\n\n```go\nfunc main() {\n    if x {\n        fmt.Println(\"deep\")\n    }\n}\n```\n\n| 列A   | 列B   |\n| ----- | ----- |\n| 值1   | 值2   |\n\n    indented code block"
+
+	got, dropped := remapFinalizeCitations(
+		[]model.AgentMessage{{ID: 1, CreatedAt: at, Content: fragment}},
+		rows, finalPool, nil,
+	)
+	if dropped != 0 {
+		t.Fatalf("dropped = %d, want 0", dropped)
+	}
+	if got[0].Content != fragment {
+		t.Fatalf("marker-free formatting changed:\n--- want ---\n%s\n--- got ---\n%s", fragment, got[0].Content)
+	}
+}
+
+func TestRemapFinalizeCitations_AdjacentMarkersAreRemappedIndependently(t *testing.T) {
+	turn1At := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	turn2At := turn1At.Add(time.Hour)
+	rows := []model.AgentMessageEvidence{
+		evidenceRow(t, "msg_u1_1", turn1At, []pipeline.Message{
+			poolMsg("alpha", 1, 1000, "alpha-1"),
+			poolMsg("alpha", 2, 1001, "alpha-2"),
+		}),
+		evidenceRow(t, "msg_u1_2", turn2At, []pipeline.Message{
+			poolMsg("beta", 1, 10, "beta-1"),
+			poolMsg("beta", 2, 11, "beta-2"),
+		}),
+	}
+	finalPool := buildPoolFromEvidenceRows(rows)
+	got, dropped := remapFinalizeCitations(
+		[]model.AgentMessage{{ID: 10, CreatedAt: turn1At, Content: "符号整数 [+1]，相邻引用 [1][2]"}},
+		rows, finalPool, nil,
+	)
+	if dropped != 0 {
+		t.Fatalf("dropped = %d, want 0", dropped)
+	}
+	if want := "符号整数 [+1]，相邻引用 [3][4]"; got[0].Content != want {
+		t.Fatalf("got %q, want %q", got[0].Content, want)
+	}
+}
+
+func TestDropResolvableMarkers_DoesNotRewriteUnrelatedWhitespace(t *testing.T) {
+	at := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	rows := []model.AgentMessageEvidence{
+		evidenceRow(t, "msg_u1_1", at, []pipeline.Message{poolMsg("alpha", 1, 1000, "a")}),
+	}
+	dropped := 0
+	in := "  - 二级  对齐\n```go\n    keep  spaces\n```\n符号 [+1]，见 [1] 。"
+	got := dropResolvableMarkers(in, rows, &dropped)
+	if dropped != 1 {
+		t.Fatalf("dropped = %d, want 1", dropped)
+	}
+	if want := "  - 二级  对齐\n```go\n    keep  spaces\n```\n符号 [+1]，见  。"; got != want {
+		t.Fatalf("drop changed bytes outside the marker:\n want=%q\n got =%q", want, got)
+	}
+}
+
 // R4 BLOCKING 2: agent_message.created_at and agent_message_evidence.created_at
 // are both plain DATETIME (second resolution) and the per-turn filter uses an
 // INCLUSIVE bound, so turn 2 evidence stamped in the same second as turn 1 reply

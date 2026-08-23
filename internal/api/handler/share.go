@@ -184,15 +184,18 @@ func stripCitationTokens(content string, plain []model.Citation, team []model.Te
 //   - fenced code regions (``` ... ```) are passed through untouched;
 //   - ordinary bracketed integers are preserved unless the exact token exists
 //     in markers;
-//   - markdown links [1](url), reference-style links [1][label] and footnote
-//     definitions [1]: url are content, never markers.
+//   - markdown links [1](url), named reference links [1][label], numeric
+//     reference links backed by a real line-start definition, and line-start
+//     definitions [1]: url are content, never markers;
+//   - adjacent numeric markers [1][2] and prose `根据 [1]: ...` remain markers
+//     unless that numeric reference definition actually exists.
 //
 // R4 (PR #209): the SCOPING half of those rules now lives in
 // internal/citation.RewriteMarkers, because the Session-Finalize worker had to
 // answer the identical question and internal/worker cannot import this package
 // (this package already imports internal/worker). The marker-set SEMANTICS stay
-// here; only the syntax is shared. Behaviour is unchanged — share_test.go and
-// citation_marker_strip_test.go pin it byte-for-byte.
+// here; only the syntax is shared. The tests pin both the preserved Markdown
+// forms and the adjacent/inline-colon cases that must still be stripped.
 func stripUnresolvedCitationMarkers(content string, markers citationMarkerSet) string {
 	if len(markers) == 0 {
 		return strings.TrimSpace(content)

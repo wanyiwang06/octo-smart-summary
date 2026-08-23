@@ -30,17 +30,23 @@ func extractCitationIndexes(text string) []int {
 	return indexes
 }
 
-
 // BuildCitations is the exported wrapper of buildCitations.
 // Exposed so out-of-package callers can reuse the citation logic.
 func BuildCitations(text string, messages []pipeline.Message, allMessages []pipeline.Message, nameMap map[string]string) []model.Citation {
 	return buildCitations(text, messages, allMessages, nameMap)
 }
+
 // buildCitations builds a citation list from the summary text and original messages.
 // Only messages actually referenced in the text are included.
-
 func buildCitations(text string, messages []pipeline.Message, allMessages []pipeline.Message, nameMap map[string]string) []model.Citation {
-	indexes := extractCitationIndexes(text)
+	return buildCitationsFromIndexes(extractCitationIndexes(text), messages, allMessages, nameMap)
+}
+
+// buildCitationsFromIndexes is the shared materialization half of
+// buildCitations. Callers with stricter syntax rules (Session-Finalize uses the
+// fence/link-aware citation.RewriteMarkers scanner) can supply an already
+// scoped index set without falling back to the package-wide regexp.
+func buildCitationsFromIndexes(indexes []int, messages []pipeline.Message, allMessages []pipeline.Message, nameMap map[string]string) []model.Citation {
 	if len(indexes) == 0 {
 		return []model.Citation{}
 	}

@@ -177,6 +177,140 @@ func TestExecuteAgentFinalize_EmptyLLMOutputIsAnError(t *testing.T) {
 	}
 }
 
+func TestExecuteAgentFinalize_EvidenceQueryErrorPropagatesBeforeLLM(t *testing.T) {
+	db := newFinalizeCoreDB(t)
+	llm := &stubFinalizeLLM{out: "正文"}
+	p := newFinalizeCoreProcessor(db, llm)
+	seedReply(t, db, 1, time.Now(), "片段一")
+
+	injected := errors.New("injected evidence query failure")
+	cbName := "test:finalize_evidence_query_failure"
+	fired := false
+	if err := db.Callback().Query().Before("gorm:query").Register(cbName, func(tx *gorm.DB) {
+		if tx.Statement != nil && tx.Statement.Table == "agent_message_evidence" {
+			fired = true
+			tx.AddError(injected)
+		}
+	}); err != nil {
+		t.Fatalf("register query callback: %v", err)
+	}
+	defer func() { _ = db.Callback().Query().Remove(cbName) }()
+
+	_, _, _, _, _, err := p.executeAgentFinalize(context.Background(),
+		model.SummaryTask{ID: 7, AgentSessionID: "s1", AgentMessageID: 10}, "u1")
+	if !errors.Is(err, injected) {
+		t.Fatalf("evidence query error must propagate to retry handling, got %v", err)
+	}
+	if !fired {
+		t.Fatal("evidence query failure callback did not fire")
+	}
+	if llm.calls != 0 {
+		t.Fatalf("LLM calls = %d, want 0 after evidence query failure", llm.calls)
+	}
+}
+
+func TestExecuteAgentFinalize_HandleOrderQueryErrorPropagatesBeforeLLM(t *testing.T) {
+	db := newFinalizeCoreDB(t)
+	llm := &stubFinalizeLLM{out: "正文"}
+	p := newFinalizeCoreProcessor(db, llm)
+	at := time.Now()
+	seedReply(t, db, 1, at, "片段一 [1]")
+	row := evidenceRow(t, "msg_u1_1", at, []pipeline.Message{poolMsg("alpha", 1, 1000, "m1")})
+	if err := db.Create(&row).Error; err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+
+	injected := errors.New("injected handle-order query failure")
+	cbName := "test:finalize_handle_order_query_failure"
+	fired := false
+	if err := db.Callback().Query().After("gorm:query").Register(cbName, func(tx *gorm.DB) {
+		if tx.Statement == nil || tx.Statement.Table != "agent_message" {
+			return
+		}
+		for _, value := range tx.Statement.Vars {
+			if role, ok := value.(string); ok && role == "tool" {
+				fired = true
+				tx.AddError(injected)
+				return
+			}
+		}
+	}); err != nil {
+		t.Fatalf("register query callback: %v", err)
+	}
+	defer func() { _ = db.Callback().Query().Remove(cbName) }()
+
+	_, _, _, _, _, err := p.executeAgentFinalize(context.Background(),
+		model.SummaryTask{ID: 7, AgentSessionID: "s1", AgentMessageID: 10}, "u1")
+	if !errors.Is(err, injected) {
+		t.Fatalf("handle-order query error must propagate to retry handling, got %v", err)
+	}
+	if !fired {
+		t.Fatal("handle-order query failure callback did not fire")
+	}
+	if llm.calls != 0 {
+		t.Fatalf("LLM calls = %d, want 0 after handle-order query failure", llm.calls)
+	}
+}
+
+func TestExecuteAgentFinalize_NewOutputMarkerFailsClosed(t *testing.T) {
+	db := newFinalizeCoreDB(t)
+	at := time.Now()
+	seedReply(t, db, 1, at, "片段一 [1]")
+	row := evidenceRow(t, "msg_u1_1", at, []pipeline.Message{poolMsg("alpha", 1, 1000, "m1")})
+	if err := db.Create(&row).Error; err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+	llm := &stubFinalizeLLM{out: "正文 [1] 以及模型擅自新增的 [99]"}
+	p := newFinalizeCoreProcessor(db, llm)
+
+	_, _, _, _, _, err := p.executeAgentFinalize(context.Background(),
+		model.SummaryTask{ID: 7, AgentSessionID: "s1", AgentMessageID: 10}, "u1")
+	if err == nil || !strings.Contains(err.Error(), "[99]") {
+		t.Fatalf("new output marker must fail closed, got %v", err)
+	}
+	if llm.calls != 1 {
+		t.Fatalf("LLM calls = %d, want 1", llm.calls)
+	}
+}
+
+func TestExecuteAgentFinalize_SourceOutOfRangeProseIsPreserved(t *testing.T) {
+	db := newFinalizeCoreDB(t)
+	at := time.Now()
+	seedReply(t, db, 1, at, "按 GB/T 7714 [2020] 执行")
+	row := evidenceRow(t, "msg_u1_1", at, []pipeline.Message{poolMsg("alpha", 1, 1000, "m1")})
+	if err := db.Create(&row).Error; err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+	llm := &stubFinalizeLLM{out: "按 GB/T 7714 [2020] 执行"}
+	p := newFinalizeCoreProcessor(db, llm)
+
+	content, citations, msgCount, _, _, err := p.executeAgentFinalize(context.Background(),
+		model.SummaryTask{ID: 7, AgentSessionID: "s1", AgentMessageID: 10}, "u1")
+	if err != nil {
+		t.Fatalf("source-owned out-of-range token must remain prose: %v", err)
+	}
+	if content != "按 GB/T 7714 [2020] 执行" || len(citations) != 0 || msgCount != 1 {
+		t.Fatalf("unexpected result: content=%q citations=%d msgCount=%d", content, len(citations), msgCount)
+	}
+}
+
+func TestExecuteAgentFinalize_EvidenceFreeMarkerlessOutputSucceeds(t *testing.T) {
+	db := newFinalizeCoreDB(t)
+	at := time.Now()
+	seedReply(t, db, 1, at, "没有引用的片段")
+	llm := &stubFinalizeLLM{out: "没有引用的正文"}
+	p := newFinalizeCoreProcessor(db, llm)
+
+	content, citations, msgCount, _, _, err := p.executeAgentFinalize(context.Background(),
+		model.SummaryTask{ID: 7, AgentSessionID: "s1", AgentMessageID: 10}, "u1")
+	if err != nil {
+		t.Fatalf("a genuinely evidence-free, marker-free session must succeed: %v", err)
+	}
+	if content != "没有引用的正文" || len(citations) != 0 || msgCount != 0 {
+		t.Fatalf("unexpected result: content=%q citations=%d msgCount=%d", content, len(citations), msgCount)
+	}
+}
+
 // The happy path, end to end through the real function: the freeze bound is
 // honoured, tool-call/empty rows are excluded, msg_count is the SOURCE MESSAGE
 // count (len(pool)) and not the fragment count, and tokens/model come from the

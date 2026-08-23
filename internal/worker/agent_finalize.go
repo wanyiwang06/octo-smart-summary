@@ -154,9 +154,15 @@ func (p *Processor) executeAgentFinalize(ctx context.Context, task model.Summary
 	// drift vector). The remap below closes the CROSS-TURN vector, which is
 	// structural to merging and which the bound alone cannot touch — see
 	// remapFinalizeCitations.
-	evidenceRows := loadSessionEvidenceRows(ctx, p.db, userID, sessionID, replies[len(replies)-1].CreatedAt)
+	evidenceRows, err := loadSessionEvidenceRows(ctx, p.db, userID, sessionID, replies[len(replies)-1].CreatedAt)
+	if err != nil {
+		return "", nil, 0, 0, modelVer, fmt.Errorf("load session evidence: %w", err)
+	}
 	pool := buildPoolFromEvidenceRows(evidenceRows)
-	handleOrder := loadEvidenceHandleOrder(ctx, p.db, userID, sessionID, task.AgentMessageID)
+	handleOrder, err := loadEvidenceHandleOrder(ctx, p.db, userID, sessionID, task.AgentMessageID)
+	if err != nil {
+		return "", nil, 0, 0, modelVer, fmt.Errorf("load evidence handle order: %w", err)
+	}
 	replies, droppedMarkers := remapFinalizeCitations(replies, evidenceRows, pool, handleOrder)
 	if droppedMarkers > 0 {
 		log.Printf("[finalize] task %d session %s: dropped %d unresolvable citation marker(s) during cross-turn remap",
@@ -190,6 +196,9 @@ func (p *Processor) executeAgentFinalize(ctx context.Context, task model.Summary
 	if content == "" {
 		return "", nil, 0, 0, modelVer, fmt.Errorf("consolidation produced empty content for session %s", sessionID)
 	}
+	if err := validateFinalizeOutputMarkers(content, replies); err != nil {
+		return "", nil, 0, 0, modelVer, err
+	}
 
 	// 5. Citations resolve against the same frozen pool the markers were remapped
 	// into in step 3, so every surviving [n] points at the message its sentence
@@ -200,15 +209,7 @@ func (p *Processor) executeAgentFinalize(ctx context.Context, task model.Summary
 			nameMap[m.SenderUID] = m.SenderName
 		}
 	}
-	//
-	// R4 P2-9 — KNOWN, NOT FIXED HERE. BuildCitations drops out-of-range indices
-	// from the citation LIST but leaves the `[n]` TEXT in the body, so a model
-	// that invents `[99]` ships a marker with no citation behind it. That
-	// exposure is identical on the Map-Reduce path today
-	// (executePersonalPipeline calls the same builder the same way), so fixing it
-	// here alone would create a second convention for what a validated body is —
-	// exactly what this project forbids. It belongs in one pass over both paths.
-	citations := BuildCitations(content, pool, pool, nameMap)
+	citations := buildFinalizeCitations(content, pool, nameMap)
 
 	// msg_count is the number of SOURCE IM messages, everywhere else in the
 	// system (personal_processor.go, api/handler/task.go, api/handler/personal.go
@@ -218,6 +219,69 @@ func (p *Processor) executeAgentFinalize(ctx context.Context, task model.Summary
 	// which route produced the row. The frozen evidence pool IS this route's
 	// source-message set, so it is the honest denominator.
 	return content, citations, len(pool), tokens, modelVer, nil
+}
+
+func buildFinalizeCitations(content string, pool []pipeline.Message, nameMap map[string]string) []model.Citation {
+	seen := make(map[int]struct{})
+	indexes := make([]int, 0)
+	citation.RewriteMarkers(content, func(token string) (string, bool) {
+		n, ok := parsePositiveCitationOrdinal(token)
+		if !ok {
+			return "", false
+		}
+		if _, exists := seen[n]; !exists {
+			seen[n] = struct{}{}
+			indexes = append(indexes, n)
+		}
+		return "", false
+	})
+	sort.Ints(indexes)
+	return buildCitationsFromIndexes(indexes, pool, pool, nameMap)
+}
+
+// validateFinalizeOutputMarkers enforces that the model introduces no new
+// scoped marker index, without rewriting the generated body. The legacy
+// dedupCitations/stripOrphanCitations helpers use a document-wide regexp and
+// whitespace collapse; calling them here would reintroduce the exact list/code
+// formatting corruption this path just removed.
+//
+// Every scoped numeric marker in the output must already occur in the remapped
+// input fragments. Source-owned out-of-range tokens such as `GB/T 7714 [2020]`
+// remain prose and survive byte-identically; a model-created or renumbered token
+// that cannot be explained by the inputs fails closed and reaches the existing
+// retry path. Evidence query failures are rejected earlier, before this check.
+func validateFinalizeOutputMarkers(content string, replies []model.AgentMessage) error {
+	sourceMarkers := make(map[int]struct{})
+	for _, reply := range replies {
+		citation.RewriteMarkers(reply.Content, func(token string) (string, bool) {
+			if n, ok := parsePositiveCitationOrdinal(token); ok {
+				sourceMarkers[n] = struct{}{}
+			}
+			return "", false
+		})
+	}
+	invalidSet := make(map[int]struct{})
+	citation.RewriteMarkers(content, func(token string) (string, bool) {
+		n, ok := parsePositiveCitationOrdinal(token)
+		if !ok {
+			return "", false
+		}
+		_, existedInSource := sourceMarkers[n]
+		if !existedInSource {
+			invalidSet[n] = struct{}{}
+		}
+		return "", false
+	})
+	if len(invalidSet) == 0 {
+		return nil
+	}
+
+	invalid := make([]int, 0, len(invalidSet))
+	for n := range invalidSet {
+		invalid = append(invalid, n)
+	}
+	sort.Ints(invalid)
+	return fmt.Errorf("finalize output contains citation markers absent from the remapped input: %v", invalid)
 }
 
 // remapFinalizeCitations rewrites each fragment's [n] markers from the numbering
@@ -304,7 +368,7 @@ func remapFinalizeCitations(replies []model.AgentMessage, rows []model.AgentMess
 			// granularity: this fragment loses its markers, the rest of the
 			// deliverable keeps theirs.
 			before := dropped
-			out[i].Content = dropResolvableMarkers(out[i].Content, turnRows, finalIdx, &dropped)
+			out[i].Content = dropResolvableMarkers(out[i].Content, turnRows, &dropped)
 			log.Printf("[finalize] fragment %d (msg id=%d): evidence timestamps tie with the reply and change the derived numbering; dropped %d marker(s) rather than guess",
 				i+1, out[i].ID, dropped-before)
 			continue
@@ -316,8 +380,8 @@ func remapFinalizeCitations(replies []model.AgentMessage, rows []model.AgentMess
 		}
 
 		out[i].Content = citation.RewriteMarkers(out[i].Content, func(token string) (string, bool) {
-			n, err := strconv.Atoi(token)
-			if err != nil || n < 1 {
+			n, ok := parsePositiveCitationOrdinal(token)
+			if !ok {
 				// Not an ordinal at all (`[P2]`, `[+5]`, `[2020-01]`). Prose.
 				return "", false
 			}
@@ -344,7 +408,6 @@ func remapFinalizeCitations(replies []model.AgentMessage, rows []model.AgentMess
 			}
 			return fmt.Sprintf("[%d]", target), true
 		})
-		out[i].Content = tidyDroppedMarkerSpacing(out[i].Content)
 	}
 	return out, dropped
 }
@@ -357,26 +420,29 @@ func remapFinalizeCitations(replies []model.AgentMessage, rows []model.AgentMess
 // decide "could this ordinal have been a citation at all". A number inside that
 // range is treated as a citation and removed; anything outside it is prose and
 // survives, exactly as in the non-ambiguous path.
-func dropResolvableMarkers(content string, turnRows []model.AgentMessageEvidence, finalIdx map[string]int, dropped *int) string {
+func dropResolvableMarkers(content string, turnRows []model.AgentMessageEvidence, dropped *int) string {
 	size := len(buildPoolFromEvidenceRows(turnRows))
-	out := citation.RewriteMarkers(content, func(token string) (string, bool) {
-		n, err := strconv.Atoi(token)
-		if err != nil || n < 1 || n > size {
+	return citation.RewriteMarkers(content, func(token string) (string, bool) {
+		n, ok := parsePositiveCitationOrdinal(token)
+		if !ok || n > size {
 			return "", false
 		}
 		*dropped++
 		return "", true
 	})
-	return tidyDroppedMarkerSpacing(out)
 }
 
-// tidyDroppedMarkerSpacing collapses the whitespace a removed marker leaves
-// behind, so `见 [7] 。` does not become `见  。`.
-func tidyDroppedMarkerSpacing(s string) string {
-	s = strings.ReplaceAll(s, " \u3002", "\u3002")
-	s = strings.ReplaceAll(s, " \uff0c", "\uff0c")
-	s = multiSpaceRe.ReplaceAllString(s, " ")
-	return s
+func parsePositiveCitationOrdinal(token string) (int, bool) {
+	if token == "" {
+		return 0, false
+	}
+	for i := 0; i < len(token); i++ {
+		if token[i] < '0' || token[i] > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(token)
+	return n, err == nil && n > 0
 }
 
 // messageIdentity is the stable, index-independent name of a source message.
@@ -507,13 +573,14 @@ func sameNumbering(a, b []pipeline.Message) bool {
 // (user_id, session_id, handle); there is no auto-increment column and adding
 // one is a schema change, out of scope for v0).
 //
-// Best-effort by design: a handle that cannot be located simply falls back to
-// the timestamp comparison, which is the pre-existing behaviour. A DB error
-// degrades every fragment to that fallback rather than failing the run.
-func loadEvidenceHandleOrder(ctx context.Context, db *gorm.DB, userID, sessionID string, maxID int64) map[string]int64 {
+// A handle that genuinely cannot be located still falls back to the timestamp
+// comparison. A QUERY failure is different: silently treating it as "no ids"
+// re-enables the same-second attribution bug this helper exists to prevent, so
+// it must reach the worker retry path.
+func loadEvidenceHandleOrder(ctx context.Context, db *gorm.DB, userID, sessionID string, maxID int64) (map[string]int64, error) {
 	out := map[string]int64{}
 	if db == nil {
-		return out
+		return out, nil
 	}
 	q := db.WithContext(ctx).
 		Model(&model.AgentMessage{}).
@@ -523,8 +590,7 @@ func loadEvidenceHandleOrder(ctx context.Context, db *gorm.DB, userID, sessionID
 	}
 	var rows []model.AgentMessage
 	if err := q.Order("id ASC").Find(&rows).Error; err != nil {
-		log.Printf("[finalize] session %s: could not load tool rows for handle ordering (%v); falling back to created_at bounds", sessionID, err)
-		return out
+		return nil, err
 	}
 	for _, r := range rows {
 		var payload struct {
@@ -540,7 +606,7 @@ func loadEvidenceHandleOrder(ctx context.Context, db *gorm.DB, userID, sessionID
 			out[payload.MessagesHandle] = r.ID
 		}
 	}
-	return out
+	return out, nil
 }
 
 // buildFinalizeConsolidationPrompt assembles the single consolidation prompt.
@@ -610,7 +676,7 @@ func buildFinalizeConsolidationPrompt(title string, replies []model.AgentMessage
 // live session) and is the same residual documented on remapFinalizeCitations;
 // the durable fix for both is reading the frozen per-run manifests, which needs
 // a schema change (agent_message has no run_id).
-func loadSessionEvidenceRows(ctx context.Context, db *gorm.DB, userID, sessionID string, createdBefore time.Time) []model.AgentMessageEvidence {
+func loadSessionEvidenceRows(ctx context.Context, db *gorm.DB, userID, sessionID string, createdBefore time.Time) ([]model.AgentMessageEvidence, error) {
 	q := db.WithContext(ctx).
 		Where("user_id = ? AND session_id = ?", userID, sessionID)
 	if !createdBefore.IsZero() {
@@ -618,9 +684,9 @@ func loadSessionEvidenceRows(ctx context.Context, db *gorm.DB, userID, sessionID
 	}
 	var rows []model.AgentMessageEvidence
 	if err := q.Order("created_at ASC, handle ASC").Find(&rows).Error; err != nil {
-		return nil
+		return nil, err
 	}
-	return rows
+	return rows, nil
 }
 
 // buildPoolFromEvidenceRows decodes, de-dups, sorts and positionally indexes the

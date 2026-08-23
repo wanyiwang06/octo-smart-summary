@@ -328,6 +328,64 @@ func TestRemapFinalizeCitations_SingleTurnIsIdentity(t *testing.T) {
 	}
 }
 
+func TestValidateFinalizeOutputMarkers_PreservesFencedNumbersWithoutRewriting(t *testing.T) {
+	replies := []model.AgentMessage{{Content: "事实见 [1]\n```go\nitems[99] = x\n```"}}
+	content := replies[0].Content
+	if err := validateFinalizeOutputMarkers(content, replies); err != nil {
+		t.Fatalf("fenced code must survive validation byte-identically: %v", err)
+	}
+}
+
+func TestValidateFinalizeOutputMarkers_RejectsNewScopedMarker(t *testing.T) {
+	replies := []model.AgentMessage{{Content: "事实见 [1]"}}
+	if err := validateFinalizeOutputMarkers("事实见 [1]，模型新增 [2]", replies); err == nil {
+		t.Fatal("a marker absent from every input fragment must fail validation")
+	}
+}
+
+func TestValidateFinalizeOutputMarkers_PreservesSourceOutOfRangeProse(t *testing.T) {
+	replies := []model.AgentMessage{{Content: "按 GB/T 7714 [2020] 执行，事实见 [1]"}}
+	if err := validateFinalizeOutputMarkers(replies[0].Content, replies); err != nil {
+		t.Fatalf("a source-owned out-of-range bracket must remain prose: %v", err)
+	}
+}
+
+func TestValidateFinalizeOutputMarkers_SignedIntegerIsProse(t *testing.T) {
+	replies := []model.AgentMessage{{Content: "偏移量 [+1]"}}
+	if err := validateFinalizeOutputMarkers("偏移量 [+1]", replies); err != nil {
+		t.Fatalf("signed bracketed integer must not be treated as a citation: %v", err)
+	}
+}
+
+func TestBuildFinalizeCitations_UsesScopedMarkerSyntax(t *testing.T) {
+	pool := []pipeline.Message{
+		poolMsg("alpha", 1, 1000, "a"),
+		poolMsg("alpha", 2, 1001, "b"),
+	}
+	for i := range pool {
+		pool[i].CitationIndex = i + 1
+	}
+
+	t.Run("numeric reference link with definition", func(t *testing.T) {
+		content := "see [1][2] for details\n\n[2]: https://example.com/doc"
+		if got := buildFinalizeCitations(content, pool, nil); len(got) != 0 {
+			t.Fatalf("reference syntax produced %d fake citations, want 0", len(got))
+		}
+	})
+
+	t.Run("adjacent citations without definition", func(t *testing.T) {
+		if got := buildFinalizeCitations("事实 [1][2]", pool, nil); len(got) != 2 {
+			t.Fatalf("adjacent markers produced %d citations, want 2", len(got))
+		}
+	})
+
+	t.Run("inline colon is still a citation", func(t *testing.T) {
+		if got := buildFinalizeCitations("根据 [1]: 该结论成立", pool, nil); len(got) != 1 || got[0].Index != 1 {
+			t.Fatalf("inline-colon marker produced %+v, want citation 1", got)
+		}
+	})
+}
+
 // --- P2-7: the TriggerAgentFinalize routing branch ------------------------
 
 // A finalize task must NOT run executePipeline. executePipeline exists to
