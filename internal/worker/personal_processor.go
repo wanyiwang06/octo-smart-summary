@@ -265,8 +265,11 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 		}
 		return streamSender
 	}
-	// finishStreamDone terminates the stream, publishing the FINAL persisted
-	// body as a snapshot first.
+	// finishStreamDone terminates the stream, publishing the caller's final
+	// reconciled body as a snapshot first. On ordinary completion this is the
+	// persisted body. The scheduled empty-window path intentionally retains the
+	// previous stored result, so its generated placeholder remains only the
+	// terminal stream body; this helper does not claim persistence itself.
 	//
 	// Why the snapshot is not optional: deltas are emitted straight from the
 	// model as it generates (CallMapStream / CallReduceStream), so a live

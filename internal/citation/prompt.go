@@ -12,10 +12,9 @@ import "fmt"
 // cannot satisfy and a reviewer cannot verify; keeping the sentence and the
 // cap in one package makes the drift impossible.
 //
-// Returning "" for Disabled is what keeps the kill switch honest: with
-// SUMMARY_MAX_CITATIONS_PER_CLAIM=0 the prompt is byte-identical to the
-// pre-change prompt AND no truncation runs, so the whole feature reverts
-// without a rebuild.
+// Returning "" for Disabled keeps the cap-specific prompt and enforcement in
+// sync. Independent citation-safety fixes are intentionally not controlled by
+// this knob.
 //
 // The leading newline is part of the value so callers can concatenate onto a
 // bullet list without deciding whether they need a separator.
@@ -40,8 +39,8 @@ func PromptRuleZH(max int) string {
 // parameter in both, never a literal in a file.
 //
 // The truncation claim is stated only here, and it is now TRUE for this path:
-// the agent's final answer is capped in internal/agent/summary_answer.go. It
-// was previously hardcoded into summary.md while no call site capped the
+// summary-profile final answers are capped in internal/agent/summary_answer.go.
+// It was previously hardcoded into summary.md while no call site capped the
 // planner's body at all.
 //
 // Returns "" (including the trailing newline) for Disabled, so the placeholder

@@ -7,9 +7,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 )
 
-// CONFIGURATION.md tells operators that SUMMARY_MAX_CITATIONS_PER_CLAIM=0
-// "restores the previous behavior byte-for-byte, prompt included". This test
-// is that guarantee.
+// SUMMARY_MAX_CITATIONS_PER_CLAIM=0 must remove the cap-specific Map prompt
+// changes byte-for-byte. Independent citation-safety fixes are outside the
+// knob and do not affect this prompt block.
 //
 // It caught a real gap: the "多条消息支持同一要点时，列出所有相关编号" line was
 // rewritten UNCONDITIONALLY, outside the cap conditional, so PromptRuleZH(0)
@@ -39,8 +39,7 @@ func TestDisabledCapRestoresTheLegacyMapPrompt(t *testing.T) {
 			t.Setenv(config.MaxCitationsPerClaimEnvVar, off)
 			got := buildMapSystemPrompt("张三", "项目进展")
 			if !strings.Contains(got, legacyCitationRules) {
-				t.Errorf("with the cap disabled the Map prompt is NOT the legacy prompt.\n"+
-					"CONFIGURATION.md promises byte-for-byte rollback.\n\nwant block:\n%s\n\ngot prompt:\n%s",
+				t.Errorf("with the cap disabled the Map prompt is NOT the legacy prompt.\n\nwant block:\n%s\n\ngot prompt:\n%s",
 					legacyCitationRules, got)
 			}
 			if strings.Contains(got, "最多标注") {
@@ -82,5 +81,25 @@ func TestEnabledCapReplacesTheListEverythingInstruction(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestReducePromptUsesTheResolvedCap(t *testing.T) {
+	for _, n := range []string{"1", "3", "5"} {
+		t.Run("env="+n, func(t *testing.T) {
+			t.Setenv(config.MaxCitationsPerClaimEnvVar, n)
+			got := buildReduceSystemPrompt("项目进展")
+			if strings.Contains(got, "保留所有 [n] 引用标记") {
+				t.Fatal("Reduce prompt still asks to preserve every citation")
+			}
+			if !strings.Contains(got, "最多标注 "+n+" 个") {
+				t.Fatalf("Reduce prompt does not state cap %s:\n%s", n, got)
+			}
+		})
+	}
+
+	t.Setenv(config.MaxCitationsPerClaimEnvVar, "0")
+	if got := buildReduceSystemPrompt("项目进展"); strings.Contains(got, "最多标注") {
+		t.Fatalf("disabled cap still appears in Reduce prompt:\n%s", got)
 	}
 }

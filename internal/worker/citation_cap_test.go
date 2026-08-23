@@ -61,6 +61,14 @@ func TestCapOnRenderedPromptLineTouchesOnlyTheIndex(t *testing.T) {
 	}
 }
 
+func TestCollapseConsecutiveMarkersAcceptsUnicodeWhitespace(t *testing.T) {
+	for _, in := range []string{"[7]　[7]", "[7]\u00a0[7]"} {
+		if got := collapseConsecutiveMarkers(in); got != "[7]" {
+			t.Errorf("collapseConsecutiveMarkers(%q) = %q, want [7]", in, got)
+		}
+	}
+}
+
 // End-to-end on the worker path, in the REAL production order. This test
 // previously stopped at buildCitations and never called
 // dedupCitations/stripOrphanCitations — which is exactly the gap that let a

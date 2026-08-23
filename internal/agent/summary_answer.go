@@ -7,8 +7,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/config"
 )
 
-// CapFinalAnswer enforces the per-claim citation cap on the AGENT PLANNER's
-// final user-facing body.
+// CapFinalAnswer enforces the per-claim citation cap on a SUMMARY PROFILE
+// planner's final user-facing body. Callers must not apply it to general chat,
+// where bracketed expressions are ordinary text rather than citations.
 //
 // # Why this exists
 //

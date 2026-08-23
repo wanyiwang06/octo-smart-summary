@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citation"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -25,15 +26,7 @@ var emptyLineRe = regexp.MustCompile(`(?m)^[ \t]*$\n`)
 
 // extractCitationIndexes extracts all [n] citation indexes from text.
 func extractCitationIndexes(text string) []int {
-	matches := citationRe.FindAllStringSubmatch(text, -1)
-	var indexes []int
-	seen := make(map[int]bool)
-	for _, m := range matches {
-		if n, err := strconv.Atoi(m[1]); err == nil && !seen[n] {
-			indexes = append(indexes, n)
-			seen[n] = true
-		}
-	}
+	indexes := citation.Numbers(text)
 	sort.Ints(indexes)
 	return indexes
 }
@@ -362,7 +355,7 @@ func collapseConsecutiveMarkers(text string) string {
 
 func isOnlyWhitespace(s string) bool {
 	for _, r := range s {
-		if r != ' ' && r != '\t' && r != '\n' && r != '\r' {
+		if !unicode.IsSpace(r) {
 			return false
 		}
 	}

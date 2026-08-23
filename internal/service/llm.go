@@ -760,8 +760,7 @@ func buildReduceSystemPrompt(topic string) string {
 - 保留所有待办事项和责任人
 - 默认输出总长度不超过 2000 token（约 1500 字）；如果总结主题明确要求详细说明、完整展开或逐项说明，可在模型输出预算内适当展开，但仍需合并相似要点、压缩无关细节
 - 如有冲突信息，保留最新的
-- 保留所有 [n] 引用标记，不要删除或修改
-- 合并相同要点时，合并其引用编号
+- 合并相同要点时，合并其引用编号，但只保留最有代表性的来源
 - 如果总结主题中包含输出结构、详细程度、分点方式、待办格式等要求，必须优先遵循；如果主题没有指定结构，再根据实际内容自行组织结构
 - 用显示名称指代人，绝对不要输出 UID 或用户 ID
 - 输出语言与输入语言保持一致
@@ -771,6 +770,7 @@ func buildReduceSystemPrompt(topic string) string {
 - 绝对不要引用或复制正文内出现的任何 [数字] 标记
 - 超出有效范围的标记一律不得出现在输出中
 `)
+	sb.WriteString(citation.PromptRuleZH(config.MaxCitationsPerClaim()))
 	if topic != "" {
 		sb.WriteString(fmt.Sprintf("\n重要：总结主题是「%s」，请只保留与该主题相关的条目，移除不相关内容。\n", topic))
 	}

@@ -15,10 +15,12 @@
 //
 //  1. agent Map tool output — internal/agent/tool_summarize_chunk.go, after
 //     the per-chunk LLM call returns.
-//  2. agent final answer — internal/agent/summary_answer.go, applied by the
-//     chat handler to the planner's user-facing body. Added because the
-//     "merging re-exceeds a Map-only cap" argument that justifies (3) applies
-//     verbatim here: the planner merges chunk summaries in its own context.
+//  2. summary / summary_refine agent final answer —
+//     internal/agent/summary_answer.go, applied by the chat handler to the
+//     summary planner's user-facing body. General chat is excluded because
+//     bracketed expressions there are not citations. The "merging re-exceeds
+//     a Map-only cap" argument that justifies (3) applies verbatim here: the
+//     planner merges chunk summaries in its own context.
 //  3. worker final body — internal/worker/personal_processor.go, AFTER
 //     buildCitations/dedupCitations/stripOrphanCitations (see the call-site
 //     comment for why the order is what it is).
@@ -33,6 +35,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // MarkerRe matches a citation marker `[n]`, n = 1..5 digits.
@@ -93,7 +96,8 @@ func (s Stats) Changed() bool { return s.RemovedByDedup > 0 || s.RemovedByCap > 
 // # What a "claim" is
 //
 // The unit capped here is a maximal run of consecutive markers — `[3][7][12]`,
-// tolerating spaces/tabs between them — NOT a sentence, bullet or paragraph.
+// tolerating horizontal Unicode whitespace between them — NOT a sentence,
+// bullet or paragraph.
 // Three reasons:
 //
 //  1. It is exactly the pathological shape production produced: a single
@@ -267,22 +271,28 @@ func findRuns(text string) (runs [][][]int, citableCount, nonCitable int) {
 	return runs, len(citable), nonCitable
 }
 
-// longest reports the marker count and byte span of the longest run.
+// longest reports two independent maxima: the largest marker count and the
+// largest rendered byte span. They need not belong to the same run because
+// marker widths vary (`[1]` vs `[99999]`).
 func longest(runs [][][]int) (marks, chars int) {
 	for _, r := range runs {
 		if len(r) > marks {
 			marks = len(r)
-			chars = r[len(r)-1][1] - r[0][0]
+		}
+		if span := r[len(r)-1][1] - r[0][0]; span > chars {
+			chars = span
 		}
 	}
 	return marks, chars
 }
 
 // isRunGap reports whether the text between two markers keeps them in the
-// same run. Spaces and tabs only — a newline separates claims. See CapRuns.
+// same run. Horizontal Unicode whitespace is accepted because model output
+// in Chinese can use full-width spaces or NBSP; newlines still separate
+// claims. See CapRuns.
 func isRunGap(gap string) bool {
-	for i := 0; i < len(gap); i++ {
-		if gap[i] != ' ' && gap[i] != '\t' {
+	for _, r := range gap {
+		if r == '\n' || r == '\r' || !unicode.IsSpace(r) {
 			return false
 		}
 	}

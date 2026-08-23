@@ -20,6 +20,8 @@ func TestCapRunsBasicTruncation(t *testing.T) {
 		{"cap of one keeps one", "结论A [7][8][9]", 1, "结论A [7]"},
 		{"whitespace-separated run is one run", "结论A [1] [2] [3] [4]", 2, "结论A [1] [2]"},
 		{"tab-separated run is one run", "A [1]\t[2]\t[3]", 2, "A [1]\t[2]"},
+		{"fullwidth-space run is one run", "结论A [1]　[2]　[3]　[4]", 2, "结论A [1]　[2]"},
+		{"nbsp-separated run is one run", "A [1]\u00a0[2]\u00a0[3]", 2, "A [1]\u00a0[2]"},
 		{"no markers", "没有任何引用的结论", 3, "没有任何引用的结论"},
 		{"empty", "", 3, ""},
 	}
@@ -30,6 +32,17 @@ func TestCapRunsBasicTruncation(t *testing.T) {
 				t.Errorf("CapRuns(%q, %d)\n got: %q\nwant: %q", tc.in, tc.max, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestLongestTracksMarkerCountAndByteSpanIndependently(t *testing.T) {
+	_, st := CapRuns("短 [1][2][3]\n宽 [99999][88888]", Disabled)
+	if st.LongestRunBefore != 3 {
+		t.Fatalf("LongestRunBefore = %d, want 3 markers", st.LongestRunBefore)
+	}
+	if st.LongestRunCharsBefore != len("[99999][88888]") {
+		t.Fatalf("LongestRunCharsBefore = %d, want %d bytes",
+			st.LongestRunCharsBefore, len("[99999][88888]"))
 	}
 }
 
@@ -61,20 +74,13 @@ func TestCapRunsNeverDropsLastCitation(t *testing.T) {
 	} {
 		for max := 1; max <= 5; max++ {
 			got, _ := CapRuns(in, max)
-			for _, line := range strings.Split(in, "\n") {
+			outLines := strings.Split(got, "\n")
+			for i, line := range strings.Split(in, "\n") {
 				if !MarkerRe.MatchString(line) {
 					continue
 				}
-				// Each originally-cited line must still be cited.
-				found := false
-				for _, outLine := range strings.Split(got, "\n") {
-					if MarkerRe.MatchString(outLine) {
-						found = true
-						break
-					}
-				}
-				if !found {
-					t.Fatalf("CapRuns(%q, %d) = %q removed all citations", in, max, got)
+				if i >= len(outLines) || !MarkerRe.MatchString(outLines[i]) {
+					t.Fatalf("CapRuns(%q, %d) = %q removed all citations from line %d", in, max, got, i)
 				}
 			}
 			if n := len(Numbers(got)); n == 0 {
@@ -244,7 +250,7 @@ func TestCapRunsNeverInventsOrReordersNumbers(t *testing.T) {
 		}
 		in := b.String()
 		max := 1 + rng.Intn(5)
-		got, st := CapRuns(in, max)
+		got, _ := CapRuns(in, max)
 
 		inNums := Numbers(in)
 		outNums := Numbers(got)
@@ -279,9 +285,6 @@ func TestCapRunsNeverInventsOrReordersNumbers(t *testing.T) {
 			if i < len(outLines) && !MarkerRe.MatchString(outLines[i]) {
 				t.Fatalf("claim line %d lost all citations: %q -> %q", i, line, outLines[i])
 			}
-		}
-		if st.MarkersAfter != len(Numbers(got)) && st.RemovedByDedup == 0 {
-			_ = st // stats sanity is asserted precisely in the stats tests
 		}
 	}
 }
