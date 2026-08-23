@@ -190,7 +190,7 @@ func TestFinalize_IdempotentReplayBeatsInFlightGuard(t *testing.T) {
 // keys on the same session are a different request, and the in-flight guard is
 // what stops them becoming two finalize runs.
 //
-// HONEST LIMIT: this is the SEQUENTIAL case. The guard COUNTs outside the
+// HONEST LIMIT: this is the SEQUENTIAL case. The guard reads outside the
 // transaction and the task INSERT commits inside it, so two different-key
 // requests that arrive CONCURRENTLY both observe inflight == 0 and both commit.
 // The mandatory header closes the double-click vector, not this one; a DB-level
@@ -272,7 +272,7 @@ func TestFinalizeHashReq_DiscriminatesFromSyncSaveRoute(t *testing.T) {
 
 // --- BLOCKING 3: the Idempotency-Key header is mandatory ------------------
 
-// The in-flight guard COUNTs outside the transaction and the task INSERT
+// The in-flight guard reads outside the transaction and the task INSERT
 // commits inside it, with no unique constraint and no lock in between. Two
 // concurrent key-less requests (a double-click) would both see inflight == 0
 // and both commit a Pending task: two LLM runs, two deliverables, violating

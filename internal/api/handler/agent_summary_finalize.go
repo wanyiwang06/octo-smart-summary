@@ -122,7 +122,7 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 	//
 	// The Idempotency-Key header is MANDATORY on this route — see below.
 	idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
-	// Mandatory, not optional. The in-flight guard below COUNTs outside the
+	// Mandatory, not optional. The in-flight guard below reads outside the
 	// transaction and the task INSERT happens inside it, with no unique constraint
 	// and no lock in between, so two concurrent key-less requests (a double-click)
 	// both observe inflight == 0 and both commit a Pending task: two consolidation
@@ -133,13 +133,13 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 	// does not close the double-click vector; it closes it only for a client that
 	// reuses ONE key across the retries of one user intent. A client that mints a
 	// fresh UUID per HTTP request — the common naive implementation — sends two
-	// DIFFERENT keys, both preflights miss, both COUNTs see zero, and both commit.
+	// DIFFERENT keys, both preflights miss, both see no row, and both commit.
 	// What the requirement actually buys is that a correctly-keyed retry is
 	// settled atomically by the unique binding (insert + locked read-back)
-	// (insert + locked read-back), which is the vector that actually occurs.
+	// which is the vector that actually occurs.
 	//
 	// BE HONEST ABOUT THE RESIDUAL: two DIFFERENT keys for the same session still
-	// race past the COUNT and still produce two tasks, whether they came from a
+	// race past the read and still produce two tasks, whether they came from a
 	// double-click or from anywhere else. "One active run per session" is
 	// therefore a contract this handler ASKS clients to honour, not one the
 	// server enforces. The durable fix is a DB-level
@@ -204,40 +204,33 @@ func (h *AgentSummaryHandler) FinalizeAgentSummary(c *gin.Context) {
 	// its own task, not be rejected by it. Soft-deleted tasks are excluded because
 	// the poller skips them (processor.go), so a soft-deleted Pending finalize
 	// would otherwise stay "in flight" forever and permanently 409 the session.
-	var inflight int64
-	if err := h.db.WithContext(c.Request.Context()).
-		Model(&model.SummaryTask{}).
+	var blocking model.SummaryTask
+	inflightErr := h.db.WithContext(c.Request.Context()).
+		Select("id").
 		Where("creator_id = ? AND agent_session_id = ? AND trigger_type = ? AND status IN ? AND deleted_at IS NULL",
 			userID, req.SessionID, model.TriggerAgentFinalize,
 			[]int{model.StatusPending, model.StatusProcessing}).
-		Count(&inflight).Error; err != nil {
+		Order("id DESC").First(&blocking).Error
+	if inflightErr != nil && !errors.Is(inflightErr, gorm.ErrRecordNotFound) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "check in-flight finalize failed"})
 		return
 	}
-	if inflight > 0 {
+	if inflightErr == nil {
 		// R4 P2-6: name the blocking task and the way out. Both this guard and
 		// the sync route's symmetric guard count Pending/Processing, so until the
 		// stuck scan or WorkerMaxRetry fires, a wedged finalize blocks BOTH save
 		// paths — and a 409 that says only "请稍候" leaves the user with no action.
-		// POST /summaries/:id/cancel clears it (task.go); surface that.
-		var blocking model.SummaryTask
-		blockingID := int64(0)
-		if err := h.db.WithContext(c.Request.Context()).
-			Select("id").
-			Where("creator_id = ? AND agent_session_id = ? AND trigger_type = ? AND status IN ? AND deleted_at IS NULL",
-				userID, req.SessionID, model.TriggerAgentFinalize,
-				[]int{model.StatusPending, model.StatusProcessing}).
-			Order("id DESC").First(&blocking).Error; err == nil {
-			blockingID = blocking.ID
-		}
+		// POST /summaries/:id/cancel clears it (task.go); surface that. A single
+		// row query avoids the old COUNT-then-First race that could advertise
+		// `/summaries/0/cancel` if the worker completed between the two reads.
 		c.JSON(http.StatusConflict, apiResponse{
 			Code:    40009,
 			Message: "本次会话的定稿正在生成中,请稍候",
 			Data: gin.H{
-				"task_id":         blockingID,
+				"task_id":         blocking.ID,
 				"reason":          "finalize_in_flight",
 				"recovery_action": "wait_or_cancel",
-				"cancel_endpoint": fmt.Sprintf("/api/v1/summaries/%d/cancel", blockingID),
+				"cancel_endpoint": fmt.Sprintf("/api/v1/summaries/%d/cancel", blocking.ID),
 			},
 		})
 		return

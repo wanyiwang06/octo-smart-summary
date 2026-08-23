@@ -141,6 +141,99 @@ func TestRewriteMarkers_UnterminatedSecondLabelDoesNotHideFirstMarker(t *testing
 	}
 }
 
+func TestRewriteMarkers_UnterminatedEarlierBracketDoesNotHideLaterMarker(t *testing.T) {
+	rewrite := func(token string) (string, bool) { return "[R" + token + "]", true }
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		{in: "broken [ text [1] after", want: "broken [ text [R1] after"},
+		{in: "nested [[1] after", want: "nested [[R1] after"},
+	} {
+		if got := RewriteMarkers(tc.in, rewrite); got != tc.want {
+			t.Errorf("RewriteMarkers(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestRewriteMarkers_PreservesInlineCodeSpans(t *testing.T) {
+	rewrite := func(token string) (string, bool) { return "[R" + token + "]", true }
+	for _, tc := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "single backtick",
+			in:   "use `items[1]` and cite [2]",
+			want: "use `items[1]` and cite [R2]",
+		},
+		{
+			name: "double backtick contains single",
+			in:   "use ``a ` b[1]`` and cite [2]",
+			want: "use ``a ` b[1]`` and cite [R2]",
+		},
+		{
+			name: "multiline code span",
+			in:   "use `first\nitems[1]\nlast` and cite [2]",
+			want: "use `first\nitems[1]\nlast` and cite [R2]",
+		},
+		{
+			name: "unmatched backtick is prose",
+			in:   "literal ` then cite [1]",
+			want: "literal ` then cite [R1]",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RewriteMarkers(tc.in, rewrite); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRewriteMarkers_RecognizesCommonMarkFences(t *testing.T) {
+	rewrite := func(token string) (string, bool) { return "[R" + token + "]", true }
+	for _, tc := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "tilde fence",
+			in:   "before [1]\n~~~go\nitems[2]\n~~~\nafter [3]",
+			want: "before [R1]\n~~~go\nitems[2]\n~~~\nafter [R3]",
+		},
+		{
+			name: "long backtick fence ignores shorter run",
+			in:   "before [1]\n````\nitems[2]\n```\nitems[3]\n````\nafter [4]",
+			want: "before [R1]\n````\nitems[2]\n```\nitems[3]\n````\nafter [R4]",
+		},
+		{
+			name: "closing fence rejects trailing content",
+			in:   "```\nitems[1]\n``` not-a-close\nitems[2]\n```\nafter [3]",
+			want: "```\nitems[1]\n``` not-a-close\nitems[2]\n```\nafter [R3]",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RewriteMarkers(tc.in, rewrite); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRewriteMarkers_DefinitionInsideCommonMarkFenceDoesNotHideMarkers(t *testing.T) {
+	in := "adjacent [1][2]\n~~~\n[2]: https://example.com/doc\n~~~"
+	got := RewriteMarkers(in, func(token string) (string, bool) {
+		return "[R" + token + "]", true
+	})
+	want := "adjacent [R1][R2]\n~~~\n[2]: https://example.com/doc\n~~~"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 // Deletion is available to a caller that wants it, and does not disturb
 // surrounding bytes (the handler pins its spacing exactly).
 func TestRewriteMarkers_DeletionLeavesSpacingToTheCaller(t *testing.T) {

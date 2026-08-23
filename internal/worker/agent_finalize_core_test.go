@@ -267,15 +267,19 @@ func TestExecuteAgentFinalize_MissingPersistedEvidenceFailsBeforeLLM(t *testing.
 
 	_, _, _, _, _, err := p.executeAgentFinalize(context.Background(),
 		model.SummaryTask{ID: 7, AgentSessionID: "s1", AgentMessageID: 2}, "u1")
-	if err == nil || !strings.Contains(err.Error(), "evidence is incomplete") {
-		t.Fatalf("a returned handle without its evidence row must fail closed, got %v", err)
+	if !errors.Is(err, errFinalizeEvidenceUnavailable) {
+		t.Fatalf("a returned handle without its evidence row must report permanent evidence loss, got %v", err)
 	}
 	if llm.calls != 0 {
 		t.Fatalf("LLM calls = %d, want 0 when frozen evidence is incomplete", llm.calls)
 	}
+	user := sanitizeErrorForUser(err.Error())
+	if strings.Contains(user, "请稍后重试") || !strings.Contains(user, "引用依据") {
+		t.Fatalf("user-facing reason must explain permanent evidence loss, got %q", user)
+	}
 }
 
-func TestExecuteAgentFinalize_NewOutputMarkerFailsClosed(t *testing.T) {
+func TestExecuteAgentFinalize_NewOutputMarkerIsDroppedWithoutFailingDeliverable(t *testing.T) {
 	db := newFinalizeCoreDB(t)
 	at := time.Now()
 	seedReply(t, db, 1, at, "片段一 [1]")
@@ -286,10 +290,44 @@ func TestExecuteAgentFinalize_NewOutputMarkerFailsClosed(t *testing.T) {
 	llm := &stubFinalizeLLM{out: "正文 [1] 以及模型擅自新增的 [99]"}
 	p := newFinalizeCoreProcessor(db, llm)
 
-	_, _, _, _, _, err := p.executeAgentFinalize(context.Background(),
+	content, citations, _, _, _, err := p.executeAgentFinalize(context.Background(),
 		model.SummaryTask{ID: 7, AgentSessionID: "s1", AgentMessageID: 10}, "u1")
-	if err == nil || !strings.Contains(err.Error(), "[99]") {
-		t.Fatalf("new output marker must fail closed, got %v", err)
+	if err != nil {
+		t.Fatalf("one invented marker must not fail the whole deliverable: %v", err)
+	}
+	if strings.Contains(content, "[99]") || !strings.Contains(content, "[1]") {
+		t.Fatalf("content=%q, want valid marker preserved and invented marker dropped", content)
+	}
+	if len(citations) != 1 || citations[0].Index != 1 {
+		t.Fatalf("citations=%+v, want only citation 1", citations)
+	}
+	if llm.calls != 1 {
+		t.Fatalf("LLM calls = %d, want 1", llm.calls)
+	}
+}
+
+func TestExecuteAgentFinalize_OnlyUnknownMarkersIsRetryableFailure(t *testing.T) {
+	db := newFinalizeCoreDB(t)
+	at := time.Now()
+	seedReply(t, db, 1, at, "没有引用的片段")
+	llm := &stubFinalizeLLM{out: " [99] "}
+	p := newFinalizeCoreProcessor(db, llm)
+
+	content, citations, msgCount, _, _, err := p.executeAgentFinalize(context.Background(),
+		model.SummaryTask{ID: 7, AgentSessionID: "s1", AgentMessageID: 10}, "u1")
+	if err == nil {
+		t.Fatal("marker-only output must fail instead of completing with placeholder content")
+	}
+	if content != "" || citations != nil || msgCount != 0 {
+		t.Fatalf("failed result leaked output: content=%q citations=%v msgCount=%d", content, citations, msgCount)
+	}
+	if errors.Is(err, errFinalizeNoSessionContent) ||
+		errors.Is(err, errFinalizeEvidenceUnavailable) ||
+		errors.Is(err, errFinalizePromptTooLarge) {
+		t.Fatalf("model-produced empty content must remain retryable, got permanent error %v", err)
+	}
+	if !strings.Contains(err.Error(), "no usable content after citation validation") {
+		t.Fatalf("error should identify post-validation emptiness, got %v", err)
 	}
 	if llm.calls != 1 {
 		t.Fatalf("LLM calls = %d, want 1", llm.calls)

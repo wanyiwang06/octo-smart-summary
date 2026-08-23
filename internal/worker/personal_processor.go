@@ -346,7 +346,7 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 	if err != nil {
 		log.Printf("[personal-worker] pipeline error task=%d user=%s: %v", taskID, participant.UserID, err)
 		finishStreamError("summary generation failed")
-		p.markPersonalFailed(&pr, &participant, err.Error())
+		p.markPersonalFailedFromError(&pr, &participant, err)
 		return
 	}
 	if strings.TrimSpace(content) == "" {
@@ -514,6 +514,21 @@ func (p *Processor) backfillSystemSubmittedAt(taskID int64, pr *model.PersonalRe
 }
 
 func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *model.SummaryParticipant, errMsg string) {
+	p.markPersonalFailedWithPolicy(pr, participant, errMsg, false)
+}
+
+func (p *Processor) markPersonalFailedFromError(pr *model.PersonalResult, participant *model.SummaryParticipant, err error) {
+	if err == nil {
+		p.markPersonalFailedWithPolicy(pr, participant, "", false)
+		return
+	}
+	permanent := errors.Is(err, errFinalizeNoSessionContent) ||
+		errors.Is(err, errFinalizeEvidenceUnavailable) ||
+		errors.Is(err, errFinalizePromptTooLarge)
+	p.markPersonalFailedWithPolicy(pr, participant, err.Error(), permanent)
+}
+
+func (p *Processor) markPersonalFailedWithPolicy(pr *model.PersonalResult, participant *model.SummaryParticipant, errMsg string, permanent bool) {
 	sanitized := sanitizeErrorForUser(errMsg)
 
 	// Retryable personal failures are returned to Pending; exhausted attempts are
@@ -528,6 +543,8 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 	// never comes -> task stuck until the lease times out.
 	//
 	// Retry behavior:
+	//   - deterministic finalize sentinels skip re-dispatch and become terminal
+	//     after this recorded attempt; the frozen inputs cannot heal on retry.
 	//   - retry_count < WorkerMaxRetry: increment retry_count and set worker_status back
 	//     to Pending (participant stays Accepted). scanStuckPersonalTasks' M3 sweep (and
 	//     the AUTO dispatch path) then naturally re-runs it -- a transient failure heals.
@@ -567,7 +584,7 @@ func (p *Processor) markPersonalFailed(pr *model.PersonalResult, participant *mo
 			return err
 		}
 		newRetry := current.RetryCount
-		willRetry = newRetry < maxRetry
+		willRetry = !permanent && newRetry < maxRetry
 
 		if willRetry {
 			// Transient failure: reset to Pending so the retry scanner re-runs it.
@@ -1175,6 +1192,11 @@ func sanitizeErrorForUser(errMsg string) string {
 	// "retry later", which is the one action that cannot work.
 	case strings.Contains(errMsg, "finalize: session has no usable assistant content"):
 		return "本次会话的内容已被保存或清空，无法定稿；请重新对话后再定稿"
+	// Evidence rows can expire before an otherwise-active session because the
+	// cleanup jobs use independent last-activity clocks. The frozen task cannot
+	// recreate the lost citation-numbering source, so retrying is not useful.
+	case strings.Contains(errMsg, "finalize: citation evidence is no longer available"):
+		return "本次会话的引用依据已过期或被清理，无法安全定稿；请重新发起总结后再定稿"
 	// Session-Finalize v0 (R4 P2-10): a single fragment larger than the whole
 	// prompt budget. Surfaced as a distinct pre-flight error instead of an
 	// opaque gateway rejection.

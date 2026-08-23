@@ -33,6 +33,13 @@ const finalizeTemperature = 0.3
 // a reason instead of "AI 处理失败，请稍后重试".
 var errFinalizeNoSessionContent = errors.New("finalize: session has no usable assistant content")
 
+// errFinalizeEvidenceUnavailable marks a permanent provenance failure: a tool
+// result still names a messages_handle, but the evidence row that defined that
+// handle's citation numbering is gone (for example after the 24h cleanup jobs
+// retire messages and evidence on different last-activity clocks). Retrying the
+// same frozen task cannot recreate that row and must not burn WorkerMaxRetry.
+var errFinalizeEvidenceUnavailable = errors.New("finalize: citation evidence is no longer available")
+
 // errFinalizePromptTooLarge marks a prompt that cannot fit even after budgeting
 // — the single-oversized-fragment case budgetFinalizeReplies deliberately does
 // not solve (an empty prompt is worse than an over-budget one).
@@ -199,8 +206,17 @@ func (p *Processor) executeAgentFinalize(ctx context.Context, task model.Summary
 	if content == "" {
 		return "", nil, 0, 0, modelVer, fmt.Errorf("consolidation produced empty content for session %s", sessionID)
 	}
-	if err := validateFinalizeOutputMarkers(content, replies); err != nil {
-		return "", nil, 0, 0, modelVer, err
+	content, droppedOutputMarkers := stripUnknownFinalizeOutputMarkers(content, replies)
+	if droppedOutputMarkers > 0 {
+		log.Printf("[finalize] task %d session %s: dropped %d citation marker(s) invented or renumbered by the consolidation model",
+			task.ID, sessionID, droppedOutputMarkers)
+	}
+	content = strings.TrimSpace(content)
+	if content == "" {
+		// Unlike missing session/evidence rows, this can heal on a later LLM
+		// attempt. Keep it retryable, but never persist the fallback placeholder
+		// that the outer pipeline uses for a successful empty result.
+		return "", nil, 0, 0, modelVer, fmt.Errorf("consolidation produced no usable content after citation validation for session %s", sessionID)
 	}
 
 	// 5. Citations resolve against the same frozen pool the markers were remapped
@@ -242,18 +258,19 @@ func buildFinalizeCitations(content string, pool []pipeline.Message, nameMap map
 	return buildCitationsFromIndexes(indexes, pool, pool, nameMap)
 }
 
-// validateFinalizeOutputMarkers enforces that the model introduces no new
-// scoped marker index, without rewriting the generated body. The legacy
+// stripUnknownFinalizeOutputMarkers removes only scoped numeric markers the
+// consolidation model introduced or renumbered: every surviving marker index
+// must already occur in the remapped input fragments. The legacy
 // dedupCitations/stripOrphanCitations helpers use a document-wide regexp and
 // whitespace collapse; calling them here would reintroduce the exact list/code
 // formatting corruption this path just removed.
 //
-// Every scoped numeric marker in the output must already occur in the remapped
-// input fragments. Source-owned out-of-range tokens such as `GB/T 7714 [2020]`
-// remain prose and survive byte-identically; a model-created or renumbered token
-// that cannot be explained by the inputs fails closed and reaches the existing
-// retry path. Evidence query failures are rejected earlier, before this check.
-func validateFinalizeOutputMarkers(content string, replies []model.AgentMessage) error {
+// The degradation is marker-local, not task-wide: wrong attribution is removed
+// and counted for diagnostics, while the rest of an otherwise usable
+// deliverable still ships. Source-owned out-of-range tokens such as
+// `GB/T 7714 [2020]` remain prose and survive byte-identically. Evidence query
+// failures are rejected earlier, before this check.
+func stripUnknownFinalizeOutputMarkers(content string, replies []model.AgentMessage) (string, int) {
 	sourceMarkers := make(map[int]struct{})
 	for _, reply := range replies {
 		citation.RewriteMarkers(reply.Content, func(token string) (string, bool) {
@@ -263,37 +280,31 @@ func validateFinalizeOutputMarkers(content string, replies []model.AgentMessage)
 			return "", false
 		})
 	}
-	invalidSet := make(map[int]struct{})
-	citation.RewriteMarkers(content, func(token string) (string, bool) {
+	dropped := 0
+	content = citation.RewriteMarkers(content, func(token string) (string, bool) {
 		n, ok := parsePositiveCitationOrdinal(token)
 		if !ok {
 			return "", false
 		}
 		_, existedInSource := sourceMarkers[n]
 		if !existedInSource {
-			invalidSet[n] = struct{}{}
+			dropped++
+			return "", true
 		}
 		return "", false
 	})
-	if len(invalidSet) == 0 {
-		return nil
-	}
-
-	invalid := make([]int, 0, len(invalidSet))
-	for n := range invalidSet {
-		invalid = append(invalid, n)
-	}
-	sort.Ints(invalid)
-	return fmt.Errorf("finalize output contains citation markers absent from the remapped input: %v", invalid)
+	return content, dropped
 }
 
 // validateFinalizeEvidenceCompleteness distinguishes a genuinely evidence-free
 // session from evidence that was deleted after the agent used it. Every
 // messages_handle returned by a tool inside the freeze bound is persisted to
 // agent_message_evidence before the tool returns. A missing row therefore means
-// the numbering source is incomplete; retry rather than reconstructing a
-// plausible-looking but wrong pool. Orphan evidence rows without a tool record
-// remain handled by the existing per-fragment ambiguity fallback.
+// the numbering source is incomplete. The missing rows can be caused by the
+// cleanup job and cannot be reconstructed by retrying the same frozen task, so
+// return a sentinel that the worker treats as terminal and renders as an
+// actionable user message. Orphan evidence rows without a tool record remain
+// handled by the existing per-fragment ambiguity fallback.
 func validateFinalizeEvidenceCompleteness(rows []model.AgentMessageEvidence, handleOrder map[string]int64) error {
 	if len(handleOrder) == 0 {
 		return nil
@@ -309,7 +320,7 @@ func validateFinalizeEvidenceCompleteness(rows []model.AgentMessageEvidence, han
 		}
 	}
 	if missing > 0 {
-		return fmt.Errorf("finalize evidence is incomplete: %d persisted tool handle(s) have no evidence row", missing)
+		return fmt.Errorf("%w: %d persisted tool handle(s) have no evidence row", errFinalizeEvidenceUnavailable, missing)
 	}
 	return nil
 }
@@ -358,7 +369,11 @@ func validateFinalizeEvidenceCompleteness(rows []model.AgentMessageEvidence, han
 //     (Round 3 deleted these. That was the defect.)
 //
 // KNOWN WEAKNESS — this RE-DERIVES each turn's numbering instead of reading an
-// authoritative record of it. PersistEvidence upserts with
+// authoritative record of it. In V2, summarize_chunk may actively apply a
+// frozen per-run manifest that drops post-freeze messages and orders by manifest
+// ordinal, while this function has no equivalent mapping because a reply is not
+// linked to its run_id. A handle-producing tool after the first summarize_chunk
+// can therefore make the two numberings diverge. PersistEvidence also upserts with
 // ON DUPLICATE KEY UPDATE evidence = VALUES(evidence) and deliberately does NOT
 // refresh created_at, so a row rewritten after the fact re-derives differently
 // than the turn actually saw. Reading the frozen per-run manifests
@@ -629,9 +644,9 @@ func loadEvidenceHandleOrder(ctx context.Context, db *gorm.DB, userID, sessionID
 		if err := json.Unmarshal([]byte(r.Content), &payload); err != nil || payload.MessagesHandle == "" {
 			continue
 		}
-		// FIRST occurrence wins: a handle is minted once, and if a later row
-		// echoes it (search_messages consuming a handle it did not mint) the
-		// earlier id is the moment the evidence actually became available.
+		// FIRST occurrence wins defensively. Handles are expected to be minted
+		// once, so duplicates indicate malformed or replayed tool rows; keeping
+		// the earliest id is the conservative availability bound.
 		if _, seen := out[payload.MessagesHandle]; !seen {
 			out[payload.MessagesHandle] = r.ID
 		}

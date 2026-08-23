@@ -2,6 +2,7 @@ package worker
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strconv"
 	"strings"
@@ -328,32 +329,36 @@ func TestRemapFinalizeCitations_SingleTurnIsIdentity(t *testing.T) {
 	}
 }
 
-func TestValidateFinalizeOutputMarkers_PreservesFencedNumbersWithoutRewriting(t *testing.T) {
+func TestStripUnknownFinalizeOutputMarkers_PreservesFencedNumbersWithoutRewriting(t *testing.T) {
 	replies := []model.AgentMessage{{Content: "事实见 [1]\n```go\nitems[99] = x\n```"}}
 	content := replies[0].Content
-	if err := validateFinalizeOutputMarkers(content, replies); err != nil {
-		t.Fatalf("fenced code must survive validation byte-identically: %v", err)
+	got, dropped := stripUnknownFinalizeOutputMarkers(content, replies)
+	if got != content || dropped != 0 {
+		t.Fatalf("fenced code must survive byte-identically: got=%q dropped=%d", got, dropped)
 	}
 }
 
-func TestValidateFinalizeOutputMarkers_RejectsNewScopedMarker(t *testing.T) {
+func TestStripUnknownFinalizeOutputMarkers_DropsOnlyNewScopedMarker(t *testing.T) {
 	replies := []model.AgentMessage{{Content: "事实见 [1]"}}
-	if err := validateFinalizeOutputMarkers("事实见 [1]，模型新增 [2]", replies); err == nil {
-		t.Fatal("a marker absent from every input fragment must fail validation")
+	got, dropped := stripUnknownFinalizeOutputMarkers("事实见 [1]，模型新增 [2]", replies)
+	if want := "事实见 [1]，模型新增 "; got != want || dropped != 1 {
+		t.Fatalf("got=%q dropped=%d, want=%q/1", got, dropped, want)
 	}
 }
 
-func TestValidateFinalizeOutputMarkers_PreservesSourceOutOfRangeProse(t *testing.T) {
+func TestStripUnknownFinalizeOutputMarkers_PreservesSourceOutOfRangeProse(t *testing.T) {
 	replies := []model.AgentMessage{{Content: "按 GB/T 7714 [2020] 执行，事实见 [1]"}}
-	if err := validateFinalizeOutputMarkers(replies[0].Content, replies); err != nil {
-		t.Fatalf("a source-owned out-of-range bracket must remain prose: %v", err)
+	got, dropped := stripUnknownFinalizeOutputMarkers(replies[0].Content, replies)
+	if got != replies[0].Content || dropped != 0 {
+		t.Fatalf("source-owned prose changed: got=%q dropped=%d", got, dropped)
 	}
 }
 
-func TestValidateFinalizeOutputMarkers_SignedIntegerIsProse(t *testing.T) {
+func TestStripUnknownFinalizeOutputMarkers_SignedIntegerIsProse(t *testing.T) {
 	replies := []model.AgentMessage{{Content: "偏移量 [+1]"}}
-	if err := validateFinalizeOutputMarkers("偏移量 [+1]", replies); err != nil {
-		t.Fatalf("signed bracketed integer must not be treated as a citation: %v", err)
+	got, dropped := stripUnknownFinalizeOutputMarkers("偏移量 [+1]", replies)
+	if got != replies[0].Content || dropped != 0 {
+		t.Fatalf("signed bracketed integer changed: got=%q dropped=%d", got, dropped)
 	}
 }
 
@@ -391,8 +396,8 @@ func TestValidateFinalizeEvidenceCompleteness_ChecksEveryReturnedHandle(t *testi
 	if err := validateFinalizeEvidenceCompleteness(rows, map[string]int64{"h1": 1}); err != nil {
 		t.Fatalf("an empty but persisted evidence row is complete: %v", err)
 	}
-	if err := validateFinalizeEvidenceCompleteness(rows, map[string]int64{"h1": 1, "h2": 2}); err == nil {
-		t.Fatal("a partially missing persisted handle must fail closed")
+	if err := validateFinalizeEvidenceCompleteness(rows, map[string]int64{"h1": 1, "h2": 2}); !errors.Is(err, errFinalizeEvidenceUnavailable) {
+		t.Fatalf("a missing persisted handle must return errFinalizeEvidenceUnavailable, got %v", err)
 	}
 }
 

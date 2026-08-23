@@ -36,8 +36,10 @@ type MarkerRewriter func(token string) (replacement string, rewrite bool)
 // Scoping rules — all of them NARROWING, all of them settled previously in
 // handler.stripUnresolvedCitationMarkers (R11 Q5) and re-derived here once:
 //
-//   - fenced code regions (``` ... ```) are passed through untouched, so
-//     `items[0] = x` in a Go block survives;
+//   - CommonMark fenced code regions (backtick or tilde, with the closing run
+//     at least as long as the opening run) are passed through untouched;
+//   - matched inline-code spans are passed through untouched, including spans
+//     that cross a line break;
 //   - a markdown inline link `[1](url)` is content, never a marker — deleting
 //     or renumbering the `[1]` silently corrupts the link;
 //   - a named reference-style link `[1][docs]` is content for the same reason;
@@ -47,7 +49,7 @@ type MarkerRewriter func(token string) (replacement string, rewrite bool)
 //   - a reference definition `[1]: https://…` is exempt only at line start
 //     (with up to three leading spaces), not in prose such as `根据 [1]: ...`;
 //   - an unterminated `[` is copied verbatim, but does not hide a complete
-//     marker immediately before it.
+//     marker immediately before or after it.
 //
 // Everything else is offered to fn, which may still decline it.
 //
@@ -58,44 +60,249 @@ func RewriteMarkers(content string, fn MarkerRewriter) string {
 	if fn == nil {
 		return content
 	}
-	lines := strings.Split(content, "\n")
-	definitions := collectReferenceDefinitions(lines)
-	inFence := false
-	for i, line := range lines {
-		if strings.HasPrefix(strings.TrimLeft(line, " \t"), "```") {
-			inFence = !inFence
+	segments := splitFencedSegments(content)
+	definitions := collectReferenceDefinitions(segments)
+	var b strings.Builder
+	b.Grow(len(content))
+	for _, segment := range segments {
+		if segment.protected {
+			b.WriteString(segment.text)
 			continue
 		}
-		if !inFence {
-			lines[i] = rewriteMarkersInLine(line, definitions, fn)
-		}
+		b.WriteString(rewriteMarkersInText(segment.text, definitions, fn))
 	}
-	return strings.Join(lines, "\n")
+	return b.String()
 }
 
-// rewriteMarkersInLine applies RewriteMarkers' rules to a single non-fenced
-// line. See RewriteMarkers for the scoping rules.
-func rewriteMarkersInLine(line string, definitions map[string]struct{}, fn MarkerRewriter) string {
-	var b strings.Builder
-	for i := 0; i < len(line); {
-		if line[i] != '[' {
-			b.WriteByte(line[i])
+type markdownSegment struct {
+	text      string
+	protected bool
+}
+
+type fenceState struct {
+	marker byte
+	length int
+}
+
+// splitFencedSegments applies CommonMark's core fence rules: an opener has up
+// to three leading spaces and at least three matching backticks or tildes; a
+// closer uses the same character, a run at least as long as the opener, and no
+// trailing non-whitespace. Keeping the opening length prevents a literal ```
+// line inside a ```` block from ending the block early.
+func splitFencedSegments(content string) []markdownSegment {
+	if content == "" {
+		return nil
+	}
+	segments := make([]markdownSegment, 0, 3)
+	appendSegment := func(text string, protected bool) {
+		if text == "" {
+			return
+		}
+		if len(segments) > 0 && segments[len(segments)-1].protected == protected {
+			segments[len(segments)-1].text += text
+			return
+		}
+		segments = append(segments, markdownSegment{text: text, protected: protected})
+	}
+
+	var fence fenceState
+	for start := 0; start < len(content); {
+		next := strings.IndexByte(content[start:], '\n')
+		if next < 0 {
+			next = len(content)
+		} else {
+			next += start + 1
+		}
+		line := content[start:next]
+		bare := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		if fence.length > 0 {
+			appendSegment(line, true)
+			if closesFence(bare, fence) {
+				fence = fenceState{}
+			}
+		} else if opened, ok := opensFence(bare); ok {
+			appendSegment(line, true)
+			fence = opened
+		} else {
+			appendSegment(line, false)
+		}
+		start = next
+	}
+	return segments
+}
+
+func opensFence(line string) (fenceState, bool) {
+	i := 0
+	for i < len(line) && i < 4 && line[i] == ' ' {
+		i++
+	}
+	if i > 3 || i >= len(line) || (line[i] != '`' && line[i] != '~') {
+		return fenceState{}, false
+	}
+	marker := line[i]
+	j := i
+	for j < len(line) && line[j] == marker {
+		j++
+	}
+	if j-i < 3 {
+		return fenceState{}, false
+	}
+	// A backtick fence's info string cannot itself contain a backtick.
+	if marker == '`' && strings.ContainsRune(line[j:], '`') {
+		return fenceState{}, false
+	}
+	return fenceState{marker: marker, length: j - i}, true
+}
+
+func closesFence(line string, fence fenceState) bool {
+	i := 0
+	for i < len(line) && i < 4 && line[i] == ' ' {
+		i++
+	}
+	if i > 3 || i >= len(line) || line[i] != fence.marker {
+		return false
+	}
+	j := i
+	for j < len(line) && line[j] == fence.marker {
+		j++
+	}
+	return j-i >= fence.length && strings.Trim(line[j:], " \t") == ""
+}
+
+type textSpan struct {
+	start int
+	end   int
+}
+
+// inlineCodeSpans returns matched CommonMark backtick spans. An unmatched run
+// remains prose, so it cannot suppress a real citation marker later in the
+// document. Matching uses an equal-length closing run and may cross newlines.
+func inlineCodeSpans(content string) []textSpan {
+	var spans []textSpan
+	for i := 0; i < len(content); {
+		if content[i] != '`' || isBackslashEscaped(content, i) {
 			i++
 			continue
 		}
-		end := strings.IndexByte(line[i:], ']')
-		if end < 0 {
-			// Unterminated bracket: emit the rest verbatim rather than
-			// consuming it.
-			b.WriteString(line[i:])
-			break
+		run := backtickRunLength(content, i)
+		closeAt := -1
+		for j := i + run; j < len(content); {
+			if content[j] != '`' {
+				j++
+				continue
+			}
+			candidateRun := backtickRunLength(content, j)
+			if candidateRun == run {
+				closeAt = j
+				break
+			}
+			j += candidateRun
 		}
-		end += i
+		if closeAt < 0 {
+			i += run
+			continue
+		}
+		spans = append(spans, textSpan{start: i, end: closeAt + run})
+		i = closeAt + run
+	}
+	return spans
+}
+
+func backtickRunLength(content string, start int) int {
+	end := start
+	for end < len(content) && content[end] == '`' {
+		end++
+	}
+	return end - start
+}
+
+func isBackslashEscaped(content string, at int) bool {
+	backslashes := 0
+	for i := at - 1; i >= 0 && content[i] == '\\'; i-- {
+		backslashes++
+	}
+	return backslashes%2 == 1
+}
+
+func spanContains(spans []textSpan, at int) bool {
+	for _, span := range spans {
+		if at < span.start {
+			return false
+		}
+		if at < span.end {
+			return true
+		}
+	}
+	return false
+}
+
+// rewriteMarkersInText applies RewriteMarkers' rules to one non-fenced block.
+// Inline code spans are protected before bracket scanning.
+func rewriteMarkersInText(content string, definitions map[string]struct{}, fn MarkerRewriter) string {
+	codeSpans := inlineCodeSpans(content)
+	spanIndex := 0
+	var b strings.Builder
+	lineStart := 0
+	for i := 0; i < len(content); {
+		for spanIndex < len(codeSpans) && codeSpans[spanIndex].end <= i {
+			spanIndex++
+		}
+		if spanIndex < len(codeSpans) && codeSpans[spanIndex].start <= i && i < codeSpans[spanIndex].end {
+			span := codeSpans[spanIndex]
+			b.WriteString(content[i:span.end])
+			if lastNewline := strings.LastIndexByte(content[i:span.end], '\n'); lastNewline >= 0 {
+				lineStart = i + lastNewline + 1
+			}
+			i = span.end
+			spanIndex++
+			continue
+		}
+		if content[i] != '[' {
+			b.WriteByte(content[i])
+			if content[i] == '\n' {
+				lineStart = i + 1
+			}
+			i++
+			continue
+		}
+
+		lineEnd := strings.IndexByte(content[i:], '\n')
+		if lineEnd < 0 {
+			lineEnd = len(content)
+		} else {
+			lineEnd += i
+		}
+		endOffset := strings.IndexByte(content[i:lineEnd], ']')
+		if endOffset < 0 {
+			// Copy only this unmatched opener. Advancing one byte instead of
+			// consuming the rest of the line lets a later complete marker be
+			// discovered independently.
+			b.WriteByte(content[i])
+			i++
+			continue
+		}
+		end := i + endOffset
+		// Likewise, a prose opener must not reach across an inline-code span to
+		// steal a closing bracket from code.
+		if spanIndex < len(codeSpans) && codeSpans[spanIndex].start < end {
+			b.WriteByte(content[i])
+			i++
+			continue
+		}
+		// A stray opener before a real marker must not claim that marker's
+		// closing bracket. Preserve the outer text and restart at the innermost
+		// opener, which owns the first closing bracket.
+		if nested := strings.LastIndexByte(content[i+1:end], '['); nested >= 0 {
+			nested += i + 1
+			b.WriteString(content[i:nested])
+			i = nested
+			continue
+		}
 		// A link or reference definition is content, not a marker.
-		if end+1 < len(line) {
-			switch line[end+1] {
+		if end+1 < lineEnd {
+			switch content[end+1] {
 			case '(':
-				b.WriteString(line[i : end+1])
+				b.WriteString(content[i : end+1])
 				i = end + 1
 				continue
 			case ':':
@@ -103,10 +310,11 @@ func rewriteMarkersInLine(line string, definitions map[string]struct{}, fn Marke
 				// line start (CommonMark permits up to three leading spaces).
 				// In prose such as `根据 [1]: 结论`, [1] is still a citation
 				// marker and must be offered to the caller.
+				line := content[lineStart:lineEnd]
 				definitionLabel, isDefinition := referenceDefinitionLabel(line)
-				if isDefinition && isReferenceDefinitionAt(line, i) &&
-					normalizeReferenceLabel(definitionLabel) == normalizeReferenceLabel(line[i+1:end]) {
-					b.WriteString(line[i : end+1])
+				if isDefinition && isReferenceDefinitionAt(line, i-lineStart) &&
+					normalizeReferenceLabel(definitionLabel) == normalizeReferenceLabel(content[i+1:end]) {
+					b.WriteString(content[i : end+1])
 					i = end + 1
 					continue
 				}
@@ -116,12 +324,12 @@ func rewriteMarkersInLine(line string, definitions map[string]struct{}, fn Marke
 				// is also the repository's adjacent-citation shape ([1][2],
 				// [P1][P2]). Treat it as a link only when the document actually
 				// defines that label; otherwise both tokens are offered to fn.
-				if labelEnd := strings.IndexByte(line[end+1:], ']'); labelEnd >= 0 {
+				if labelEnd := strings.IndexByte(content[end+1:lineEnd], ']'); labelEnd >= 0 {
 					labelEnd += end + 1
-					label := line[end+2 : labelEnd]
+					label := content[end+2 : labelEnd]
 					_, definedReference := definitions[normalizeReferenceLabel(label)]
 					if !isCitationLikeLabel(label) || definedReference {
-						b.WriteString(line[i : labelEnd+1])
+						b.WriteString(content[i : labelEnd+1])
 						i = labelEnd + 1
 						continue
 					}
@@ -131,58 +339,69 @@ func rewriteMarkersInLine(line string, definitions map[string]struct{}, fn Marke
 				// the next loop iteration.
 			}
 		}
-		if replacement, rewrite := fn(line[i+1 : end]); rewrite {
+		if replacement, rewrite := fn(content[i+1 : end]); rewrite {
 			b.WriteString(replacement)
 			i = end + 1
 			continue
 		}
-		b.WriteString(line[i : end+1])
+		b.WriteString(content[i : end+1])
 		i = end + 1
 	}
 	return b.String()
 }
 
-func collectReferenceDefinitions(lines []string) map[string]struct{} {
+func collectReferenceDefinitions(segments []markdownSegment) map[string]struct{} {
 	definitions := make(map[string]struct{})
-	inFence := false
-	for _, line := range lines {
-		if strings.HasPrefix(strings.TrimLeft(line, " \t"), "```") {
-			inFence = !inFence
+	for _, segment := range segments {
+		if segment.protected {
 			continue
 		}
-		if inFence {
-			continue
-		}
-		if label, ok := referenceDefinitionLabel(line); ok {
-			definitions[normalizeReferenceLabel(label)] = struct{}{}
+		codeSpans := inlineCodeSpans(segment.text)
+		for start := 0; start < len(segment.text); {
+			next := strings.IndexByte(segment.text[start:], '\n')
+			if next < 0 {
+				next = len(segment.text)
+			} else {
+				next += start + 1
+			}
+			line := strings.TrimSuffix(strings.TrimSuffix(segment.text[start:next], "\n"), "\r")
+			if label, markerStart, ok := referenceDefinition(line); ok && !spanContains(codeSpans, start+markerStart) {
+				definitions[normalizeReferenceLabel(label)] = struct{}{}
+			}
+			start = next
 		}
 	}
 	return definitions
 }
 
 func referenceDefinitionLabel(line string) (string, bool) {
+	label, _, ok := referenceDefinition(line)
+	return label, ok
+}
+
+func referenceDefinition(line string) (string, int, bool) {
 	start := 0
 	for start < len(line) && start < 3 && line[start] == ' ' {
 		start++
 	}
 	if start >= len(line) || line[start] != '[' {
-		return "", false
+		return "", 0, false
 	}
 	end := strings.IndexByte(line[start:], ']')
 	if end < 0 {
-		return "", false
+		return "", 0, false
 	}
 	end += start
 	if end+1 >= len(line) || line[end+1] != ':' || end == start+1 {
-		return "", false
+		return "", 0, false
 	}
 	// Keep the recognizer intentionally single-line and conservative. An empty
 	// `[label]:` is not a usable definition and must not suppress adjacent
 	// numeric citation markers elsewhere in the document.
 	if strings.TrimSpace(line[end+2:]) == "" {
-		return "", false
+		return "", 0, false
 	}
-	return line[start+1 : end], true
+	return line[start+1 : end], start, true
 }
 
 func isReferenceDefinitionAt(line string, markerStart int) bool {

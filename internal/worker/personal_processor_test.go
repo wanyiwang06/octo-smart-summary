@@ -3,7 +3,9 @@
 package worker
 
 import (
+	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -359,6 +361,34 @@ func TestMarkPersonalFailed_UnderMaxRetry_ResetsToPending(t *testing.T) {
 	}
 	if gotPart.WorkerStartedAt != nil {
 		t.Errorf("worker_started_at should be cleared on retry reset, got %v", gotPart.WorkerStartedAt)
+	}
+}
+
+func TestMarkPersonalFailed_PermanentFinalizeErrorSkipsRetry(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	p, pr, part := seedFailFixture(t, db, "T-FAIL-PERMANENT", 1, 0)
+
+	p.markPersonalFailedFromError(pr, part, fmt.Errorf("%w: handle h1", errFinalizeEvidenceUnavailable))
+
+	var gotPR model.PersonalResult
+	if err := db.First(&gotPR, pr.ID).Error; err != nil {
+		t.Fatalf("reload personal result: %v", err)
+	}
+	if gotPR.WorkerStatus != model.PersonalStatusFailed {
+		t.Fatalf("worker_status=%d, want Failed without retry", gotPR.WorkerStatus)
+	}
+	if gotPR.RetryCount != 1 {
+		t.Fatalf("retry_count=%d, want one recorded terminal attempt", gotPR.RetryCount)
+	}
+	if gotPR.ErrorMessage == nil || !strings.Contains(*gotPR.ErrorMessage, "引用依据") || strings.Contains(*gotPR.ErrorMessage, "稍后重试") {
+		t.Fatalf("unexpected user-facing error: %v", gotPR.ErrorMessage)
+	}
+	var gotTask model.SummaryTask
+	if err := db.First(&gotTask, pr.TaskID).Error; err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if gotTask.Status != model.StatusFailed {
+		t.Fatalf("task status=%d, want Failed terminally", gotTask.Status)
 	}
 }
 
