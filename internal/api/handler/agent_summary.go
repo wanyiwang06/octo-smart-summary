@@ -569,7 +569,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			UpdatedAt:        now,
 		}
 		// Build citations from session tool traces (fallback to empty array on error)
-		cits, cerr := h.buildCitationsForSessionWithDB(c.Request.Context(), tx, req.SessionID, content, userID, resolvedRequestID)
+		cits, cerr := h.buildCitationsForSessionWithDB(c.Request.Context(), tx, req.SessionID, content, userID, req.RequestID)
 		if cerr != nil {
 			log.Printf("[handler] buildCitationsForSession failed session=%s: %v (fallback to empty)", req.SessionID, cerr)
 			cits = nil

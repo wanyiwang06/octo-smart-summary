@@ -392,7 +392,9 @@ func TestReplayFailureKeepsPreviousMessageOutputTruncation(t *testing.T) {
 
 	// Exercise the real save endpoint, not just finalizeRunForMessage. The
 	// currently deployed client omits request_id on save, so the handler must
-	// derive it from A's persisted RunID before building citations/finalizing.
+	// derive it from A's persisted RunID for binding validation/finalization.
+	// Citation building deliberately keeps the original empty request_id and
+	// therefore preserves the legacy recompute contract.
 	saveBody, err := json.Marshal(map[string]interface{}{
 		"session_id":          sessionID,
 		"origin_channel_id":   "ch-1",
