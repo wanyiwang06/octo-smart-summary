@@ -11,6 +11,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 
 	"gorm.io/gorm"
@@ -169,6 +171,56 @@ func TestCreateAgentSummary_BE2_MessageIDToolCall_404(t *testing.T) {
 	}, nil)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for tool-call id, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateAgentSummary_BE2_MessageRunMismatchRejectedBeforeSave(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+	db := setupAgentSummaryTestDB(t)
+	if err := db.AutoMigrate(&model.AgentSummaryRun{}); err != nil {
+		t.Fatalf("migrate summary run: %v", err)
+	}
+	store := summaryrun.NewStore(db)
+	runA, _, err := store.CreateOrGetRun(context.Background(), "test-user", "sess-run-mismatch", "req-a", model.ScopePolicyClosed)
+	if err != nil {
+		t.Fatalf("create run A: %v", err)
+	}
+	if _, _, err := store.CreateOrGetRun(context.Background(), "test-user", "sess-run-mismatch", "req-b", model.ScopePolicyClosed); err != nil {
+		t.Fatalf("create run B: %v", err)
+	}
+	msg := seedAssistantMessage(t, db, "test-user", "sess-run-mismatch", "answer from run A")
+	if err := db.Model(&msg).Update("run_id", runA.RunID).Error; err != nil {
+		t.Fatalf("bind message to run A: %v", err)
+	}
+
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	w := doAgentSave(t, setupAgentSummaryRouter(h), map[string]interface{}{
+		"session_id":          "sess-run-mismatch",
+		"request_id":          "req-b",
+		"origin_channel_id":   "chan-1",
+		"origin_channel_type": 1,
+		"agent_message_id":    msg.ID,
+		"snapshot_version":    1,
+	}, nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("mismatch status = %d, want 409: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["code"] != float64(40901) {
+		t.Fatalf("mismatch code = %v, want 40901", resp["code"])
+	}
+	var taskCount, messageCount int64
+	if err := db.Model(&model.SummaryTask{}).Count(&taskCount).Error; err != nil {
+		t.Fatalf("count tasks: %v", err)
+	}
+	if err := db.Model(&model.AgentMessage{}).Where("id = ?", msg.ID).Count(&messageCount).Error; err != nil {
+		t.Fatalf("count draft: %v", err)
+	}
+	if taskCount != 0 || messageCount != 1 {
+		t.Fatalf("mismatch mutated state: tasks=%d draft_rows=%d, want 0/1", taskCount, messageCount)
 	}
 }
 

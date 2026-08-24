@@ -76,10 +76,10 @@ type AgentSummaryRun struct {
 	// kinds because the remediation differs (lower detail level vs narrower
 	// range).
 	//
-	// Persisted rather than passed in-process because the fact is produced deep
-	// inside a tool handler / the planner loop while the gate runs later, in the
-	// save path — and, critically, because a persisted fact cannot be edited away
-	// by the model that generated the text.
+	// This run-level value is a conservative aggregate across replay attempts and
+	// the compatibility fallback for legacy agent_message rows. New assistant
+	// messages also persist their attempt-local value, which is authoritative for
+	// the exact deliverable selected by the save path.
 	OutputTruncated bool `gorm:"column:output_truncated;not null;default:false" json:"output_truncated"`
 	DroppedMessages int  `gorm:"column:dropped_messages;not null;default:0" json:"dropped_messages"`
 

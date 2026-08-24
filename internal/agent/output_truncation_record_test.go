@@ -19,9 +19,9 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 )
 
-// These tests cover the PRODUCING half of the truncation disclosure: the run
-// row must carry the fact by the time the run ends, so the finish gate can
-// disclose it structurally.
+// These tests cover the PRODUCING half of the truncation disclosure: the final
+// assistant message carries the exact attempt-local fact, while the run row
+// keeps a conservative aggregate for legacy compatibility.
 //
 // The gap they close: PR #208 made a truncated Reduce detectable and appended
 // service.TruncationNotice to the merge_summaries tool result. But that result
@@ -196,12 +196,13 @@ func cleanReduceServer(t *testing.T, content string) *httptest.Server {
 }
 
 // runTruncationScenario drives a full agent run against the given LLM stub and
-// returns the final answer plus the run row the gate would later read.
-func runTruncationScenario(t *testing.T, srvURL string, client chatter) (string, *model.AgentSummaryRun) {
+// returns the final answer, conservative run aggregate, and exact final-message
+// metadata the gate will prefer once that message is persisted.
+func runTruncationScenario(t *testing.T, srvURL string, client chatter) (string, *model.AgentSummaryRun, Message) {
 	t.Helper()
 	db := newTruncationRunDB(t)
 	if db == nil {
-		return "", nil
+		return "", nil, Message{}
 	}
 	withReduceLLMAndDB(t, srvURL, db)
 	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
@@ -219,7 +220,7 @@ func runTruncationScenario(t *testing.T, srvURL string, client chatter) (string,
 	reg := NewRegistry()
 	registerTruncationTools(reg)
 	runner := NewRunner(client, reg, NewPool(2), Policy{MaxSteps: 8, MaxTokens: 1 << 20, StepTimeout: 5 * time.Second})
-	out, _, err := runner.RunWithHistory(ctx, "system", nil, "summarize")
+	out, newMsgs, err := runner.RunWithHistory(ctx, "system", nil, "summarize")
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -227,7 +228,10 @@ func runTruncationScenario(t *testing.T, srvURL string, client chatter) (string,
 	if err != nil {
 		t.Fatalf("reload run: %v", err)
 	}
-	return out, got
+	if len(newMsgs) == 0 {
+		t.Fatal("run returned no messages")
+	}
+	return out, got, newMsgs[len(newMsgs)-1]
 }
 
 // REQUIREMENT 1: the disclosure must not be defeatable by the model.
@@ -235,12 +239,12 @@ func runTruncationScenario(t *testing.T, srvURL string, client chatter) (string,
 // The Reduce truncates. The planner reads the disclosure and throws it away,
 // answering with confident, clean prose. The delivered text therefore carries NO
 // warning at all — and yet the run must still evaluate to PARTIAL with a
-// truncation gap, because the fact was latched on the run row where the model
-// cannot reach it.
+// truncation gap, because the fact was latched in structural state the model
+// cannot reach.
 func TestOutputTruncationSurvivesPlannerDroppingTheNotice(t *testing.T) {
 	srv, _ := truncatedReduceServer(t, "合并结果：项目进展、风险与待办（正文在此被截断")
 	client := &noticeStrippingPlanner{}
-	out, run := runTruncationScenario(t, srv.URL, client)
+	out, run, final := runTruncationScenario(t, srv.URL, client)
 	if run == nil {
 		return
 	}
@@ -255,6 +259,9 @@ func TestOutputTruncationSurvivesPlannerDroppingTheNotice(t *testing.T) {
 
 	if !run.OutputTruncated {
 		t.Fatal("run row was not marked output-truncated: the ONLY disclosure was prose the model just deleted, so the user receives a silently unfinished summary")
+	}
+	if final.RunID != run.RunID || !final.OutputTruncated {
+		t.Fatalf("final message metadata = {run:%q truncated:%t}, want {%q true}", final.RunID, final.OutputTruncated, run.RunID)
 	}
 
 	// And that fact must actually produce a gap through the real gate.
@@ -288,7 +295,7 @@ func TestOutputTruncationSurvivesPlannerDroppingTheNotice(t *testing.T) {
 func TestOutputTruncationKeepsInlineNoticeForFaithfulPlanner(t *testing.T) {
 	srv, _ := truncatedReduceServer(t, "合并结果：项目进展、风险与待办（正文在此被截断")
 	client := &truncationPlannerClient{}
-	out, run := runTruncationScenario(t, srv.URL, client)
+	out, run, final := runTruncationScenario(t, srv.URL, client)
 	if run == nil {
 		return
 	}
@@ -298,6 +305,9 @@ func TestOutputTruncationKeepsInlineNoticeForFaithfulPlanner(t *testing.T) {
 	if !run.OutputTruncated {
 		t.Fatal("run row must be marked even when the prose notice survives: both disclosures, not either")
 	}
+	if final.RunID != run.RunID || !final.OutputTruncated {
+		t.Fatalf("final message metadata = {run:%q truncated:%t}, want {%q true}", final.RunID, final.OutputTruncated, run.RunID)
+	}
 }
 
 // REQUIREMENT 3: no false positives. An identical run whose Reduce completes
@@ -306,7 +316,7 @@ func TestOutputTruncationKeepsInlineNoticeForFaithfulPlanner(t *testing.T) {
 func TestNoOutputTruncationRecordedForCleanReduce(t *testing.T) {
 	srv := cleanReduceServer(t, "合并结果：项目进展、风险与待办，全文完整。")
 	client := &truncationPlannerClient{}
-	out, run := runTruncationScenario(t, srv.URL, client)
+	out, run, final := runTruncationScenario(t, srv.URL, client)
 	if run == nil {
 		return
 	}
@@ -315,6 +325,9 @@ func TestNoOutputTruncationRecordedForCleanReduce(t *testing.T) {
 	}
 	if run.OutputTruncated {
 		t.Fatal("clean run marked output-truncated: this would make PARTIAL the standing verdict for every healthy summary")
+	}
+	if final.RunID != run.RunID || final.OutputTruncated {
+		t.Fatalf("clean final message metadata = {run:%q truncated:%t}, want {%q false}", final.RunID, final.OutputTruncated, run.RunID)
 	}
 
 	verdict, gaps := finishgate.Evaluate(finishgate.RunState{
@@ -399,6 +412,10 @@ func TestRejectedPrematureTruncatedAnswerDoesNotPoisonCleanFinal(t *testing.T) {
 			t.Fatalf("rejected truncated draft was persisted: %+v", newMsgs)
 		}
 	}
+	final := newMsgs[len(newMsgs)-1]
+	if final.RunID != run.RunID || final.OutputTruncated {
+		t.Fatalf("clean final message metadata = {run:%q truncated:%t}, want {%q false}", final.RunID, final.OutputTruncated, run.RunID)
+	}
 
 	got, err := store.GetByID(ctx, "u1", run.RunID)
 	if err != nil {
@@ -406,5 +423,59 @@ func TestRejectedPrematureTruncatedAnswerDoesNotPoisonCleanFinal(t *testing.T) {
 	}
 	if got.OutputTruncated {
 		t.Fatal("rejected truncated draft poisoned a later complete deliverable")
+	}
+}
+
+// A replay whose history already contains a persisted truncated answer from
+// this same run may reuse that partial text. The new attempt therefore inherits
+// the taint even when its own final LLM turn ends cleanly. A message from a
+// different run must not contaminate it.
+func TestRunWithHistoryCarriesOnlySameRunOutputTruncation(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		history   []Message
+		wantTaint bool
+	}{
+		{
+			name: "same run",
+			history: []Message{{
+				Role: "assistant", Content: "partial", RunID: "run-current", OutputTruncated: true,
+			}},
+			wantTaint: true,
+		},
+		{
+			name: "different run",
+			history: []Message{{
+				Role: "assistant", Content: "partial", RunID: "run-old", OutputTruncated: true,
+			}},
+			wantTaint: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.WithValue(context.Background(), ContextKeyRunID, "run-current")
+			runner := NewRunner(&fakeClient{turns: []AssistantTurn{{Content: "clean final"}}}, NewRegistry(), NewPool(1), Policy{
+				MaxSteps: 1, MaxTokens: 1000, StepTimeout: time.Second,
+			})
+			_, newMsgs, err := runner.RunWithHistory(ctx, "system", tc.history, "retry")
+			if err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			final := newMsgs[len(newMsgs)-1]
+			if final.RunID != "run-current" || final.OutputTruncated != tc.wantTaint {
+				t.Fatalf("final metadata = {run:%q truncated:%t}, want {run-current %t}", final.RunID, final.OutputTruncated, tc.wantTaint)
+			}
+		})
+	}
+}
+
+func TestMessagePersistenceMetadataIsNotSerializedToTheModel(t *testing.T) {
+	b, err := json.Marshal(Message{
+		Role: "assistant", Content: "answer", RunID: "run-secret", OutputTruncated: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal message: %v", err)
+	}
+	if strings.Contains(string(b), "run-secret") || strings.Contains(string(b), "output_truncated") {
+		t.Fatalf("persistence metadata leaked into model payload: %s", b)
 	}
 }

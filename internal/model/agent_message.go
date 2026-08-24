@@ -11,15 +11,20 @@ import "time"
 //   - 不同用户偶然使用相同 session_id 字面值是允许的——查询按 (user_id, session_id) 过滤，
 //     各自看到自己的历史；handler 层 owner check 是安全兜底。
 type AgentMessage struct {
-	ID         int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	SessionID  string    `gorm:"column:session_id;type:varchar(128);not null" json:"session_id"`
-	UserID     string    `gorm:"column:user_id;type:varchar(64);not null;index:idx_user_session_created,priority:1" json:"user_id"`
-	Role       string    `gorm:"column:role;type:varchar(16);not null" json:"role"`
-	Content    string    `gorm:"column:content;type:mediumtext" json:"content"`
-	ToolCalls  *string   `gorm:"column:tool_calls;type:json" json:"tool_calls"`
-	ToolCallID string    `gorm:"column:tool_call_id;type:varchar(128)" json:"tool_call_id"`
-	Name       string    `gorm:"column:name;type:varchar(128)" json:"name"`
-	CreatedAt  time.Time `gorm:"column:created_at;not null" json:"created_at"`
+	ID         int64   `gorm:"primaryKey;autoIncrement" json:"id"`
+	SessionID  string  `gorm:"column:session_id;type:varchar(128);not null" json:"session_id"`
+	UserID     string  `gorm:"column:user_id;type:varchar(64);not null;index:idx_user_session_created,priority:1" json:"user_id"`
+	Role       string  `gorm:"column:role;type:varchar(16);not null" json:"role"`
+	Content    string  `gorm:"column:content;type:mediumtext" json:"content"`
+	ToolCalls  *string `gorm:"column:tool_calls;type:json" json:"tool_calls"`
+	ToolCallID string  `gorm:"column:tool_call_id;type:varchar(128)" json:"tool_call_id"`
+	Name       string  `gorm:"column:name;type:varchar(128)" json:"name"`
+	// RunID and OutputTruncated bind generation-quality evidence to the exact
+	// assistant deliverable selected by the save endpoint. Legacy rows have an
+	// empty RunID and fall back to the run-level aggregate.
+	RunID           string    `gorm:"column:run_id;type:varchar(64);not null;default:''" json:"-"`
+	OutputTruncated bool      `gorm:"column:output_truncated;not null;default:false" json:"-"`
+	CreatedAt       time.Time `gorm:"column:created_at;not null" json:"created_at"`
 }
 
 func (AgentMessage) TableName() string { return "agent_message" }

@@ -63,10 +63,12 @@ func rowsDescToMessagesAsc(rows []model.AgentMessage) ([]agent.Message, error) {
 	msgs := make([]agent.Message, 0, len(rows))
 	for i := range rows {
 		m := agent.Message{
-			Role:       rows[i].Role,
-			Content:    rows[i].Content,
-			ToolCallID: rows[i].ToolCallID,
-			Name:       rows[i].Name,
+			Role:            rows[i].Role,
+			Content:         rows[i].Content,
+			ToolCallID:      rows[i].ToolCallID,
+			Name:            rows[i].Name,
+			RunID:           rows[i].RunID,
+			OutputTruncated: rows[i].OutputTruncated,
 		}
 		// tool_calls 仅 assistant 轮非空；反序列化失败则整条历史不可信，直接报错。
 		if rows[i].ToolCalls != nil && *rows[i].ToolCalls != "" {
@@ -91,13 +93,15 @@ func (r *agentMessageRepo) AppendMessages(ctx context.Context, sessionID, userID
 	rows := make([]model.AgentMessage, 0, len(msgs))
 	for i := range msgs {
 		row := model.AgentMessage{
-			SessionID:  sessionID,
-			UserID:     userID,
-			Role:       msgs[i].Role,
-			Content:    msgs[i].Content,
-			ToolCallID: msgs[i].ToolCallID,
-			Name:       msgs[i].Name,
-			CreatedAt:  now,
+			SessionID:       sessionID,
+			UserID:          userID,
+			Role:            msgs[i].Role,
+			Content:         msgs[i].Content,
+			ToolCallID:      msgs[i].ToolCallID,
+			Name:            msgs[i].Name,
+			RunID:           msgs[i].RunID,
+			OutputTruncated: msgs[i].OutputTruncated,
+			CreatedAt:       now,
 		}
 		if len(msgs[i].ToolCalls) > 0 {
 			b, err := json.Marshal(msgs[i].ToolCalls)

@@ -283,24 +283,6 @@ func (s *Store) ClearFailedStatusForReplay(ctx context.Context, userID, runID st
 		Updates(map[string]interface{}{"status": model.RunStatusRunning, "updated_at": now()}).Error
 }
 
-// ClearOutputTruncatedForReplay clears a truncation latch left by a PREVIOUS
-// attempt under the same idempotency tuple. A replay regenerates its answer from
-// scratch, so attempt A's truncated text cannot describe attempt B's deliverable.
-// Attempt B will latch the flag again if its own accepted answer or Reduce is
-// truncated.
-//
-// This is deliberately replay-scoped. Within one attempt the latch remains
-// one-way: a later clean re-Reduce must not erase an earlier truncated result
-// that the planner may already have folded into the delivered answer.
-func (s *Store) ClearOutputTruncatedForReplay(ctx context.Context, userID, runID string) error {
-	return s.db.WithContext(ctx).Model(&model.AgentSummaryRun{}).
-		Where("run_id = ? AND user_id = ? AND output_truncated = ?", runID, userID, true).
-		Updates(map[string]interface{}{
-			"output_truncated": false,
-			"updated_at":       now(),
-		}).Error
-}
-
 // SetFinishStatus records the finish-gate verdict (COMPLETE/PARTIAL/FAILED) on a
 // run. This is a terminal write (no optimistic CAS): the verdict is computed once
 // at finalize and does not race concurrent status transitions.
@@ -371,14 +353,12 @@ func (s *Store) RecordChannelFetch(ctx context.Context, userID, runID, channelID
 // MarkOutputTruncated latches the fact that a model completion on this run's
 // answer path was cut off by finish_reason=length.
 //
-// WITHIN-ATTEMPT LATCH. The Reduce may be retried, and the planner emits several
-// completions per attempt; a later untruncated call does not undo the fact that
-// an earlier one was truncated, because the truncated text may already have
-// been folded into what the user receives. Writing `false` from a clean call
-// would let it erase the disclosure — the exact silent-completeness failure this
-// path exists to prevent. Hence the guarded UPDATE below only ever flips 0 -> 1.
-// A new attempt reusing request_id is the sole reset boundary; see
-// ClearOutputTruncatedForReplay.
+// CONSERVATIVE RUN-LEVEL LATCH. The Reduce may be retried, the planner emits
+// several completions per attempt, and one run row may be reused by replay
+// attempts. A later clean call never clears the aggregate because truncated text
+// may already have been persisted or folded into a later answer. The exact
+// deliverable-level fact is stored on agent_message; this run-level latch remains
+// the compatibility fallback for legacy rows that predate that binding.
 //
 // Idempotent and lock-free: a single conditional UPDATE, so concurrent writers
 // (parallel Map/Reduce tool calls) converge without the row lock that

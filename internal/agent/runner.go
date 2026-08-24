@@ -99,6 +99,22 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 	// the tool context. It deliberately shadows any store on the parent context so
 	// a reused context cannot leak handles or pending state across runner calls.
 	ctx = withSummaryHandleStore(ctx)
+	ctx, truncationTracker := withOutputTruncationTracker(ctx)
+
+	// A replay can see an already-persisted answer from an earlier attempt in
+	// session history. If that answer belongs to this same run and was truncated,
+	// conservatively carry the taint forward: the planner may reuse its partial
+	// text. If the earlier attempt never persisted a message, there is nothing to
+	// inherit and a clean replay remains clean.
+	runID, _ := ctx.Value(ContextKeyRunID).(string)
+	if runID != "" {
+		for i := range history {
+			if history[i].RunID == runID && history[i].OutputTruncated {
+				truncationTracker.mark()
+				break
+			}
+		}
+	}
 
 	userMsg := Message{Role: "user", Content: userInput}
 
@@ -221,7 +237,18 @@ func (r *Runner) RunWithHistory(ctx context.Context, system string, history []Me
 					StepHasTools: false, // No tool calls - final answer
 				})
 			}
-			newMsgs = append(newMsgs, Message{Role: "assistant", Content: turn.Content})
+			finalMsg := Message{
+				Role:            "assistant",
+				Content:         turn.Content,
+				RunID:           runID,
+				OutputTruncated: runID != "" && truncationTracker.value(),
+			}
+			newMsgs = append(newMsgs, finalMsg)
+			if runID != "" {
+				for i := range newMsgs {
+					newMsgs[i].RunID = runID
+				}
+			}
 			return turn.Content, newMsgs, nil
 		}
 
