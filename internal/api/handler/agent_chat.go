@@ -514,14 +514,18 @@ func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid strin
 		// Idempotent replay: the run already exists (e.g. SSE downgrade reusing
 		// the same request_id). Reuse its run_id; do not re-persist the spec.
 		//
-		// But DO clear a status=failed latched by the previous attempt. The
-		// SS-07b fatal marker lives in the per-runner hook closure, so the new
-		// attempt's OnToolSuccess cannot clear a marker it never set; without this
-		// reset a clean regenerated summary inherits the earlier attempt's failure
-		// and finalizeRun discloses FAILED for a good deliverable. Best-effort:
-		// a reset failure only costs the stale verdict, never the reply.
+		// But DO clear attempt-scoped degradation latched by the previous attempt.
+		// The SS-07b fatal marker lives in the per-runner hook closure, so the new
+		// attempt's OnToolSuccess cannot clear a marker it never set. Likewise,
+		// output_truncated describes attempt A's discarded answer, not the fresh
+		// answer attempt B is about to generate. Without these resets a clean replay
+		// is disclosed as FAILED or PARTIAL. Best-effort: reset failures only cost a
+		// stale verdict, never the reply.
 		if err := h.runStore.ClearFailedStatusForReplay(ctx, uid, run.RunID); err != nil {
 			log.Printf("[agent] v2 clear failed status on replay (run=%s): %v", run.RunID, err)
+		}
+		if err := h.runStore.ClearOutputTruncatedForReplay(ctx, uid, run.RunID); err != nil {
+			log.Printf("[agent] v2 clear output truncation on replay (run=%s): %v", run.RunID, err)
 		}
 		return run.RunID
 	}

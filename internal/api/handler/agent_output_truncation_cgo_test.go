@@ -179,13 +179,10 @@ func TestFinalizeRunCleanRunStaysCompleteWithoutOutputTruncation(t *testing.T) {
 	}
 }
 
-// MarkOutputTruncated is a LATCH. The Reduce may be retried and the planner
-// emits several completions per run; a later clean call must not erase the fact
-// that an earlier one was truncated, because that truncated text may already
-// have been folded into what the user receives. A store method that wrote the
-// boolean unconditionally would let the last writer win and silently drop the
-// disclosure.
-func TestMarkOutputTruncatedLatchesAndIsIdempotent(t *testing.T) {
+// MarkOutputTruncated is idempotent and owner-scoped. The within-attempt latch
+// semantics are covered by the rejected-premature and repeated-Reduce tests;
+// the replay-only reset boundary is covered separately below.
+func TestMarkOutputTruncatedIsIdempotentAndOwnerScoped(t *testing.T) {
 	db := newFinalizeTestDB(t)
 	if db == nil {
 		return
@@ -221,5 +218,85 @@ func TestMarkOutputTruncatedLatchesAndIsIdempotent(t *testing.T) {
 	// error (it simply matches no row).
 	if err := store.MarkOutputTruncated(ctx, "u2", run.RunID); err != nil {
 		t.Fatalf("cross-owner mark should be a silent no-op, got: %v", err)
+	}
+}
+
+// A repeated request_id starts a NEW generation attempt on the SAME run row.
+// Attempt A's output is discarded on the SSE fallback/retry path, so its
+// output_truncated latch must not poison attempt B's clean deliverable. The
+// reset belongs exactly at maybePersistSummaryRun's created=false branch; the
+// latch remains one-way everywhere inside one attempt.
+func TestReplayClearsStaleOutputTruncationAndCanRelatch(t *testing.T) {
+	db := newFinalizeTestDB(t)
+	if db == nil {
+		return
+	}
+	store := summaryrun.NewStore(db)
+	ctx := context.Background()
+	h := &AgentChatHandler{runStore: store}
+	req := agentChatRequest{
+		Message:   "总结项目进展",
+		SessionID: "sess-trunc-replay",
+		RequestID: "req-trunc-replay",
+		SelectedChannels: []selectedChannel{{
+			ChannelID: "ch-1", ChannelType: "group", Name: "项目群",
+		}},
+	}
+
+	// Attempt A creates the run and delivers a truncated result.
+	runID := h.maybePersistSummaryRun(ctx, "u1", req, true)
+	if runID == "" {
+		t.Fatal("first attempt did not create a run")
+	}
+	if err := store.RecordChannelFetch(ctx, "u1", runID, "ch-1", true, false); err != nil {
+		t.Fatalf("record coverage: %v", err)
+	}
+	if err := store.MarkOutputTruncated(ctx, "u1", runID); err != nil {
+		t.Fatalf("mark attempt A truncated: %v", err)
+	}
+
+	// The reset is owner-scoped: an unrelated user cannot clear the latch.
+	if err := store.ClearOutputTruncatedForReplay(ctx, "someone-else", runID); err != nil {
+		t.Fatalf("foreign replay reset: %v", err)
+	}
+	if got, err := store.GetByID(ctx, "u1", runID); err != nil {
+		t.Fatalf("get after foreign reset: %v", err)
+	} else if !got.OutputTruncated {
+		t.Fatal("a foreign user cleared the owner's truncation latch")
+	}
+
+	// Attempt B reuses request_id. The handler recognises created=false and
+	// clears only the previous attempt's latch before generating fresh output.
+	if replayRunID := h.maybePersistSummaryRun(ctx, "u1", req, true); replayRunID != runID {
+		t.Fatalf("replay run_id = %q, want %q", replayRunID, runID)
+	}
+	got, err := store.GetByID(ctx, "u1", runID)
+	if err != nil {
+		t.Fatalf("get replay run: %v", err)
+	}
+	if got.OutputTruncated {
+		t.Fatal("attempt B inherited attempt A's output_truncated latch")
+	}
+
+	// A complete attempt B must now be judged COMPLETE rather than inheriting a
+	// false output_truncation gap from attempt A.
+	verdict, gaps := (&AgentSummaryHandler{db: db}).finalizeRun(
+		ctx, "u1", req.SessionID, req.RequestID, "项目进展完整 [1]。", []model.Citation{{Index: 1}},
+	)
+	if verdict != finishgate.Complete {
+		t.Fatalf("clean replay verdict = %s, want COMPLETE (gaps=%v)", verdict, gaps)
+	}
+	if hasGapKind(gaps, finishgate.GapOutputTruncation) {
+		t.Fatalf("clean replay inherited stale output_truncation gap: %v", gaps)
+	}
+
+	// The reset is not permanent: attempt B still latches its own truncation.
+	if err := store.MarkOutputTruncated(ctx, "u1", runID); err != nil {
+		t.Fatalf("relatch attempt B: %v", err)
+	}
+	if got, err := store.GetByID(ctx, "u1", runID); err != nil {
+		t.Fatalf("get after relatch: %v", err)
+	} else if !got.OutputTruncated {
+		t.Fatal("attempt B could not latch its own output truncation")
 	}
 }
