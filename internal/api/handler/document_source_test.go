@@ -265,6 +265,11 @@ func TestValidateDocumentRefs_RejectsControlCharacters(t *testing.T) {
 	if err := validateDocumentRefs([]documentRefReq{{DocumentID: "ok", Version: "v\n1"}}); err == nil {
 		t.Error("control character in version was accepted")
 	}
+	// version is validated with the SAME rune class as document_id: invalid UTF-8 /
+	// U+FFFD is rejected too, not just control characters (CR-nit uniformity).
+	if err := validateDocumentRefs([]documentRefReq{{DocumentID: "ok", Version: "v\xff1"}}); err == nil {
+		t.Error("invalid UTF-8 in version was accepted")
+	}
 	// Ordinary ids with punctuation and non-ASCII must still pass: this is a control
 	// character rule, not a charset allow-list.
 	for _, id := range []string{"doc-123_v2.final", "文档-2026", "a:b/c"} {

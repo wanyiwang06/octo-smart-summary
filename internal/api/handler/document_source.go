@@ -296,12 +296,13 @@ func validateDocumentRefs(refs []documentRefReq) error {
 		// indistinguishable from a genuine one. Quoting every site is a rule that has to
 		// hold forever; rejecting the input is a rule that holds once. No legitimate
 		// document id contains a control character.
-		if i := strings.IndexFunc(ref.DocumentID, func(r rune) bool {
-			return r == utf8.RuneError || unicode.IsControl(r)
-		}); i >= 0 {
+		if strings.IndexFunc(ref.DocumentID, forbiddenRefRune) >= 0 {
 			return fmt.Errorf("document_id must not contain control characters: %q", ref.DocumentID)
 		}
-		if strings.IndexFunc(ref.Version, unicode.IsControl) >= 0 {
+		// Version uses the SAME rune class as document_id (invalid UTF-8 / U+FFFD as
+		// well as control characters), so the two caller-supplied fields are not read
+		// as deliberately asymmetric. Both reach the prompt via the document envelope.
+		if strings.IndexFunc(ref.Version, forbiddenRefRune) >= 0 {
 			return fmt.Errorf("document version must not contain control characters: %q", ref.Version)
 		}
 		// url.PathEscape leaves "." and ".." untouched (both are unreserved), so a bare
@@ -349,9 +350,26 @@ func validateDocumentRefs(refs []documentRefReq) error {
 // round 5, uncounted ever since).
 const documentChunkTitlePrefix = "### "
 
+// forbiddenRefRune is the single rune class rejected in caller-supplied document
+// refs (document_id AND version) and stripped from upstream-supplied version: it
+// covers invalid UTF-8 / U+FFFD and every control character. One closure at every
+// site keeps the fields uniform so an asymmetry is never read as intentional.
+func forbiddenRefRune(r rune) bool { return r == utf8.RuneError || unicode.IsControl(r) }
+
+// stripForbiddenRefRunes drops forbiddenRefRune runes. Used on the upstream version
+// (which is data, not a request, so it is sanitized rather than rejected).
+func stripForbiddenRefRunes(s string) string {
+	return strings.Map(func(r rune) rune {
+		if forbiddenRefRune(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefReq) {
 	doc.DocumentID = ref.DocumentID
-	doc.Version = truncateRunes(strings.TrimSpace(doc.Version), maxDocumentVersionLen)
+	doc.Version = truncateRunes(strings.TrimSpace(stripForbiddenRefRunes(doc.Version)), maxDocumentVersionLen)
 	if doc.Version == "" {
 		doc.Version = ref.Version
 	}
