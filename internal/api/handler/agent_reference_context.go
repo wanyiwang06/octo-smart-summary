@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -24,17 +25,12 @@ const (
 // Using a placeholder (not "") prevents split-token reassembly attacks
 // where deleting a fence tag splices neighbours together to form a new
 // copy of the same token (P1-2 fix).
-//
-// Kept as a named constant because the existing test suite asserts against it;
-// refFenceGuard derives the identical value from the tag name.
 const fencePlaceholder = "[引用数据]"
 
-// refFenceGuard shares its implementation with the <文档数据> guard (fence_guard.go).
-// Before centralization these two had diverged — this one accepted neither an
-// attribute tail nor repeated solidus, so fixes landed on one and missed the other.
-// Both now inherit the same homoglyph folding, ignorable-in-tag-name handling, and
-// head-neutralization pass.
-var refFenceGuard = newFenceGuard("引用数据")
+var (
+	refInvisiblePattern = regexp.MustCompile(`[\p{Cf}\x{00ad}]`)
+	refFenceTagPattern  = regexp.MustCompile(`<[\s\p{Zs}]*/?[\s\p{Zs}]*引用数据[\s\p{Zs}]*>`)
+)
 
 // sanitizeRef neutralizes untrusted referenced-summary text before it is
 // embedded in the agent's system prompt (SUM-158 blocker 3 — prompt
@@ -58,17 +54,27 @@ func sanitizeRef(s string) string {
 }
 
 func normalizeRefFenceSyntax(s string, preserveNewline bool) string {
-	// Newline handling is the only thing that differs between the line and block
-	// render sites, so it stays here; all fence structure is the shared guard's job.
-	if !preserveNewline {
-		s = strings.ReplaceAll(s, "\n", " ")
-		return refFenceGuard.neutralize(s)
+	replacements := []string{
+		"＜", "<",
+		"＞", ">",
+		"／", "/",
+		"\r", " ",
+		"\t", " ",
+		"\x00", " ",
+		"\v", " ",
+		"\f", " ",
+		"\u0085", " ",
+		"\u2028", " ",
+		"\u2029", " ",
 	}
-	// Block sites keep leading indentation and trailing blank lines: that formatting
-	// IS the content (quoted code, paragraph structure). Round 12 centralized both
-	// guards onto fenceGuard.neutralize, which TrimSpace's, and silently started
-	// stripping it here — an unannounced behaviour change to already-shipped code.
-	return refFenceGuard.neutralizePreservingSpace(s)
+	if !preserveNewline {
+		replacements = append(replacements, "\n", " ")
+	}
+	s = strings.NewReplacer(replacements...).Replace(s)
+	// Format/invisible characters can visually splice or split the tag name
+	// (for example 引用\u200b数据). Remove them before structural matching.
+	s = refInvisiblePattern.ReplaceAllString(s, "")
+	return refFenceTagPattern.ReplaceAllString(s, fencePlaceholder)
 }
 
 // sanitizeRefLine sanitizes text rendered at single-value sites (bullets,

@@ -323,34 +323,24 @@ func validateDocumentRefs(refs []documentRefReq) error {
 	return nil
 }
 
-// docFenceGuard neutralizes untrusted document text that could close the
-// <文档数据> fence early. The whole implementation — homoglyph folding, invisible
-// handling, and the two structural passes — lives in fence_guard.go and is shared
-// with the <引用数据> guard; see that file for why neither the delimiter set nor
-// the invisible set is enumerated by hand any more.
-var docFenceGuard = newFenceGuard("文档数据")
-
-// Names kept so the existing test suite keeps addressing the guard's parts directly
-// after centralization — those tests are the regression barrier for rounds 4–10 and
-// are deliberately not rewritten as part of this change.
+// NOTE ON PROMPT INJECTION CONTAINMENT
 //
-// docFenceHeadPlaceholder is what the head pass writes over a forged opener. Round
-// 14 made that pass rewrite IN PLACE, so it is the single replacement rune rather
-// than the old "tag name, with the `<` deleted" — see fenceOpenNeutralized.
-var (
-	docFencePlaceholder     = docFenceGuard.placeholder
-	docFenceHeadPlaceholder = fenceOpenNeutralized
-	docFenceTagPattern      = docFenceGuard.tagPattern
-	docFenceHeadPattern     = docFenceGuard.headPattern
-)
-
-// sanitizeDocumentFenceText neutralizes forged <文档数据> tags in untrusted document
-// text, replacing them with a visible placeholder. Never lengthens its input, which
-// buildDocumentPreviewPrompt's post-assembly pass relies on: the tag pass shortens,
-// and the head pass is rune-for-rune length-preserving.
-func sanitizeDocumentFenceText(s string) string {
-	return docFenceGuard.neutralize(s)
-}
+// This endpoint does NOT wrap untrusted document text in an in-band fence such as
+// <文档数据>…</文档数据>. Untrusted text is carried in its OWN chat message (see
+// buildDocumentPreviewBody and the message assembly in document_preview.go), so
+// there is no in-band delimiter for a document to forge and therefore nothing to
+// sanitize away.
+//
+// This is deliberate and it is the reason no fence guard lives here. An in-band
+// fence forces a sanitizer over the very text the endpoint exists to summarize, and
+// that sanitizer is a rewriting pass on user content: every bound it draws is either
+// too loose (a forged closing tag reaches the model) or too tight (real document
+// prose is silently deleted with no truncation marker). Over-neutralizing is safe
+// for injection and actively wrong for a summarizer. Moving the boundary from an
+// in-band string to the message envelope removes the whole class instead of tuning it.
+//
+// Consequence for this file: document text is only ever budgeted (rune caps, chunk
+// caps, truncation marker) and never pattern-rewritten.
 
 // documentChunkTitlePrefix is the markup buildDocumentPreviewPrompt renders before
 // a chunk title. It lives here rather than as a literal at the render site because
@@ -437,30 +427,27 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 }
 
 // documentPreviewHasNoContent reports whether a normalized document has anything
-// left to summarize once fence tags are discounted. It cannot reuse
-// sanitizeDocumentFenceText, whose placeholder is deliberately non-empty (that is
-// what keeps an injected tag visible to the model as neutralized text); measuring
-// emptiness needs the tags removed outright. Without this, a body consisting solely
-// of "<文档数据>" clears the gate and bills a completion for an empty document,
-// while a caller sending "" gets a clean 40004.
+// left to summarize, so a body that is only whitespace does not bill a completion.
 //
-// The chunks-else-content precedence mirrors buildDocumentPreviewPrompt exactly:
-// the builder renders doc.Content ONLY when there are no chunks. Judging the union
-// instead would let a doc with fence-only chunks plus real content clear this gate
-// and then bill a completion on a body the model never receives — the mirror of
-// the case this gate was added to prevent.
+// Emptiness is plain TrimSpace. With untrusted text in its own message there is no
+// fence to discount, so the gate and the prompt builder measure the SAME text —
+// they cannot disagree about what counts as content. (While an in-band fence
+// existed, the gate had to strip tags before measuring, and "strip" and "render"
+// were two different views of one document: a body that looked empty to the gate
+// still reached the model, and prose the gate deleted was billed but never seen.)
+//
+// The chunks-else-content precedence mirrors buildDocumentPreviewBody exactly: the
+// builder renders doc.Content ONLY when there are no chunks. Judging the union
+// instead would let a doc with blank chunks plus real content clear this gate and
+// then bill a completion on a body the model never receives.
 func documentPreviewHasNoContent(doc *documentSummarySource) bool {
 	if len(doc.Chunks) > 0 {
 		for _, chunk := range doc.Chunks {
-			if documentTextWithoutFenceTags(chunk.Text) != "" {
+			if strings.TrimSpace(chunk.Text) != "" {
 				return false
 			}
 		}
 		return true
 	}
-	return documentTextWithoutFenceTags(doc.Content) == ""
-}
-
-func documentTextWithoutFenceTags(s string) string {
-	return docFenceGuard.strip(s)
+	return strings.TrimSpace(doc.Content) == ""
 }
