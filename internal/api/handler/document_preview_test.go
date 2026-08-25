@@ -743,6 +743,124 @@ func TestNormalizeFetchedDocumentSource_RedundantChunksDoNotFlagTruncation(t *te
 	}
 }
 
+// TestNormalizeFetchedDocumentSource_OversizeIsFlaggedEvenWhenChunksSurvive pins the
+// round-21 blocker, found independently by two reviewers.
+//
+// Two separate holes made one failure:
+//
+//  1. contentTruncated — the ONLY signal that the source was larger than the rune
+//     budget — was discarded whenever chunks survived, on the reasoning that the
+//     coexistence guard covered that case.
+//  2. The guard compared chunks against the ALREADY-TRUNCATED doc.Content, so chunks
+//     segmenting just the retained 80k prefix "covered" it and the guard went quiet.
+//
+// Each check was relying on the other, so an oversized source with leading-portion
+// chunks passed both and disclosed nothing. Measured at the previous head with the
+// shape below: 160,000 runes in, 72,208 rendered, Truncated=false, no marker — more
+// than half the document silently absent from a confident-looking 速览.
+//
+// The whitespace differential is load-bearing in this construction and is why the
+// obvious version of the test does NOT catch it: with chunks covering exactly the
+// retained prefix, buildDocumentPreviewBody's own bodyLimit trips and emits the
+// marker anyway. Dense chunks against whitespace-bearing content keep the rendered
+// total under that budget, so nothing else fires.
+// TestNormalizeFetchedDocumentSource_UpstreamVersionIsSanitized pins P2-2.
+//
+// Replacing stripForbiddenRefRunes(doc.Version) with a bare doc.Version left the whole
+// suite green: of the three forbiddenRefRune call sites, this one had no test at all.
+// The rune class is documented as a uniform invariant across document_id and version
+// precisely so an asymmetry is never read as intentional, and the upstream version is
+// rendered into the untrusted-data message, so it must be sanitized (it is data, not a
+// request, hence stripped rather than rejected).
+func TestNormalizeFetchedDocumentSource_UpstreamVersionIsSanitized(t *testing.T) {
+	for name, tc := range map[string]struct{ upstream, want string }{
+		"control characters": {"v\n1\t2", "v12"},
+		"invalid UTF-8":      {"v\xff1", "v1"},
+		"NUL":                {"v\x001", "v1"},
+		"C1 control":         {"v\u00851", "v1"},
+		"clean version kept": {"v2.1-rc1", "v2.1-rc1"},
+		"surrounding spaces": {"  v3  ", "v3"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			doc := &documentSummarySource{DocumentID: "d1", Content: "正文", Version: tc.upstream}
+			// A non-empty ref version would be shadowed by the upstream value only when the
+			// latter survives sanitization, so pass an empty ref version to isolate this.
+			normalizeFetchedDocumentSource(doc, documentRefReq{DocumentID: "d1"})
+			if doc.Version != tc.want {
+				t.Errorf("upstream version %q normalized to %q, want %q", tc.upstream, doc.Version, tc.want)
+			}
+			if strings.IndexFunc(doc.Version, forbiddenRefRune) >= 0 {
+				t.Errorf("forbidden rune survived into the model-visible version: %q", doc.Version)
+			}
+		})
+	}
+}
+
+func TestNormalizeFetchedDocumentSource_OversizeIsFlaggedEvenWhenChunksSurvive(t *testing.T) {
+	t.Run("dense chunks against whitespace-bearing oversized content", func(t *testing.T) {
+		// 160,000 runes at ~10% whitespace: twice maxDocumentPromptRunes.
+		var sb strings.Builder
+		for i := 0; i < 16000; i++ {
+			sb.WriteString("文文文文文文文文文\n")
+		}
+		doc := &documentSummarySource{DocumentID: "d1", Title: "T", Content: sb.String()}
+		// 200 × 360 dense runes = the whitespace-stripped leading portion only. Every
+		// per-chunk and count cap is satisfied, so the chunk loop flags nothing.
+		for i := 0; i < maxDocumentChunks; i++ {
+			doc.Chunks = append(doc.Chunks, documentSourceChunk{Text: strings.Repeat("文", 360)})
+		}
+		normalizeFetchedDocumentSource(doc, documentRefReq{DocumentID: "d1"})
+		body := buildDocumentPreviewBody(doc)
+
+		if !doc.Truncated {
+			t.Error("oversized source must set Truncated even when chunks survive")
+		}
+		if !strings.Contains(body, "截断") {
+			t.Errorf("truncation marker missing; %d runes rendered from a 160000-rune source",
+				utf8.RuneCountInString(body))
+		}
+	})
+
+	t.Run("chunks cover only the retained prefix, tail lost", func(t *testing.T) {
+		// The second reviewer's shape: exactly maxDocumentPromptRunes of "文 " plus a
+		// tail that falls past the cap, with chunks covering the stripped prefix.
+		const canary = "CANARY尾巴结论"
+		doc := &documentSummarySource{
+			DocumentID: "d1",
+			Title:      "T",
+			Content:    strings.Repeat("文 ", maxDocumentPromptRunes/2) + canary,
+		}
+		for i := 0; i < 4; i++ {
+			doc.Chunks = append(doc.Chunks, documentSourceChunk{Text: strings.Repeat("文", 10000)})
+		}
+		normalizeFetchedDocumentSource(doc, documentRefReq{DocumentID: "d1"})
+		body := buildDocumentPreviewBody(doc)
+
+		if strings.Contains(body, canary) {
+			t.Fatal("premise broken: the tail now renders — re-check the guard")
+		}
+		if !doc.Truncated {
+			t.Error("tail past the rune cap was dropped with no signal")
+		}
+		if !strings.Contains(body, "截断") {
+			t.Error("truncation marker missing for a source whose tail never reached the model")
+		}
+	})
+
+	t.Run("content-only oversize still flags", func(t *testing.T) {
+		// The pre-existing path (no chunks at all). It was the only covered branch
+		// before this round — keep it covered.
+		doc := &documentSummarySource{
+			DocumentID: "d1",
+			Content:    strings.Repeat("文", maxDocumentPromptRunes+1),
+		}
+		normalizeFetchedDocumentSource(doc, documentRefReq{DocumentID: "d1"})
+		if !doc.Truncated {
+			t.Error("content-only oversize must set Truncated")
+		}
+	})
+}
+
 func TestStreamDocumentPreview_OversizedTrailingBytesReportedAsTooLarge(t *testing.T) {
 	// A second JSON value after the object trips MaxBytesReader in the trailing-EOF
 	// check rather than in Decode, and used to surface as a misleading 40000

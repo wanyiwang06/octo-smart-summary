@@ -533,7 +533,15 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 		kept++
 	}
 	doc.Chunks = normalized
-	if len(normalized) == 0 && contentTruncated {
+	// contentTruncated is the ONLY signal that the source document was larger than the
+	// rune budget, and it is computed from rawContent before doc.Content is cut down.
+	// It used to be discarded whenever chunks survived, on the reasoning that the
+	// coexistence guard below would cover that case — but the guard compared against the
+	// ALREADY-TRUNCATED doc.Content, so an oversized source with chunks segmenting only
+	// its leading portion passed both checks and disclosed nothing. Oversize is
+	// oversize regardless of which field renders; flagging it unconditionally is what
+	// makes the two checks independent rather than mutually load-bearing.
+	if contentTruncated {
 		doc.Truncated = true
 	}
 	// COEXISTENCE GUARD — see the Content/Chunks contract on the struct.
@@ -550,7 +558,24 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 	// documented contract has no defined semantics — appending Content after the chunks
 	// would duplicate the whole document in the common redundant case — so the honest
 	// response is to tell the user the source was incomplete rather than to guess.
-	if len(normalized) > 0 && doc.Content != "" && !chunksCoverContent(normalized, doc.Content) {
+	//
+	// Coverage is judged against rawContent, NOT doc.Content. Comparing against the
+	// post-cap value is what let the previous round ship a guard with a hole in exactly
+	// the shape it was written to stop: chunks that cover only the retained 80k prefix
+	// "cover" a Content that has itself been shortened to that prefix, so the guard went
+	// quiet while more than half the document was dropped. Measured at the previous
+	// head: a 160,000-rune source rendered 72,208 runes with Truncated=false and no
+	// marker.
+	//
+	// Note for anyone pruning this later: given the unconditional contentTruncated
+	// check above, using rawContent here is provably redundant — the two values differ
+	// only when content exceeded the cap, and that case is already flagged. Mutation
+	// testing confirms it: reverting either line alone keeps the suite green, only
+	// reverting both reproduces the defect. It is kept because the guard's correctness
+	// should not depend on a separate check three lines up continuing to exist, and
+	// because comparing against a value this function itself shortened is the kind of
+	// subtlety that produced this round's finding. Redundant, deliberately.
+	if len(normalized) > 0 && rawContent != "" && !chunksCoverContent(normalized, rawContent) {
 		doc.Truncated = true
 	}
 }
