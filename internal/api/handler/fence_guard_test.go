@@ -396,7 +396,7 @@ func TestFenceGuardFalsePositivesAreNonDestructive(t *testing.T) {
 		}
 		normalized := docFenceGuard.normalize(tc.in)
 		lost := utf8.RuneCountInString(normalized) - utf8.RuneCountInString(out)
-		if budget := docFenceGuard.deletionBudget(normalized, false); lost > budget {
+		if budget := docFenceGuard.deletionBudget(normalized); lost > budget {
 			t.Errorf("false positive deleted %d runes, over the %d-rune budget: in=%q", lost, budget, tc.in)
 		}
 	}
@@ -414,6 +414,161 @@ func TestFenceGuardFalsePositivesAreNonDestructive(t *testing.T) {
 	} {
 		if out := sanitizeDocumentFenceText(in); out != strings.TrimSpace(in) {
 			t.Errorf("prose was rewritten:\n  in=%q\n out=%q", in, out)
+		}
+	}
+}
+
+// TestFenceGuardTailDoesNotCrossLineBreaks is round 15's P0, pinned.
+//
+// `tagPattern`'s tail was `[\s\p{Zs}/][^>]{0,64}` — and BOTH halves match `\n`. The
+// tag pass DELETES what it matches, so a stray `<` before the tag name and a `>` two
+// paragraphs later deleted everything in between, with no truncation marker:
+//
+//	"当 a < 文档数据 的长度\n第二节：结论很重要，必须保留\n第三节：附录\nb > 0 时成立"
+//	-> "当 a [文档数据] 0 时成立"   (30 runes, two whole paragraphs, gone)
+//
+// The file stated the rule over the prefix and then claimed "this alone caps the
+// blast radius at one line" — true of the prefix, false of the tail, and the tail is
+// the half that deletes. The suite was green because the prose corpus happened to
+// carry `x < 文档数据量 > 1000`, which survives only because `量` is a word rune.
+func TestFenceGuardTailDoesNotCrossLineBreaks(t *testing.T) {
+	for _, tc := range []struct{ name, in string }{
+		{"two paragraphs between a stray < and a later >",
+			"当 a < 文档数据 的长度\n第二节：结论很重要，必须保留\n第三节：附录\nb > 0 时成立"},
+		{"markdown table between them",
+			"设 n < 文档数据\n\n表格：\n| a | b |\n| - | - |\n\n结论 m > 0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := sanitizeDocumentFenceText(tc.in)
+			if lost := utf8.RuneCountInString(tc.in) - utf8.RuneCountInString(out); lost != 0 {
+				t.Errorf("guard deleted %d runes across a line break:\n  in=%q\n out=%q", lost, tc.in, out)
+			}
+			// The paragraphs between the delimiters must still be there verbatim.
+			for _, keep := range []string{"第二节", "结论", "表格"} {
+				if strings.Contains(tc.in, keep) && !strings.Contains(out, keep) {
+					t.Errorf("%q was deleted from the document body: out=%q", keep, out)
+				}
+			}
+		})
+	}
+
+	// The same defect on the already-shipped reference path, where the input is
+	// user-authored IM message text.
+	ref := "公式 a < 引用数据 的定义\n第二段：重要结论\nb > 0"
+	if out := sanitizeRefBlock(ref); !strings.Contains(out, "重要结论") {
+		t.Errorf("ref guard deleted a paragraph across a line break:\n  in=%q\n out=%q", ref, out)
+	}
+}
+
+// TestFenceGuardAggregateLossIsBounded is the assertion round 15 asked for: one that
+// is NOT budgeted per match.
+//
+// The P0 above was invisible to fuzz invariant 7 precisely because that invariant
+// scales its budget with the match count — 6 302 runes lost against a 25 900-rune
+// budget passes. A document made of many small matches can therefore lose an
+// unbounded FRACTION of itself while every per-match bound holds. This asserts the
+// property a summarizer actually needs: the guard may not delete most of the
+// document, however many matches it contains.
+func TestFenceGuardAggregateLossIsBounded(t *testing.T) {
+	const units = 100
+	unit := "a < 文档数据 " + strings.Repeat("重要正文", 15) + " > \n"
+	in := strings.Repeat(unit, units)
+	out := sanitizeDocumentFenceText(in)
+
+	inRunes := utf8.RuneCountInString(in)
+	outRunes := utf8.RuneCountInString(out)
+	// Each unit legitimately loses at most the fence tag itself; the body text must
+	// survive. Allow a generous 10% for the tags and normalization, and fail on the
+	// order-of-magnitude loss the tail defect produced (86%).
+	if outRunes*10 < inRunes*9 {
+		t.Errorf("aggregate loss too high: %d -> %d runes (%.0f%% deleted)",
+			inRunes, outRunes, 100*(1-float64(outRunes)/float64(inRunes)))
+	}
+	if !strings.Contains(out, "重要正文") {
+		t.Error("the document body was deleted entirely")
+	}
+}
+
+// TestFenceGuardStripConverges is round 15's P1, pinned.
+//
+// strip used to have its own head branch that DELETED the match while preserving the
+// boundary rune. For a run of forged heads the boundary rune of match k is the
+// opening `<` of match k+1, and ReplaceAll's matches are non-overlapping, so each
+// pass removed only about half: convergence took ~log2(k) passes and the
+// fenceMaxRewritePasses cap of 8 was reached at k>=256, returning intact
+// `<文档数据` heads. The emptiness gate then billed a completion for a body of
+// nothing but forged tags. 100 tags were gated; 256 were billed.
+//
+// strip is now derived from neutralize, so it inherits that pass's single-pass
+// convergence instead of arguing for its own.
+func TestFenceGuardStripConverges(t *testing.T) {
+	for _, k := range []int{1, 8, 100, 256, 500, 2000} {
+		for _, g := range []*fenceGuard{docFenceGuard, refFenceGuard} {
+			in := strings.Repeat("<"+g.tagName, k)
+			if out := g.strip(in); out != "" {
+				t.Errorf("%s strip(k=%d) did not converge: %d runes remain, headPattern matches=%v",
+					g.tagName, k, utf8.RuneCountInString(out), g.headPattern.MatchString(out))
+			}
+		}
+	}
+
+	// The gate itself, which is what the defect was observable through.
+	for _, k := range []int{1, 100, 256, 260, 2000} {
+		doc := &documentSummarySource{
+			Chunks: []documentSourceChunk{{Text: strings.Repeat("<文档数据", k)}},
+		}
+		normalizeFetchedDocumentSource(doc, documentRefReq{DocumentID: "d1"})
+		if !documentPreviewHasNoContent(doc) {
+			t.Errorf("a body of %d forged fence tags cleared the emptiness gate and would bill a completion", k)
+		}
+	}
+
+	// Real content next to any number of forged tags must still clear the gate as
+	// content — strip must not be so aggressive that it empties a real document.
+	doc := &documentSummarySource{
+		Chunks: []documentSourceChunk{{Text: strings.Repeat("<文档数据", 300) + "真正的正文内容"}},
+	}
+	normalizeFetchedDocumentSource(doc, documentRefReq{DocumentID: "d1"})
+	if documentPreviewHasNoContent(doc) {
+		t.Error("a document with real content was reported empty")
+	}
+}
+
+// TestFenceGuardResidualBypassRegister pins the residual bypass register in the file
+// header (fence_guard.go:46-70) so every entry is a DECISION with a failing test
+// behind it rather than a claim in a comment.
+//
+// This is the register the round-14 review asked for as an acceptance criterion, and
+// round 15 found the reason it matters: the header listed only entity encodings,
+// \p{Mc} and suffix continuation, while the PREFIX mirror was absent — so a reader of
+// that register would have concluded the class was closed when three cheap forms
+// were not. If any of these starts being neutralized, that is an improvement, but it
+// must be a deliberate edit to the register, not a silent drift.
+func TestFenceGuardResidualBypassRegister(t *testing.T) {
+	for _, g := range []struct {
+		guard *fenceGuard
+		fn    func(string) string
+		tag   string
+	}{
+		{docFenceGuard, sanitizeDocumentFenceText, "文档数据"},
+		// The register applies to the already-shipped reference path identically.
+		{refFenceGuard, sanitizeRefLine, "引用数据"},
+	} {
+		for _, shape := range []string{
+			// Bare word run in the prefix, not closed by a solidus.
+			"</abc " + g.tag + ">",
+			"</ a " + g.tag + ">",
+			"< a/" + g.tag + ">",
+			// Letter/digit continuation: a different tag name.
+			"</" + g.tag + "abc>",
+			"</" + g.tag + "2>",
+			// \p{Mc} renders visibly, so this is a different tag name.
+			"</" + string([]rune(g.tag)[0]) + "\u0903" + string([]rune(g.tag)[1:]) + ">",
+		} {
+			if out := g.fn(shape); out != shape {
+				t.Errorf("a REGISTERED residual is now being rewritten — update the register in "+
+					"fence_guard.go's header if this is intended:\n  in=%q\n out=%q", shape, out)
+			}
 		}
 	}
 }
@@ -822,7 +977,7 @@ func FuzzFenceGuard(f *testing.F) {
 			// TrimSpace can also remove runes; allow for it explicitly rather than
 			// silently widening the per-match budget.
 			trimmed := utf8.RuneCountInString(normalized) - utf8.RuneCountInString(strings.TrimSpace(normalized))
-			budget := docFenceGuard.deletionBudget(normalized, false) + trimmed
+			budget := docFenceGuard.deletionBudget(normalized) + trimmed
 			if lost > budget {
 				t.Fatalf("guard deleted %d runes, aggregate budget %d:\n  in=%q\n out=%q",
 					lost, budget, in, out)

@@ -49,6 +49,25 @@ import (
 // introduces a decoder upstream of the prompt builder; no amount of widening here
 // addresses them. FuzzFenceGuard pins the properties this layer does claim.
 //
+// Known residual, RESIDUAL BYPASS REGISTER — forms that reach the model with `<`
+// intact. Recorded so a reader of this header does not conclude the class is closed,
+// and pinned by TestFenceGuardResidualBypassRegister so each entry is a decision
+// rather than an accident. All of them apply to BOTH guards.
+//
+//	• A BARE WORD RUN in the prefix, not terminated by a solidus:
+//	    `</abc 文档数据>`, `</ a 文档数据>`, `< a/文档数据>`
+//	  The prefix admits a word run only when a `/` closes it (`<0/文档数据>`), because
+//	  crossing bare words is what made round 11/12 delete prose. Since round 14 the
+//	  head pass substitutes one rune instead of deleting, so that justification no
+//	  longer applies to it and relaxing this is now a faithfulness trade rather than a
+//	  deletion risk (`当 x < y 时，文档数据…` would become `当 x [ y 时，…`). Left as-is
+//	  deliberately: the forms above carry visible junk between `<` and the name, the
+//	  same residual class as `<文档数据格式说明>`.
+//	• LETTER/DIGIT CONTINUATION of the tag name: `</文档数据abc>`, `</文档数据2>` — a
+//	  different token by construction, per the negative boundary class.
+//	• \p{Mc} SPACING combining marks inside the name: `</文ः档数据>` renders visibly
+//	  differently, so it is a different tag name.
+//
 // Known COST, stated here because the "byte-identical" principle above is otherwise
 // read as universal and it is not: fenceDelimiterReplacer is applied to the WHOLE
 // text in normalize(), not just to tag neighbourhoods, so every angle-bracket and
@@ -91,9 +110,28 @@ const fenceWordClass = `\p{L}\p{Nd}`
 const (
 	fenceMaxPrefixNoise    = 8
 	fenceMaxPrefixSegments = 3
+	// fenceMaxTail bounds tagPattern's optional attribute/self-closing tail.
+	//
+	// Round 6 set this to 64 and the number was load-bearing then: the tag pass was
+	// the only pass, so anything it declined shipped verbatim, and a bound the
+	// attacker could pad past was a bypass. That is no longer true. Since round 14 the
+	// head pass catches everything the tag pass declines and rewrites it IN PLACE, so
+	// padding past this bound buys an inert head, not a fence.
+	//
+	// Which makes the tail purely a FAITHFULNESS trade, and 64 was the wrong side of
+	// it: the tail DELETES, and 64 runes is enough to swallow a sentence. Round 15
+	// measured `a < 文档数据 <60 runes of prose> >` ×100 losing 86% of the document with
+	// no truncation marker — every per-match bound held, because the loss was spread
+	// across matches.
+	//
+	// 16 covers real attribute syntax with room to spare (` attr=x` is 7, `/` is 1,
+	// `\t attr` is 6, `"` is 1) while being too short to hold a clause. Anything longer
+	// falls to the head pass and costs the document exactly one substituted rune.
+	fenceMaxTail = 16
 
 	fenceMaxPrefixNoiseStr    = "8"
 	fenceMaxPrefixSegmentsStr = "3"
+	fenceMaxTailStr           = "16"
 )
 
 // fenceMaxDeletion bounds the runes a single rewrite may remove, derived from the
@@ -102,7 +140,7 @@ const (
 //	prefix   = (noise + word + "/") * segments + noise
 //	tag name = len(name) runes, each gap absorbing at most fenceMaxSepRun separators
 //	           and (fenceMaxSepRun + 1) * fenceMaxZeroWidthRun zero-width runes
-//	tail     = 64 runes (tagPattern's attribute tail) + the `<` and `>`
+//	tail     = fenceMaxTail runes + the tail's own lead rune + the `<` and `>`
 //
 // This is a PER-MATCH, PER-PASS bound. rewriteToFixpoint runs several passes, so
 // the aggregate ceiling for a whole call is deletionBudget, which replays the
@@ -113,7 +151,7 @@ func fenceMaxDeletion(tagName string) int {
 	prefix := (fenceMaxPrefixNoise+fenceMaxPrefixNoise+1)*fenceMaxPrefixSegments + fenceMaxPrefixNoise
 	perGap := fenceMaxSepRun + (fenceMaxSepRun+1)*fenceMaxZeroWidthRun
 	gaps := (nameRunes + 1) * perGap
-	const tail = 64 + 2
+	const tail = fenceMaxTail + 1 + 2
 	return prefix + gaps + nameRunes + tail
 }
 
@@ -336,8 +374,23 @@ type fenceGuard struct {
 	// placeholder is 2 runes longer than tagName ("[" + tagName + "]"), matching the
 	// 2 delimiter runes of the shortest full tag `<tagName>` exactly.
 	placeholder string
+	// stripCleanupPattern matches what the head pass LEAVES BEHIND: a neutralized
+	// opener followed by the prefix and the tag name. strip removes it to measure
+	// emptiness; nothing else uses it, and it never runs on model-bound text.
+	//
+	// It is anchored on fenceOpenNeutralized rather than on `<` so that it can only
+	// ever match this guard's own output, not arbitrary prose: a document that merely
+	// mentions 文档数据 keeps it, and only text the head pass already rewrote is removed.
+	//
+	// The trailing `\p{Zs}*>?` closes round 15's P2-2. When the tag pass declines a tag
+	// because its zero-width run exceeds fenceMaxZeroWidthRun, the head pass
+	// neutralizes the opener in place and PRESERVES the boundary rune — which for a
+	// well-formed tag is its own `>`. Without consuming that, strip returned `">"` for
+	// `<文` + 20 combining marks + `档数据>`, a lone delimiter the emptiness gate counted
+	// as content: the body cleared 40004 and bought a completion. Only an ADJACENT `>`
+	// is consumed, so real text following a neutralized tag still counts as content.
+	stripCleanupPattern *regexp.Regexp
 }
-
 func newFenceGuard(tagName string) *fenceGuard {
 	// Interleave the ignorable class around every rune of the tag name, including a
 	// leading position so `<\uFE0F文档数据>` is covered too. Each rune is matched as an
@@ -385,8 +438,14 @@ func newFenceGuard(tagName string) *fenceGuard {
 	//  1. The prefix carries no bare word run. It may cross a word run ONLY when that
 	//     run is terminated by a solidus, i.e. markup shape rather than prose
 	//     (`<0/文档数据>`, found by fuzzing in round 10).
-	//  2. The prefix never crosses a LINE BREAK. A fence tag is a token; a token does
-	//     not span paragraphs. This alone caps the blast radius at one line.
+	//  2. NEITHER the prefix NOR THE TAIL crosses a LINE BREAK. A fence tag is a token;
+	//     a token does not span paragraphs. Round 15: this rule used to be stated over
+	//     the prefix alone, and the claim that followed it — "this alone caps the blast
+	//     radius at one line" — was FALSE, because the TAIL was `[^>]{0,64}` and `[^>]`
+	//     matches `\n`. `当 a < 文档数据 的长度\n第二节：结论很重要\n…\nb > 0` lost two whole
+	//     paragraphs, and 100 such units lost 86% of the document with
+	//     doc.Truncated=false and no marker. The bound was stated over the wrong half of
+	//     the pattern — and the wrong half was the one that deletes.
 	//  3. Every unbounded repetition is replaced by an explicit COUNT
 	//     (fenceMaxPrefixNoise, fenceMaxPrefixSegments). Deletion is therefore bounded
 	//     by a constant this file states, which is what makes the quantitative bound in
@@ -434,13 +493,26 @@ func newFenceGuard(tagName string) *fenceGuard {
 	const fenceHeadPathNoise = `[^` + fenceWordClass + `>\p{Z}\p{Cc}]*`
 	const fenceHeadPrefix = `(?:` + fenceHeadPathNoise + `[` + fenceWordClass + `]+/)*` + fenceHeadDelimNoise
 
+	// The optional attribute / self-closing tail, on the DELETING pass.
+	//
+	// Both halves exclude line breaks, for the reason rule 2 above gives and with the
+	// urgency the prefix has: this pattern deletes what it matches. Round 6 wrote the
+	// tail as `[\s\p{Zs}/][^>]{0,64}` and BOTH halves match `\n` — `\s` does, and `[^>]`
+	// does — so a stray `<` before the tag name and a `>` two paragraphs later deleted
+	// everything in between. normalize() has already folded every other control
+	// separator to a space, so `\n` is the only line break that can still be here; the
+	// rest are excluded for symmetry with fenceDelimNoise, not because they can occur.
+	const fenceTailLead = `[\p{Zs}\t\v\f\r/]`
+	const fenceTailRest = `[^>\r\n\x{2028}\x{2029}]{0,` + fenceMaxTailStr + `}`
+	const fenceTail = `(?:` + fenceTailLead + fenceTailRest + `)?`
+
 	return &fenceGuard{
 		tagName: tagName,
 		// The optional tail must START with whitespace or a solidus, i.e. real
 		// attribute/self-closing syntax, so prose that merely contains the tag name
 		// (`<文档数据格式说明>`) is left alone. Anything this declines is still caught by
 		// headPattern, so declining costs no containment.
-		tagPattern: regexp.MustCompile(`<` + fencePrefix + n + `(?:[\s\p{Zs}/][^>]{0,64})?>`),
+		tagPattern: regexp.MustCompile(`<` + fencePrefix + n + fenceTail + `>`),
 		// The boundary condition is deliberately NEGATIVE — "the tag name is not
 		// continued by another letter or digit" — rather than an allow-list of
 		// delimiters. An allow-list is a bound the attacker picks: round 8 briefly used
@@ -454,6 +526,8 @@ func newFenceGuard(tagName string) *fenceGuard {
 		// rather than at two and eight.
 		headPattern: regexp.MustCompile(`<` + fenceHeadPrefix + headName + `([^` + fenceWordClass + `]|$)`),
 		placeholder: "[" + tagName + "]",
+		stripCleanupPattern: regexp.MustCompile(
+			regexp.QuoteMeta(fenceOpenNeutralized) + fenceHeadPrefix + headName + `\p{Zs}*>?`),
 	}
 }
 
@@ -503,17 +577,40 @@ func (g *fenceGuard) neutralize(s string) string {
 // neutralizePreservingSpace is neutralize without the surrounding TrimSpace, for
 // render sites where leading indentation and trailing blank lines are content.
 func (g *fenceGuard) neutralizePreservingSpace(s string) string {
-	return g.rewriteToFixpoint(g.normalize(s), g.placeholder, false)
+	return g.rewriteToFixpoint(g.normalize(s), g.placeholder)
 }
 
 // strip removes fence tags OUTRIGHT. Used only to measure whether a document has
 // any real content left; it must not be used on model-bound text, where the
 // non-empty placeholder of neutralize is what preserves the injection's visibility.
+//
+// Round 15: strip is DERIVED from neutralize instead of being a second rewriting
+// mode, which is what makes it converge.
+//
+// The old strip-mode head branch deleted the match while preserving the boundary
+// rune `${1}`. For a run of forged heads the boundary rune of match k IS the opening
+// `<` of match k+1, and ReplaceAll's matches are non-overlapping, so each pass
+// removed only about half of them: convergence took ~log2(k) passes and the
+// fenceMaxRewritePasses cap of 8 was REACHED at k>=256, returning intact
+// `<文档数据` heads. documentPreviewHasNoContent then saw non-empty output for a body
+// of nothing but forged tags, cleared the 40004 gate, and bought a completion.
+//
+// Deriving strip from neutralize also collapses the mode split that produced
+// round 15's P2-1 and P2-2: there is now exactly ONE rewriting path, so a bound or
+// an invariant verified for neutralize holds for strip by construction rather than
+// by a parallel argument nothing exercised.
+//
+// Order matters: the full-tag placeholder is removed BEFORE stripCleanupPattern,
+// because the placeholder starts with fenceOpenNeutralized and the cleanup pattern
+// would otherwise eat its opening bracket and leave the `]`.
 func (g *fenceGuard) strip(s string) string {
-	return strings.TrimSpace(g.rewriteToFixpoint(g.normalize(s), "", true))
+	out := g.rewriteToFixpoint(g.normalize(s), g.placeholder)
+	out = strings.ReplaceAll(out, g.placeholder, "")
+	out = g.stripCleanupPattern.ReplaceAllString(out, "")
+	return strings.TrimSpace(out)
 }
 
-func (g *fenceGuard) rewriteToFixpoint(s, tagReplacement string, stripHead bool) string {
+func (g *fenceGuard) rewriteToFixpoint(s, tagReplacement string) string {
 	for i := 0; i < fenceMaxRewritePasses; i++ {
 		if !strings.ContainsRune(s, '<') {
 			return s
@@ -533,14 +630,10 @@ func (g *fenceGuard) rewriteToFixpoint(s, tagReplacement string, stripHead bool)
 		//  2. It deletes nothing, so it needs no bounds, so there is no count for an
 		//     attacker to pad past — see headPattern.
 		//
-		// strip mode is the exception: it removes tags outright to measure whether any
-		// real content remains, so there the head match is deleted rather than
-		// neutralized. That path never reaches the model.
-		if stripHead {
-			next = g.headPattern.ReplaceAllString(next, "${1}")
-		} else {
-			next = g.headPattern.ReplaceAllStringFunc(next, neutralizeFenceOpeners)
-		}
+		// There is no longer a delete-mode variant of this pass. strip() is derived from
+		// this one (see strip), because the delete-mode variant preserved the boundary
+		// rune and therefore did NOT converge on overlapping runs — round 15's P1.
+		next = g.headPattern.ReplaceAllStringFunc(next, neutralizeFenceOpeners)
 		if next == s {
 			return s
 		}
@@ -560,11 +653,13 @@ func (g *fenceGuard) rewriteToFixpoint(s, tagReplacement string, stripHead bool)
 // rewriteToFixpoint's loop exactly, so a future edit to one that is not made to the
 // other shows up as a failing bound rather than as silence.
 //
-// Only deleting passes are charged. The head pass is length-preserving in
-// neutralize mode (one rune substituted for one rune); in strip mode it deletes, so
-// it is charged there. strip's output never reaches the model, but the invariant is
-// stated over both.
-func (g *fenceGuard) deletionBudget(normalized string, stripHead bool) int {
+// Only the tag pass is charged, because it is the only pass that deletes: the head
+// pass substitutes one rune for one rune. Round 14 carried a `stripHead` parameter
+// here and a comment claiming the invariant was "stated over both" modes; it was
+// never called with it, and it would have failed if it had been (~8× over budget),
+// because strip's head pass deleted an unbounded match. Round 15 removed that mode
+// entirely — strip is now derived from neutralize — so there is one path to charge.
+func (g *fenceGuard) deletionBudget(normalized string) int {
 	perMatch := fenceMaxDeletion(g.tagName)
 	budget := 0
 	s := normalized
@@ -574,12 +669,7 @@ func (g *fenceGuard) deletionBudget(normalized string, stripHead bool) int {
 		}
 		budget += len(g.tagPattern.FindAllString(s, -1)) * perMatch
 		next := g.tagPattern.ReplaceAllString(s, g.placeholder)
-		if stripHead {
-			budget += len(g.headPattern.FindAllString(next, -1)) * perMatch
-			next = g.headPattern.ReplaceAllString(next, "${1}")
-		} else {
-			next = g.headPattern.ReplaceAllStringFunc(next, neutralizeFenceOpeners)
-		}
+		next = g.headPattern.ReplaceAllStringFunc(next, neutralizeFenceOpeners)
 		if next == s {
 			break
 		}
