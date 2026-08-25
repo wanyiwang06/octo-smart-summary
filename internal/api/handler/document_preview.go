@@ -69,13 +69,13 @@ const documentPreviewInstruction = `请为下一条消息中的文档生成一�
 
 // documentPreviewReq accepts the preview target two ways:
 //
-//   - inline (Content non-empty): the caller supplies the document text directly.
+//   - inline (Content present / non-nil): the caller supplies the document text directly.
 //     Used by the online-document 速览, where the editor already holds the full body
 //     in memory. No document-service round trip, so DOCUMENT_SUMMARY_SOURCE_API_URL
 //     is not required. This grants no new read access: the caller can only submit
 //     text it can already see, and the result is streamed straight back to it.
 //
-//   - by reference (Content empty): the document text is fetched from the document
+//   - by reference (Content omitted / nil): the document text is fetched from the document
 //     service via documentSourceClient. Required for sources the client cannot
 //     render itself — uploaded PDF/Word attachments, whose text only exists after
 //     server-side parsing — and for authorization on those.
@@ -87,10 +87,12 @@ type documentPreviewReq struct {
 	// Title is only read on the inline path; on the fetch path the document
 	// service is authoritative for it.
 	Title string `json:"title,omitempty"`
-	// Content is the inline document body (plain text or Markdown). Non-empty
-	// selects the inline path. Treated strictly as untrusted data: it is
+	// Content is the inline document body (plain text or Markdown). PRESENT (non-nil)
+	// selects the inline path — an explicitly empty or whitespace-only `content` is
+	// still an inline request that answers 40004, never a by-reference fetch; only an
+	// OMITTED content is by-reference. Treated strictly as untrusted data: it is
 	// fence-sanitized and rune-budgeted exactly like fetched content.
-	Content string `json:"content,omitempty"`
+	Content *string `json:"content,omitempty"`
 }
 
 // previewEvent is the SSE payload shape. type ∈ {"start","delta","done","error"}.
@@ -165,10 +167,9 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 	}
 	defer releaseSlot()
 
-	inlineContent := strings.TrimSpace(req.Content)
 	var doc *documentSummarySource
 	switch {
-	case inlineContent != "":
+	case req.Content != nil && strings.TrimSpace(*req.Content) != "":
 		// Inline path: no document-service dependency, no fetch timeout. The body is
 		// still funnelled through normalizeFetchedDocumentSource so the rune budget,
 		// title/version clamping, and the Truncated flag behave identically to fetched
@@ -177,14 +178,16 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 			DocumentID: ref.DocumentID,
 			Title:      req.Title,
 			Version:    ref.Version,
-			Content:    inlineContent,
+			Content:    strings.TrimSpace(*req.Content),
 		}
-	case req.Content != "":
-		// The caller sent `content`, so they chose the inline path; it just trimmed to
-		// nothing. Falling through to the fetch path answers "document source is not
-		// configured" (50201) to a request that never wanted the document source — a
-		// confusing answer where "the document is empty" is the accurate one. Only a
-		// request that OMITS content is a by-reference request.
+	case req.Content != nil:
+		// The caller SENT `content` (a non-nil field, even if empty or whitespace), so
+		// they chose the inline path; it just trimmed to nothing. Falling through to the
+		// fetch path answers "document source is not configured" (50201) to a request
+		// that never wanted the document source — a confusing answer where "the document
+		// is empty" is the accurate one. Only a request that OMITS content is
+		// by-reference. Modelling content as *string is what makes {"content":""}
+		// distinguishable from an omitted field here.
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40004, Message: "文档内容为空"})
 		return
 	default:

@@ -217,6 +217,32 @@ func TestFetchSummarySource_HTTPBoundary(t *testing.T) {
 	}
 }
 
+func TestFetchSummarySource_RequestsCanonicalDocsPath(t *testing.T) {
+	// P2-1: pin the upstream request PATH. The HTTPBoundary fake service never
+	// inspects r.URL.Path, so a future edit could silently move the fetch off
+	// octo-docs-backend's canonical route. This asserts the exact path (and that the
+	// version rides the query string, not the path).
+	var gotPath, gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"document_id":"d1","content":"x"}`))
+	}))
+	defer srv.Close()
+
+	client := &httpDocumentSourceClient{baseURL: srv.URL, client: srv.Client()}
+	if _, err := client.FetchSummarySource(context.Background(), "sp", "u", "d1", "v7", http.Header{}); err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if want := "/api/v1/docs/d1/summary-source"; gotPath != want {
+		t.Errorf("upstream path = %q, want %q", gotPath, want)
+	}
+	if want := "version=v7"; gotQuery != want {
+		t.Errorf("upstream query = %q, want %q (version must ride the query string)", gotQuery, want)
+	}
+}
+
 func TestValidateDocumentRefs(t *testing.T) {
 	if err := validateDocumentRefs([]documentRefReq{{DocumentID: "ok", Version: "v1"}}); err != nil {
 		t.Errorf("valid ref rejected: %v", err)

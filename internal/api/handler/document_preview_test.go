@@ -315,6 +315,23 @@ func TestStreamDocumentPreview_OmittedContentFetches(t *testing.T) {
 	}
 }
 
+func TestStreamDocumentPreview_ExplicitEmptyContentIsInline(t *testing.T) {
+	// P1-1: content is a *string, so {"content":""} is distinguishable from an OMITTED
+	// field. An explicitly empty content is an inline request that answers 40004 — it
+	// must NOT fall through to the by-reference fetch (which is only for omitted
+	// content). With content as a plain string, "" was indistinguishable from omitted
+	// and this exact request wrongly hit the document source.
+	spy := &spyDocClient{doc: &documentSummarySource{DocumentID: "d1", Content: "来自文档服务的内容"}}
+	h := &AgentSummaryHandler{llmApiURL: "http://127.0.0.1:1/v1", llmModel: "m", llmTimeout: 1, documentClient: spy}
+	_, code := runPreview(t, h, `{"document_id":"d1","content":""}`)
+	if code != 40004 {
+		t.Errorf("want app code 40004 for explicitly empty inline content, got %d", code)
+	}
+	if spy.called {
+		t.Error("explicitly empty content must not fall back to the document source client")
+	}
+}
+
 func TestStreamDocumentPreview_InlineWithoutDocumentIDRejected(t *testing.T) {
 	// document_id stays mandatory on the inline path: it is the correlation key in
 	// logs and the cache key on the client.

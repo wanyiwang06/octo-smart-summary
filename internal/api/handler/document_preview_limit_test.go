@@ -63,7 +63,7 @@ func TestDocumentPreviewLimiter(t *testing.T) {
 			rel()
 		}
 		l.mu.Lock()
-		n := len(l.inFlght)
+		n := len(l.inFlight)
 		l.mu.Unlock()
 		if n != 0 {
 			t.Errorf("limiter retained %d entries after all releases; the map is keyed by "+
@@ -85,7 +85,7 @@ func TestDocumentPreviewLimiter(t *testing.T) {
 		}
 		wg.Wait()
 		l.mu.Lock()
-		n := l.inFlght["u1"]
+		n := l.inFlight["u1"]
 		l.mu.Unlock()
 		if n != 0 {
 			t.Errorf("in-flight count did not return to zero: %d", n)
@@ -169,7 +169,7 @@ func TestStreamDocumentPreview_InvalidRequestDoesNotConsumeSlot(t *testing.T) {
 		h.StreamDocumentPreview(c)
 	}
 	l.mu.Lock()
-	n := l.inFlght["u"]
+	n := l.inFlight["u"]
 	l.mu.Unlock()
 	if n != 0 {
 		t.Errorf("rejected requests consumed %d slots", n)

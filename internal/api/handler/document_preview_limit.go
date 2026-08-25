@@ -47,13 +47,13 @@ const documentPreviewMaxInFlightPerUser = 2
 
 // documentPreviewLimiter tracks in-flight previews per user.
 type documentPreviewLimiter struct {
-	mu      sync.Mutex
-	max     int
-	inFlght map[string]int
+	mu       sync.Mutex
+	max      int
+	inFlight map[string]int
 }
 
 func newDocumentPreviewLimiter(max int) *documentPreviewLimiter {
-	return &documentPreviewLimiter{max: max, inFlght: make(map[string]int)}
+	return &documentPreviewLimiter{max: max, inFlight: make(map[string]int)}
 }
 
 // acquire reserves a slot for userID. The release func is safe to call exactly
@@ -64,22 +64,22 @@ func (l *documentPreviewLimiter) acquire(userID string) (release func(), ok bool
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.inFlght[userID] >= l.max {
+	if l.inFlight[userID] >= l.max {
 		return func() {}, false
 	}
-	l.inFlght[userID]++
+	l.inFlight[userID]++
 
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			l.mu.Lock()
 			defer l.mu.Unlock()
-			if n := l.inFlght[userID] - 1; n > 0 {
-				l.inFlght[userID] = n
+			if n := l.inFlight[userID] - 1; n > 0 {
+				l.inFlight[userID] = n
 			} else {
 				// Delete rather than store 0: the map is keyed by user id and would
 				// otherwise grow without bound for the lifetime of the process.
-				delete(l.inFlght, userID)
+				delete(l.inFlight, userID)
 			}
 		})
 	}, true
