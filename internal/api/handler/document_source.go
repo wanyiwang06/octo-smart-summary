@@ -3,11 +3,15 @@ package handler
 // Shared document-source infrastructure.
 //
 // The client that fetches a document's summarize-ready content from the document
-// service, plus the request/response shapes, fence sanitization, and chunk
+// service, plus the request/response shapes, ref validation, and chunk
 // normalization that any document-summarizing handler builds on. Today the sole
 // consumer is the ephemeral AI 速览 preview (document_preview.go); it lives in its
 // own file so a future persisted document-summary path can reuse it rather than
 // redefine these symbols.
+//
+// There is deliberately NO fence sanitization here — see the comment above
+// normalizeFetchedDocumentSource for why the in-band fence, and the rewriting pass
+// it forced over user content, were removed.
 
 import (
 	"bytes"
@@ -305,11 +309,39 @@ func validateDocumentRefs(refs []documentRefReq) error {
 		if strings.IndexFunc(ref.Version, forbiddenRefRune) >= 0 {
 			return fmt.Errorf("document version must not contain control characters: %q", ref.Version)
 		}
-		// url.PathEscape leaves "." and ".." untouched (both are unreserved), so a bare
-		// dot-segment reaches the document service as GET /api/v1/docs/../summary-source
-		// and any normalizing intermediary collapses it to /api/v1/summary-source — a
-		// single-segment climb carrying the caller's own token. Every other dangerous
-		// character is already percent-encoded, so rejecting the two dot-segments closes it.
+		// PATH-SEGMENT CONTAINMENT.
+		//
+		// documentID is interpolated into the upstream path as a single segment
+		// (FetchSummarySource: baseURL + "/api/v1/docs/" + url.PathEscape(id) +
+		// "/summary-source"). It must therefore BE one segment.
+		//
+		// The previous rule compared the whole string to "." and ".." and argued that
+		// everything else was safe because url.PathEscape percent-encodes it. That
+		// argument was self-contradictory: the case it did handle only matters because a
+		// normalizing intermediary collapses dot segments, while the case it dismissed
+		// assumed no intermediary ever decodes %2F before normalizing. Both cannot hold
+		// of the same proxy. nginx-style ingress does exactly that — decode, then
+		// normalize, then route — so an embedded dot segment survived:
+		//
+		//   "a/../../admin"  ->  wire /api/v1/docs/a%2F..%2F..%2Fadmin/summary-source
+		//                    ->  backend sees /api/v1/admin/summary-source
+		//
+		// reached with the caller's forwarded Token, the middleware-resolved X-User-Id,
+		// and the caller-supplied X-Space-Id. Rows like "x/../y" were silent id
+		// substitution; "a/../../../../etc/passwd" left the base path entirely.
+		//
+		// So the rule is containment, not enumeration: a segment separator must never be
+		// EMBEDDABLE in the first place, which makes dot segments inexpressible rather
+		// than individually forbidden. octo-docs-backend issues ids as `d_<24 hex>`
+		// (newDocId = "d_" + randomBytes(12).hex) and the summary-source route resolves
+		// the primary key, never a slug, so no legitimate id contains a separator. If
+		// that ever changes, the id must move to the query string — do NOT relax this
+		// back into a list of forbidden shapes.
+		if strings.ContainsAny(ref.DocumentID, "/\\") {
+			return fmt.Errorf("document_id must be a single path segment: %q", ref.DocumentID)
+		}
+		// Belt-and-braces for the separator-free forms (".", ".."), which are still
+		// dot segments on their own.
 		if ref.DocumentID == "." || ref.DocumentID == ".." {
 			return fmt.Errorf("document_id must not be a path segment: %q", ref.DocumentID)
 		}

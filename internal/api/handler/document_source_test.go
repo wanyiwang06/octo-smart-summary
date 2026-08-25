@@ -297,10 +297,66 @@ func TestValidateDocumentRefs_RejectsControlCharacters(t *testing.T) {
 		t.Error("invalid UTF-8 in version was accepted")
 	}
 	// Ordinary ids with punctuation and non-ASCII must still pass: this is a control
-	// character rule, not a charset allow-list.
-	for _, id := range []string{"doc-123_v2.final", "文档-2026", "a:b/c"} {
+	// character rule, not a charset allow-list. `a:b/c` used to be blessed here and is
+	// deliberately gone — it asserted that the one character which makes path
+	// traversal expressible was legitimate, which is what kept that class alive in the
+	// suite for seventeen rounds.
+	for _, id := range []string{"doc-123_v2.final", "文档-2026", "a:b", "d_70cf5758a2358d30eaa3aa89"} {
 		if err := validateDocumentRefs([]documentRefReq{{DocumentID: id}}); err != nil {
 			t.Errorf("legitimate document_id %q rejected: %v", id, err)
+		}
+	}
+}
+
+// TestValidateDocumentRefs_RejectsEmbeddedPathSegments pins the traversal fix.
+//
+// document_id is interpolated as a SINGLE path segment upstream. The old rule
+// compared the whole string to "." / ".." and reasoned that url.PathEscape made
+// everything else safe — but %2F is only safe while nothing decodes it before
+// normalizing, and the same comment's other half already assumed a normalizing
+// intermediary exists. An nginx-style ingress (decode, normalize, route) defeats it.
+//
+// The shapes below are the reviewer's probe table, measured OPEN against the
+// previous head. Each row's third column is what a normalizing backend would have
+// been handed.
+func TestValidateDocumentRefs_RejectsEmbeddedPathSegments(t *testing.T) {
+	for _, tc := range []struct{ id, wouldBecome string }{
+		{"a/../../admin", "/api/v1/admin/summary-source"},
+		{"a/../../../../etc/passwd", "/etc/passwd/summary-source"},
+		{"a/..", "/api/v1/docs/summary-source"},
+		{"x/../y", "/api/v1/docs/y/summary-source"},
+		{"a/./b", "/api/v1/docs/a/b/summary-source"},
+		{"./x", "/api/v1/docs/x/summary-source"},
+		{".", "/api/v1/summary-source"},
+		{"..", "/api/v1/summary-source"},
+		// A separator alone is enough: it need not carry a dot segment to redirect the
+		// credentialed request at a different upstream route.
+		{"a/b", "/api/v1/docs/a/b/summary-source"},
+		{"a\\b", "backslash: normalized to a separator by some intermediaries"},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			if err := validateDocumentRefs([]documentRefReq{{DocumentID: tc.id}}); err == nil {
+				t.Errorf("document_id %q accepted; a normalizing intermediary would serve %s "+
+					"with the caller's Token and X-Space-Id", tc.id, tc.wouldBecome)
+			}
+		})
+	}
+}
+
+// TestValidateDocumentRefs_AcceptsRealBackendIDs pins the other direction, so the
+// containment rule cannot be tightened into rejecting production traffic.
+//
+// octo-docs-backend's newDocId is "d_" + randomBytes(12).hex, and the
+// summary-source route resolves the primary key rather than a slug, so every real
+// id is separator-free by construction.
+func TestValidateDocumentRefs_AcceptsRealBackendIDs(t *testing.T) {
+	for _, id := range []string{
+		"d_70cf5758a2358d30eaa3aa89",
+		"d_" + strings.Repeat("a", 24),
+		"d_0123456789abcdef01234567",
+	} {
+		if err := validateDocumentRefs([]documentRefReq{{DocumentID: id}}); err != nil {
+			t.Errorf("real octo-docs-backend id %q rejected: %v", id, err)
 		}
 	}
 }

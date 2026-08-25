@@ -90,8 +90,12 @@ type documentPreviewReq struct {
 	// Content is the inline document body (plain text or Markdown). PRESENT (non-nil)
 	// selects the inline path — an explicitly empty or whitespace-only `content` is
 	// still an inline request that answers 40004, never a by-reference fetch; only an
-	// OMITTED content is by-reference. Treated strictly as untrusted data: it is
-	// fence-sanitized and rune-budgeted exactly like fetched content.
+	// OMITTED content — or an explicit JSON `null`, which unmarshals to nil and is
+	// therefore indistinguishable from omitted — is by-reference.
+	//
+	// Treated strictly as untrusted data: it is rune-budgeted exactly like fetched
+	// content and carried as its own chat message. It is NOT rewritten or sanitized;
+	// there is no in-band delimiter for it to forge, so there is nothing to strip.
 	Content *string `json:"content,omitempty"`
 }
 
@@ -247,10 +251,10 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 		doc = fetched
 	}
 	normalizeFetchedDocumentSource(doc, ref)
-	// Emptiness is judged on the SANITIZED text: content consisting only of a fence
-	// tag (e.g. "<文档数据>") used to clear this gate and bill a completion for a
-	// document whose whole body collapses to a placeholder, while a caller with
-	// genuinely empty content got a clean 40004.
+	// Emptiness is judged on the text as it will actually be sent. A document whose
+	// body is only whitespace must not bill a completion, and the check has to agree
+	// with what buildDocumentPreviewMessages renders — chunks when present, otherwise
+	// the content field — or the two disagree about what "empty" means.
 	if documentPreviewHasNoContent(doc) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40004, Message: "文档没有可总结内容"})
 		return
