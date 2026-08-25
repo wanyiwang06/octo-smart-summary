@@ -333,19 +333,31 @@ var docFenceGuard = newFenceGuard("文档数据")
 // Names kept so the existing test suite keeps addressing the guard's parts directly
 // after centralization — those tests are the regression barrier for rounds 4–10 and
 // are deliberately not rewritten as part of this change.
+//
+// docFenceHeadPlaceholder is what the head pass writes over a forged opener. Round
+// 14 made that pass rewrite IN PLACE, so it is the single replacement rune rather
+// than the old "tag name, with the `<` deleted" — see fenceOpenNeutralized.
 var (
 	docFencePlaceholder     = docFenceGuard.placeholder
-	docFenceHeadPlaceholder = docFenceGuard.headPlaceholder
+	docFenceHeadPlaceholder = fenceOpenNeutralized
 	docFenceTagPattern      = docFenceGuard.tagPattern
 	docFenceHeadPattern     = docFenceGuard.headPattern
 )
 
 // sanitizeDocumentFenceText neutralizes forged <文档数据> tags in untrusted document
-// text, replacing them with a visible placeholder. Only ever shortens its input,
-// which buildDocumentPreviewPrompt's post-assembly pass relies on.
+// text, replacing them with a visible placeholder. Never lengthens its input, which
+// buildDocumentPreviewPrompt's post-assembly pass relies on: the tag pass shortens,
+// and the head pass is rune-for-rune length-preserving.
 func sanitizeDocumentFenceText(s string) string {
 	return docFenceGuard.neutralize(s)
 }
+
+// documentChunkTitlePrefix is the markup buildDocumentPreviewPrompt renders before
+// a chunk title. It lives here rather than as a literal at the render site because
+// normalizeFetchedDocumentSource has to charge the same runes to the prompt budget
+// — the two drifting apart is exactly the round-14 P2 (titles model-visible since
+// round 5, uncounted ever since).
+const documentChunkTitlePrefix = "### "
 
 func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefReq) {
 	doc.DocumentID = ref.DocumentID
@@ -384,9 +396,29 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 			doc.Truncated = true
 		}
 		chunk.Text = truncateRunes(trimmed, maxDocumentChunkRunes)
-		total += utf8.RuneCountInString(chunk.Text)
+		// Titles are rendered into the prompt as `### <title>\n`
+		// (buildDocumentPreviewPrompt), so they must be charged to the same budget as
+		// the body. They became model-visible in round 5 and the arithmetic here did
+		// not follow: with the configured caps that is up to 200 chunks × 200 runes =
+		// ~40k runes entering the prompt uncounted — half the budget. It never
+		// overflowed, because buildDocumentPreviewPrompt's own bodyLimit is
+		// authoritative, but it made budgetExhausted trip earlier than this loop
+		// believed, so real body text at the tail of a long, heavily-sectioned document
+		// was dropped to pay for titles this loop thought were free.
+		//
+		// The +len() is the rendered markup itself: the "### " prefix and the trailing
+		// newline that buildDocumentPreviewPrompt writes around every non-empty title.
+		cost := utf8.RuneCountInString(chunk.Text)
+		titleCost := 0
+		if chunk.Title != "" {
+			titleCost = utf8.RuneCountInString(chunk.Title) + len(documentChunkTitlePrefix) + len("\n")
+		}
+		total += cost + titleCost
 		if total > maxDocumentPromptRunes {
-			remaining := maxDocumentPromptRunes - (total - utf8.RuneCountInString(chunk.Text))
+			// The title is already committed at this point (it renders before the body),
+			// so it is charged first and the body gets whatever is left. Charging only
+			// the body here is what let the total overrun by the title's own runes.
+			remaining := maxDocumentPromptRunes - (total - cost)
 			doc.Truncated = true
 			if remaining <= 0 {
 				break

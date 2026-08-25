@@ -392,7 +392,7 @@ func buildDocumentPreviewPrompt(doc *documentSummarySource) string {
 			// model can honour the instruction's "建议细读第X部分"; it is untrusted text and
 			// goes through the same sanitize + budget path as the chunk body.
 			if sectionTitle := strings.TrimSpace(chunk.Title); sectionTitle != "" {
-				if !appendBody("### ") || !appendBody(sanitizeDocumentFenceText(sectionTitle)) || !appendBody("\n") {
+				if !appendBody(documentChunkTitlePrefix) || !appendBody(sanitizeDocumentFenceText(sectionTitle)) || !appendBody("\n") {
 					budgetExhausted = true
 					break
 				}

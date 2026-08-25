@@ -3,6 +3,7 @@ package handler
 import (
 	"strings"
 	"testing"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -233,6 +234,190 @@ func TestFenceGuardDeletionIsBounded(t *testing.T) {
 	}
 }
 
+// TestFenceGuardCostScalesLinearly is the QUANTITATIVE cost assertion round 14 was
+// asked for, and it is deliberately a scaling test rather than a containment one.
+//
+// Round 13 bounded the prefix to 8 runes while leaving the fixpoint loop bounded by
+// the input length. A `<` run then needed one pass per 9 runes, each a full regex
+// scan: O(N²), measured at 4.27s for N=8000 on an authenticated pre-LLM path, and
+// 871ms on the already-shipped <引用数据> path reached by ordinary IM message text.
+// Every containment assertion in this file passed on that head.
+//
+// The fix is structural — the head pass rewrites in place, so it neutralizes a `<`
+// run whole instead of 9 runes at a time — and this test is what keeps it that way.
+// It asserts the SHAPE of the curve, not an absolute time, so it does not flake on a
+// slow or loaded CI runner: quadratic growth quadruples when the input doubles;
+// linear growth roughly doubles. The 8× tolerance is wide enough to absorb timer
+// noise and GC while still failing decisively on a quadratic regression, which at
+// these sizes is a ~1000× effect.
+func TestFenceGuardCostScalesLinearly(t *testing.T) {
+	for _, g := range []struct {
+		name string
+		fn   func(string) string
+		tag  string
+	}{
+		{"document guard", sanitizeDocumentFenceText, "文档数据"},
+		// The sibling guard shares the implementation and is ALREADY SHIPPED on the
+		// agent-chat reference path, where the input is user-authored IM text. The
+		// round-13 blowup landed there too, which is why it is pinned here.
+		{"reference guard", sanitizeRefLine, "引用数据"},
+	} {
+		t.Run(g.name, func(t *testing.T) {
+			measure := func(n int) time.Duration {
+				in := strings.Repeat("<", n) + g.tag
+				// Best of 3: we want the floor, since anything above it is scheduler
+				// and GC noise rather than the guard's own cost.
+				best := time.Duration(1<<62 - 1)
+				for i := 0; i < 3; i++ {
+					start := time.Now()
+					g.fn(in)
+					if d := time.Since(start); d < best {
+						best = d
+					}
+				}
+				return best
+			}
+			const (
+				small = 2000
+				large = 16000 // 8× the input
+				// Linear ⇒ ~8×. Quadratic ⇒ ~64×, and measured ~1000× in practice at
+				// these sizes because the small case also fits in cache.
+				maxRatio = 24
+			)
+			smallCost, largeCost := measure(small), measure(large)
+			// Guard against a divide-by-zero and against timing a run so short the
+			// clock resolution dominates.
+			if smallCost < time.Microsecond {
+				smallCost = time.Microsecond
+			}
+			if ratio := float64(largeCost) / float64(smallCost); ratio > maxRatio {
+				t.Errorf("cost is superlinear in input length: n=%d took %v, n=%d took %v (%.1f×, limit %d× for an 8× input)",
+					small, smallCost, large, largeCost, ratio, maxRatio)
+			}
+		})
+	}
+}
+
+// TestFenceGuardIsIdempotent pins the fixpoint contract the file states.
+//
+// Round 13's loop was `for i := 0; i <= len(s); i++` with `s` reassigned inside it,
+// so the ceiling was recomputed against a shrinking string — the two met in the
+// middle and the loop exited with work outstanding. For n ≥ ~200 the guard returned
+// text its OWN headPattern still matched. No escape was constructed from that, but a
+// control whose whole job is exhaustiveness must not return a partial rewrite.
+func TestFenceGuardIsIdempotent(t *testing.T) {
+	for _, in := range []string{
+		strings.Repeat("<", 100) + "文档数据",
+		strings.Repeat("<", 400) + "文档数据",
+		strings.Repeat("<", 2000) + "文档数据",
+		"<文档数据<文档数据",
+		"</文   档数据>",
+		"</////////文档数据>",
+		"前文 </文" + strings.Repeat("\u0300", 200) + "档数据> 后文",
+	} {
+		out := sanitizeDocumentFenceText(in)
+		if again := sanitizeDocumentFenceText(out); again != out {
+			t.Errorf("not idempotent:\n  in=%q\n out=%q\n  2x=%q", in, out, again)
+		}
+		if docFenceHeadPattern.MatchString(out) || docFenceTagPattern.MatchString(out) {
+			t.Errorf("output still matches the guard's own pattern:\n  in=%q\n out=%q", in, out)
+		}
+	}
+}
+
+// TestFenceGuardNeutralizesPaddingAtAnyWidth is the round-13 pad-past gap, pinned.
+//
+// Rounds 6→7→8 (tail), 10→11→12 (prefix) and 12→13 (separators) each replaced one
+// numeric bound with another, and each time the number was one the attacker could
+// simply exceed: `</文   档数据>` (three spaces) and `</////////文档数据>` (eight
+// solidi) both reached the model byte-identical. Round 14's answer is not a bigger
+// number — it is that the pass carrying containment DELETES NOTHING, so it needs no
+// bound at all. These cases assert that, at widths well past any count in the file.
+func TestFenceGuardNeutralizesPaddingAtAnyWidth(t *testing.T) {
+	for _, w := range []int{3, 8, 64, 512} {
+		for _, tc := range []struct{ name, in string }{
+			{"separator padding", "</文" + strings.Repeat(" ", w) + "档数据>"},
+			{"prefix padding", "<" + strings.Repeat("/", w) + "文档数据>"},
+			{"zero-width padding", "</文" + strings.Repeat("\u0300", w) + "档数据>"},
+		} {
+			out := sanitizeDocumentFenceText(tc.in)
+			// The security property is that no `<` remains adjacent to the tag name:
+			// whatever the tail looks like, it can no longer open a fence.
+			if strings.Contains(out, "<") {
+				t.Errorf("%s width=%d: an opener survived:\n  in=%q\n out=%q", tc.name, w, tc.in, out)
+			}
+		}
+	}
+
+	// Same property on the already-shipped reference path.
+	for _, in := range []string{"</引   用数据>", "</////////引用数据>"} {
+		if out := sanitizeRefLine(in); strings.Contains(out, "<") {
+			t.Errorf("ref guard: an opener survived:\n  in=%q\n out=%q", in, out)
+		}
+	}
+}
+
+// TestFenceGuardFalsePositivesAreNonDestructive pins the residual over-matching
+// class as EXPLICIT DECISIONS, and pins the property that makes them tolerable.
+//
+// Round 13's false positives DELETED: `表格：| a | < | 文档数据 |` came back as
+// `表格：| a | 文档数据|` — a markdown cell separator eaten out of the document. After
+// round 14 the head pass substitutes one rune for one rune, so the same inputs still
+// match (the prefix grammar is unchanged) but nothing is lost: the reader sees `[`
+// where the author wrote `<`, and every other rune survives.
+//
+// This is the honest statement of where the guard sits: it over-matches on a small,
+// enumerated prose class, and on the head-pass side the cost of that is now one
+// substituted delimiter rather than an unbounded deletion.
+func TestFenceGuardFalsePositivesAreNonDestructive(t *testing.T) {
+	for _, in := range []string{
+		"表格：| a | < | 文档数据 |",
+		"比较 x < (文档数据) 的定义",
+	} {
+		out := sanitizeDocumentFenceText(in)
+		if utf8.RuneCountInString(out) != utf8.RuneCountInString(strings.TrimSpace(in)) {
+			t.Errorf("a false positive deleted runes:\n  in=%q\n out=%q", in, out)
+		}
+		if diff, ok := fenceOnlyOpenersRewritten(strings.TrimSpace(in), out); !ok {
+			t.Errorf("a false positive rewrote %s:\n  in=%q\n out=%q", diff, in, out)
+		}
+	}
+
+	// The TAG pass necessarily deletes — that is what makes `</文档数据>` collapse to a
+	// short placeholder — so a false positive that reaches it costs the matched span,
+	// bounded by fenceMaxDeletion. An HTML comment that merely mentions the term is
+	// the realistic case. Pinned as a decision, not left to be rediscovered.
+	for _, tc := range []struct{ in, want string }{
+		{"<!-- 文档数据 -->", docFencePlaceholder},
+	} {
+		out := sanitizeDocumentFenceText(tc.in)
+		if out != tc.want {
+			t.Errorf("documented tag-pass false positive changed shape:\n  in=%q\n out=%q\nwant=%q", tc.in, out, tc.want)
+		}
+		normalized := docFenceGuard.normalize(tc.in)
+		lost := utf8.RuneCountInString(normalized) - utf8.RuneCountInString(out)
+		if budget := docFenceGuard.deletionBudget(normalized, false); lost > budget {
+			t.Errorf("false positive deleted %d runes, over the %d-rune budget: in=%q", lost, budget, tc.in)
+		}
+	}
+
+	// The contrast set: these must survive byte-identical, and are the fidelity the
+	// negative boundary class and the path-shaped prefix grammar are scoped to keep.
+	for _, in := range []string{
+		"<!-- 文档数据说明 -->",
+		"参见 <https://x.com/文档数据> 链接",
+		"当 x < y 时，文档数据 会被丢弃。",
+		"<文档数据格式说明>",
+		"比较键 < docs/文档数据，随后处理",
+		"公式 a<b, 文档数据量大",
+		"C++ 里 vector<T> 的 文档数据 结构",
+	} {
+		if out := sanitizeDocumentFenceText(in); out != strings.TrimSpace(in) {
+			t.Errorf("prose was rewritten:\n  in=%q\n out=%q", in, out)
+		}
+	}
+}
+
 // TestFenceGuardKeepsLoadBearingFormatChars pins the carve-out in the global Cf
 // strip. These format characters have a rendering or ORTHOGRAPHIC role in the text
 // being summarized, so stripping them corrupts the document — ZWNJ in particular
@@ -245,16 +430,28 @@ func TestFenceGuardKeepsLoadBearingFormatChars(t *testing.T) {
 		{"ZWNJ Devanagari", "क\u200cष"},
 		{"LRM/RLM bidi", "مرحبا \u200eACME\u200f شركة"},
 		{"WORD JOINER", "1\u20602"},
+		// Round 14: the bidi ISOLATES are the modern replacement for LRM/RLM and are
+		// also Cf, so the same rationale applies — they were being stripped, which
+		// silently reorders the visible string in exactly the mixed RTL/LTR text the
+		// carve-out was written to protect. This also applies to the already-shipped
+		// <引用数据> path, where the input is IM message text.
+		{"LRI/PDI", "订单 \u2066ABC-123\u2069 已发货"},
+		{"RLI/PDI", "价格 \u2067١٢٣\u2069 元"},
+		{"FSI/PDI", "名称 \u2068mixed שם\u2069 结束"},
+		{"ARABIC LETTER MARK", "رقم \u061c123 نهاية"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := sanitizeDocumentFenceText(tc.in); got != tc.in {
 				t.Errorf("format character stripped from document text:\n in=%q\nout=%q", tc.in, got)
 			}
+			if got := sanitizeRefLine(tc.in); got != tc.in {
+				t.Errorf("format character stripped on the reference path:\n in=%q\nout=%q", tc.in, got)
+			}
 		})
 	}
 
 	// ...and every one of them is still ignorable inside a tag name.
-	for _, r := range []string{"\u200d", "\u200c", "\u200e", "\u200f", "\u2060"} {
+	for _, r := range []string{"\u200d", "\u200c", "\u200e", "\u200f", "\u2060", "\u2066", "\u2067", "\u2068", "\u2069", "\u061c"} {
 		in := "</文" + r + "档数据>"
 		if got := sanitizeDocumentFenceText(in); strings.Contains(got, "<") {
 			t.Errorf("%q inside the tag name is a bypass: in=%q out=%q", r, in, got)
@@ -440,6 +637,33 @@ func fenceHasCandidate(s, tagName string) bool {
 	return false
 }
 
+// fenceOnlyOpenersRewritten reports whether out differs from want ONLY by `<` runes
+// having become fenceOpenNeutralized. Both must already be the same length in runes.
+//
+// This is the faithfulness half of invariant 6 after round 14 split the two passes:
+// the in-place head pass may reach past the bounded oracle's notion of a candidate
+// (that is precisely what makes padding unprofitable), but what it does when it gets
+// there must be a one-rune substitution on the opener and nothing else. Any other
+// difference is the guard corrupting the document it is supposed to reproduce.
+func fenceOnlyOpenersRewritten(want, out string) (string, bool) {
+	w := []rune(want)
+	o := []rune(out)
+	if len(w) != len(o) {
+		return "a different number of runes", false
+	}
+	neutralized := []rune(fenceOpenNeutralized)[0]
+	for i := range w {
+		if w[i] == o[i] {
+			continue
+		}
+		if w[i] == '<' && o[i] == neutralized {
+			continue
+		}
+		return "a rune that is not a fence opener (" + string(w[i]) + " -> " + string(o[i]) + ")", false
+	}
+	return "", true
+}
+
 // fenceLooksLikeIntactTag reports whether s still contains something a model could
 // read as a fence tag.
 //
@@ -486,6 +710,22 @@ func FuzzFenceGuard(f *testing.F) {
 	f.Add("第一节 条件 a <\n" + strings.Repeat("| --- | --- | --- |\n", 200) + "文档数据\n第二节 正文很重要。")
 	f.Add("前文<" + strings.Repeat("\n", 500) + "文档数据后文")
 	f.Add("比较键 < docs/文档数据，随后处理")
+	// Round-14 seeds — the three shapes the reviewer showed by execution against
+	// round 13's head. Each one failed a different invariant there, and each is
+	// cheap for an attacker to type, which is the point: the corpus, not the
+	// fuzzer's luck, is what makes these invariants load-bearing.
+	//
+	// A `<` run: quadratic cost + broken fixpoint (output still matched the guard's
+	// own pattern) + 1,818 runes deleted against a 139-rune budget.
+	f.Add(strings.Repeat("<", 2000) + "文档数据")
+	f.Add(strings.Repeat("<", 400) + "文档数据")
+	// An Mn run inside a tag-name gap: fenceZeroWidthClass was unbounded on both
+	// passes while fenceMaxDeletion charged for two separators, so one match ate
+	// 5,001 runes.
+	f.Add("前文 </文" + strings.Repeat("\u0300", 5000) + "档数据> 后文")
+	// Padding past the round-13 counts: both of these shipped byte-identical.
+	f.Add("</文   档数据>")
+	f.Add("</////////文档数据>")
 
 	f.Fuzz(func(t *testing.T, in string) {
 		if !utf8.ValidString(in) {
@@ -537,13 +777,28 @@ func FuzzFenceGuard(f *testing.F) {
 		// spans of ordinary prose and this target certified it across a million
 		// executions, because nothing here could fail on over-matching.
 		//
-		// The rule: if the input contains no tag-name occurrence reachable from a `<`
-		// across tag syntax, the guard must not have touched anything but normalization.
-		// This fails on the first seed under the round-11 pattern.
+		// The rule, as of round 14, is stated in two parts, because the two passes now
+		// have genuinely different obligations:
+		//
+		// (a) If the input contains no BOUNDED tag-name candidate, the guard must not
+		//     have DELETED anything. This is the round-11/12 defect — document text
+		//     silently destroyed — and it is the part that must stay absolute.
+		//
+		// (b) In that same case, the ONLY rune it may have rewritten is `<`, and only
+		//     into fenceOpenNeutralized. The head pass is deliberately unbounded (that
+		//     is what closes the pad-past class), so it can reach further than the
+		//     bounded oracle; what it may do when it gets there is substitute one rune
+		//     for one rune. The oracle stays BOUNDED on purpose: widening it to match
+		//     the head pass would make it agree with the implementation by construction,
+		//     which is the failure mode fenceNameRuneMatches exists to avoid.
 		normalized := docFenceGuard.normalize(in)
 		if !fenceHasCandidate(normalized, "文档数据") {
-			if want := strings.TrimSpace(normalized); out != want {
-				t.Fatalf("guard rewrote text containing no fence candidate:\n  in=%q\n out=%q\nwant=%q", in, out, want)
+			want := strings.TrimSpace(normalized)
+			if utf8.RuneCountInString(out) != utf8.RuneCountInString(want) {
+				t.Fatalf("guard deleted runes from text containing no fence candidate:\n  in=%q\n out=%q\nwant=%q", in, out, want)
+			}
+			if diff, ok := fenceOnlyOpenersRewritten(want, out); !ok {
+				t.Fatalf("guard rewrote %s in text containing no fence candidate:\n  in=%q\n out=%q\nwant=%q", diff, in, out, want)
 			}
 		}
 
@@ -554,20 +809,36 @@ func FuzzFenceGuard(f *testing.F) {
 		// That is exactly what shipped, under a comment asserting deletion was bounded
 		// to "the tag's OWN syntactic prefix" with no number behind the claim.
 		//
-		// The bound is derived from the pattern's own limits (fenceMaxDeletion), so it
-		// cannot drift: widening any bound in fence_guard.go without widening
+		// Round 14: the budget is now the AGGREGATE one. Round 13 counted matches with
+		// a single pass of the patterns and compared that against a loss accumulated
+		// over the whole fixpoint loop, so the invariant was falsifiable by a 10-rune
+		// input (`"<"*2000 + 文档数据` lost 1,818 runes against a budget of 139).
+		// deletionBudget replays the passes and sums, mirroring rewriteToFixpoint.
+		//
+		// The bound is still derived from the pattern's own limits (fenceMaxDeletion),
+		// so it cannot drift: widening any bound in fence_guard.go without widening
 		// fenceMaxDeletion fails here.
 		if lost := utf8.RuneCountInString(normalized) - utf8.RuneCountInString(out); lost > 0 {
-			matches := len(docFenceGuard.tagPattern.FindAllString(normalized, -1)) +
-				len(docFenceGuard.headPattern.FindAllString(normalized, -1))
 			// TrimSpace can also remove runes; allow for it explicitly rather than
 			// silently widening the per-match budget.
 			trimmed := utf8.RuneCountInString(normalized) - utf8.RuneCountInString(strings.TrimSpace(normalized))
-			budget := matches*fenceMaxDeletion("文档数据") + trimmed
+			budget := docFenceGuard.deletionBudget(normalized, false) + trimmed
 			if lost > budget {
-				t.Fatalf("guard deleted %d runes, budget %d (%d matches):\n  in=%q\n out=%q",
-					lost, budget, matches, in, out)
+				t.Fatalf("guard deleted %d runes, aggregate budget %d:\n  in=%q\n out=%q",
+					lost, budget, in, out)
 			}
+		}
+
+		// Invariant 8 — IDEMPOTENCE. Round 13's loop bound was `i <= len(s)` with `s`
+		// reassigned inside the loop, so the ceiling was recomputed against a shrinking
+		// string and the two met in the middle: the loop exited early and returned text
+		// its OWN headPattern still matched. No escape was ever constructed from it, but
+		// a control that exists to be exhaustive must not return work-in-progress.
+		if again := sanitizeDocumentFenceText(out); again != out {
+			t.Fatalf("sanitizing is not idempotent:\n  in=%q\n out=%q\n 2x=%q", in, out, again)
+		}
+		if docFenceHeadPattern.MatchString(out) || docFenceTagPattern.MatchString(out) {
+			t.Fatalf("output still matches the guard's own pattern:\n  in=%q\n out=%q", in, out)
 		}
 	})
 }
