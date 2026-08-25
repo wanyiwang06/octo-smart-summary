@@ -253,7 +253,7 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 	normalizeFetchedDocumentSource(doc, ref)
 	// Emptiness is judged on the text as it will actually be sent. A document whose
 	// body is only whitespace must not bill a completion, and the check has to agree
-	// with what buildDocumentPreviewMessages renders — chunks when present, otherwise
+	// with what buildDocumentPreviewBody renders — chunks when present, otherwise
 	// the content field — or the two disagree about what "empty" means.
 	if documentPreviewHasNoContent(doc) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40004, Message: "文档没有可总结内容"})

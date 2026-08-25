@@ -72,10 +72,10 @@ func TestNormalizeFetchedDocumentSource_BlankChunksDoNotConsumeCap(t *testing.T)
 }
 
 // TestNormalizeFetchedDocumentSource_TitlesAreBudgeted pins the round-14 P2: chunk
-// titles are RENDERED into the prompt (`### <title>\n`, buildDocumentPreviewPrompt)
+// titles are RENDERED into the prompt (`### <title>\n`, buildDocumentPreviewBody)
 // but were not counted here.
 //
-// It never overflowed — buildDocumentPreviewPrompt's own bodyLimit is authoritative
+// It never overflowed — buildDocumentPreviewBody's own bodyLimit is authoritative
 // — but with the configured caps up to 200 × 200 = ~40k runes of title, half the
 // budget, entered the prompt uncounted. The effect is silent and in the wrong
 // direction: budgetExhausted trips earlier than this loop believes, so real body
@@ -296,14 +296,43 @@ func TestValidateDocumentRefs_RejectsControlCharacters(t *testing.T) {
 	if err := validateDocumentRefs([]documentRefReq{{DocumentID: "ok", Version: "v\xff1"}}); err == nil {
 		t.Error("invalid UTF-8 in version was accepted")
 	}
-	// Ordinary ids with punctuation and non-ASCII must still pass: this is a control
-	// character rule, not a charset allow-list. `a:b/c` used to be blessed here and is
-	// deliberately gone — it asserted that the one character which makes path
-	// traversal expressible was legitimate, which is what kept that class alive in the
-	// suite for seventeen rounds.
-	for _, id := range []string{"doc-123_v2.final", "文档-2026", "a:b", "d_70cf5758a2358d30eaa3aa89"} {
+	// Ordinary ids with ASCII punctuation must still pass. Note this list is now an
+	// ALLOW-LIST test, not a control-character test: `文档-2026` was blessed here one
+	// round ago under the old "control characters only" rule and is deliberately gone.
+	//
+	// Narrowing to ASCII is a client-visible tightening, taken knowingly: a caller
+	// passing a non-ASCII document_id now gets 400 instead of a 404 from upstream.
+	// octo-docs-backend issues ids as `d_` + 24 hex, so nothing real is rejected, and
+	// the by-reference path is the only consumer (the inline path never sends an id
+	// upstream). The alternative — permitting non-ASCII because CJK cannot become a
+	// separator — keeps a deny-list shaped rule alive for no reachable benefit.
+	for _, id := range []string{"doc-123_v2.final", "a:b", "d_70cf5758a2358d30eaa3aa89", "DOC_9"} {
 		if err := validateDocumentRefs([]documentRefReq{{DocumentID: id}}); err != nil {
 			t.Errorf("legitimate document_id %q rejected: %v", id, err)
+		}
+	}
+}
+
+// TestValidateDocumentRefs_RejectsPercentEncodedSeparators pins the allow-list.
+//
+// Rejecting literal "/" and "\\" was not enough. url.PathEscape escapes the "%" of a
+// percent-encoded separator to "%25", so ONE decode stage is safe — but an ingress
+// that decodes twice turns these back into separators, and then the containment
+// argument is gone. Two decode stages is a misconfiguration rather than a default,
+// which is why this was P2 and not the blocker; the allow-list ends the class for any
+// number of stages, because "%" itself is not permitted.
+func TestValidateDocumentRefs_RejectsPercentEncodedSeparators(t *testing.T) {
+	for _, id := range []string{
+		"%2e%2e%2fadmin",
+		"%2F..%2Fadmin",
+		"%252e%252e%252fadmin",
+		"a%2Fb",
+		"%00",
+		// Not a separator, but the same principle: no percent-encoding survives.
+		"a%20b",
+	} {
+		if err := validateDocumentRefs([]documentRefReq{{DocumentID: id}}); err == nil {
+			t.Errorf("document_id %q accepted; a double-decoding ingress could turn it into a separator", id)
 		}
 	}
 }

@@ -645,6 +645,104 @@ func TestDocumentPreviewHasNoContent_MirrorsBuilderPrecedence(t *testing.T) {
 		}
 	}
 }
+
+// TestNormalizeFetchedDocumentSource_ChunksNotCoveringContentFlagTruncation pins the
+// coexistence guard.
+//
+// The builder renders chunks and ignores Content when both are present. If the chunks
+// are only PART of Content, the rest never reaches the model — and because every
+// value here sits far below every cap, none of the size checks fire: Truncated stays
+// false, no marker is emitted, and a completion is billed for a confident-looking
+// 速览 of an excerpt. That is the same silent-content-loss shape this endpoint spent
+// its review history removing, re-entering through field precedence.
+//
+// octo-docs-backend v1 always sends `chunks: []` (getSummarySourceHandler returns
+// content with a literal empty chunk list), so this is not reachable from today's
+// producer — which is exactly why it needs a test: nothing else would catch the other
+// side starting to emit partial chunks.
+func TestNormalizeFetchedDocumentSource_ChunksNotCoveringContentFlagTruncation(t *testing.T) {
+	const canary = "CRITICAL-CONCLUSION-金丝雀-9182"
+	doc := &documentSummarySource{
+		DocumentID: "d_70cf5758a2358d30eaa3aa89",
+		Title:      "季度报告",
+		Content:    "引言部分……" + canary + " 这是最重要的结论。",
+		Chunks:     []documentSourceChunk{{Text: "引言部分……"}},
+	}
+	normalizeFetchedDocumentSource(doc, documentRefReq{DocumentID: doc.DocumentID})
+	body := buildDocumentPreviewBody(doc)
+
+	// The premise: the uncovered tail really is absent from the prompt. If this ever
+	// fails the builder has started merging the two fields and the guard below should
+	// be revisited rather than silently kept.
+	if strings.Contains(body, canary) {
+		t.Fatalf("premise broken: builder now renders uncovered Content — re-check the guard\nbody=%q", body)
+	}
+	// The point of the fix: the user must be TOLD the source was incomplete.
+	if !doc.Truncated {
+		t.Error("chunks not covering Content must set Truncated; text was dropped with no signal")
+	}
+	if !strings.Contains(body, "截断") {
+		t.Errorf("truncation marker missing from body: %q", body)
+	}
+	// And it must still be billable content, not a spurious 40004.
+	if documentPreviewHasNoContent(doc) {
+		t.Error("a doc with real chunks must not be judged empty")
+	}
+}
+
+// TestNormalizeFetchedDocumentSource_RedundantChunksDoNotFlagTruncation is the other
+// half: the guard must not cry wolf.
+//
+// A producer that sends chunks which fully segment Content is redundant, not lossy.
+// Raising a truncation marker there would be a false alarm — the one failure a
+// truncation marker cannot afford, because it teaches users to ignore the marker in
+// the cases that are real. Whitespace differences are expected (chunking re-flows the
+// text) and must not count as loss.
+func TestNormalizeFetchedDocumentSource_RedundantChunksDoNotFlagTruncation(t *testing.T) {
+	for name, doc := range map[string]*documentSummarySource{
+		"exact segmentation": {
+			DocumentID: "d1",
+			Content:    "第一段。第二段。第三段。",
+			Chunks: []documentSourceChunk{
+				{Text: "第一段。"}, {Text: "第二段。"}, {Text: "第三段。"},
+			},
+		},
+		"chunks re-flow whitespace": {
+			DocumentID: "d1",
+			Content:    "第一段。\n\n第二段。\n\n第三段。",
+			Chunks: []documentSourceChunk{
+				{Text: "第一段。\n第二段。"}, {Text: "\n\n第三段。  "},
+			},
+		},
+		"chunks carry more than content": {
+			DocumentID: "d1",
+			Content:    "第二段。",
+			Chunks: []documentSourceChunk{
+				{Text: "第一段。第二段。第三段。"},
+			},
+		},
+		"content empty, chunks only": {
+			DocumentID: "d1",
+			Content:    "",
+			Chunks:     []documentSourceChunk{{Text: "只有分段。"}},
+		},
+		"chunks empty, content only": {
+			DocumentID: "d1",
+			Content:    "只有正文。",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			normalizeFetchedDocumentSource(doc, documentRefReq{DocumentID: doc.DocumentID})
+			if doc.Truncated {
+				t.Error("no text was lost; a truncation marker here is a false alarm")
+			}
+			if strings.Contains(buildDocumentPreviewBody(doc), "截断") {
+				t.Error("spurious truncation marker in body")
+			}
+		})
+	}
+}
+
 func TestStreamDocumentPreview_OversizedTrailingBytesReportedAsTooLarge(t *testing.T) {
 	// A second JSON value after the object trips MaxBytesReader in the trailing-EOF
 	// check rather than in Decode, and used to surface as a misleading 40000

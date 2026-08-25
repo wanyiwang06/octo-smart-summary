@@ -51,9 +51,11 @@ var errDocumentSourceNotConfigured = errors.New("document summary source API is 
 type documentSourceError struct {
 	status  int
 	message string
-	// retryAfter carries the upstream Retry-After header verbatim on the 429 path.
-	// Empty on every other path. Telling a client to back off without telling it for
-	// how long makes the status advisory rather than actionable.
+	// retryAfter carries the upstream Retry-After on the 429 path, after
+	// sanitizeRetryAfter has re-canonicalized and range-checked it — not verbatim.
+	// Empty on every other path, and empty when the upstream value fails that check.
+	// Telling a client to back off without telling it for how long makes the status
+	// advisory rather than actionable.
 	retryAfter string
 }
 
@@ -65,11 +67,31 @@ type documentRefReq struct {
 }
 
 type documentSummarySource struct {
-	DocumentID string                `json:"document_id"`
-	Title      string                `json:"title"`
-	Version    string                `json:"version"`
-	Content    string                `json:"content"`
-	Chunks     []documentSourceChunk `json:"chunks,omitempty"`
+	DocumentID string `json:"document_id"`
+	Title      string `json:"title"`
+	Version    string `json:"version"`
+
+	// CONTENT / CHUNKS CONTRACT.
+	//
+	// This struct is the only definition of the summary-source payload, so this
+	// comment is the contract rather than a description of one that lives elsewhere.
+	//
+	// Content is the WHOLE document flattened to plain text. Chunks, when non-empty,
+	// are a segmentation OF that same text and take precedence: buildDocumentPreviewBody
+	// renders chunks and ignores Content entirely (and documentPreviewHasNoContent
+	// mirrors that precedence). Sending both is therefore redundant, not additive.
+	//
+	// As of v1 octo-docs-backend always sends `chunks: []` — getSummarySourceHandler
+	// returns `content: pmDocToPlainText(pmDoc)` with a literal empty chunk list,
+	// commented "the summary service treats content alone as the whole document" — so
+	// only the Content path is live today. The XOR is NOT enforced on the wire, and a
+	// producer that starts emitting partial chunks alongside a full Content would
+	// otherwise degrade this endpoint silently: the uncovered tail of Content would
+	// never reach the model, no cap would fire, and the user would receive a
+	// confident-looking 速览 of part of the document. normalizeFetchedDocumentSource
+	// therefore flags that shape as truncation rather than trusting the contract.
+	Content string                `json:"content"`
+	Chunks  []documentSourceChunk `json:"chunks,omitempty"`
 	// Truncated is set by normalizeFetchedDocumentSource when any size cap
 	// (chunk count, per-chunk runes, or total runes) dropped document content,
 	// so the prompt builder can surface the truncation marker. Not wire data.
@@ -257,7 +279,8 @@ func sanitizeRetryAfter(v string) string {
 }
 
 // documentSourceClient returns the handler's configured document-source client
-// (nil when DOCUMENT_SOURCE_API_URL is unset).
+// (nil when neither DOCUMENT_SUMMARY_SOURCE_API_URL nor the legacy
+// DOCUMENT_SOURCE_API_URL fallback is set — see newDefaultDocumentSourceClient).
 func (h *AgentSummaryHandler) documentSourceClient() documentSourceClient {
 	return h.documentClient
 }
@@ -285,6 +308,32 @@ func normalizeDocumentRefs(refs []documentRefReq) []documentRefReq {
 		return out[i].DocumentID < out[j].DocumentID
 	})
 	return out
+}
+
+// isAllowedDocumentIDRune reports whether every rune of id is in the document_id
+// allow-list. See the containment comment in validateDocumentRefs for why this is an
+// allow-list rather than a set of forbidden characters.
+//
+// The set is deliberately wider than octo-docs-backend's actual `d_<24 hex>` shape:
+// pinning the exact shape here would couple this service to the other side's id
+// format and break the moment it adds a prefix or lengthens the random part, for no
+// additional containment — every character below is already path-safe and
+// encoding-safe. ":" is included because it appears in ids of the form "ns:id".
+func isAllowedDocumentIDRune(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '_', r == '-', r == '.', r == ':':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func validateDocumentRefs(refs []documentRefReq) error {
@@ -337,11 +386,24 @@ func validateDocumentRefs(refs []documentRefReq) error {
 		// the primary key, never a slug, so no legitimate id contains a separator. If
 		// that ever changes, the id must move to the query string — do NOT relax this
 		// back into a list of forbidden shapes.
-		if strings.ContainsAny(ref.DocumentID, "/\\") {
-			return fmt.Errorf("document_id must be a single path segment: %q", ref.DocumentID)
+		// The rule is an ALLOW-LIST, not a deny-list of separators, because a deny-list
+		// only closes the shapes that are separators *at validation time*. Rejecting
+		// literal "/" and "\\" left "%2e%2e%2fadmin" and "%2F..%2Fadmin" accepted:
+		// url.PathEscape correctly escapes the "%" to "%25", so one decode is safe, but an
+		// ingress that decodes twice turns them back into separators and the containment
+		// argument above leaks. Two decode stages is a misconfiguration rather than a
+		// default, which is why this was not the blocker — but a character that BECOMES a
+		// separator one decode later is the same class, and no deny-list ends the class.
+		//
+		// Permitting only these characters ends it for any number of decode stages: none
+		// of them is a separator, and none of them can encode one. "%" is deliberately
+		// absent, so no percent-encoding of any depth survives validation.
+		if !isAllowedDocumentIDRune(ref.DocumentID) {
+			return fmt.Errorf("document_id must match [A-Za-z0-9_.:-]+: %q", ref.DocumentID)
 		}
-		// Belt-and-braces for the separator-free forms (".", ".."), which are still
-		// dot segments on their own.
+		// Belt-and-braces for the separator-free forms (".", ".."), which pass the
+		// allow-list ("." is permitted inside ids such as "doc-123_v2.final") but are
+		// still dot segments on their own.
 		if ref.DocumentID == "." || ref.DocumentID == ".." {
 			return fmt.Errorf("document_id must not be a path segment: %q", ref.DocumentID)
 		}
@@ -375,7 +437,7 @@ func validateDocumentRefs(refs []documentRefReq) error {
 // Consequence for this file: document text is only ever budgeted (rune caps, chunk
 // caps, truncation marker) and never pattern-rewritten.
 
-// documentChunkTitlePrefix is the markup buildDocumentPreviewPrompt renders before
+// documentChunkTitlePrefix is the markup buildDocumentPreviewBody renders before
 // a chunk title. It lives here rather than as a literal at the render site because
 // normalizeFetchedDocumentSource has to charge the same runes to the prompt budget
 // — the two drifting apart is exactly the round-14 P2 (titles model-visible since
@@ -410,7 +472,7 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 	rawContent := strings.TrimSpace(doc.Content)
 	doc.Content = truncateRunes(rawContent, maxDocumentPromptRunes)
 	// The content field is only rendered when no chunks survive (see
-	// buildDocumentPreviewPrompt). Defer flagging its truncation until we know that,
+	// buildDocumentPreviewBody). Defer flagging its truncation until we know that,
 	// so the marker never claims a cut the model never saw.
 	contentTruncated := utf8.RuneCountInString(rawContent) > maxDocumentPromptRunes
 
@@ -420,7 +482,7 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 	for _, chunk := range doc.Chunks {
 		// ChunkID/Page are carried for the wire contract only — nothing downstream reads
 		// them, so they are deliberately not normalized. Title IS rendered into the
-		// prompt (see buildDocumentPreviewPrompt), so it is clamped like any other
+		// prompt (see buildDocumentPreviewBody), so it is clamped like any other
 		// untrusted, model-visible string.
 		chunk.Title = truncateRunes(strings.TrimSpace(chunk.Title), maxDocumentTitleRunes)
 		trimmed := strings.TrimSpace(chunk.Text)
@@ -437,17 +499,17 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 		}
 		chunk.Text = truncateRunes(trimmed, maxDocumentChunkRunes)
 		// Titles are rendered into the prompt as `### <title>\n`
-		// (buildDocumentPreviewPrompt), so they must be charged to the same budget as
+		// (buildDocumentPreviewBody), so they must be charged to the same budget as
 		// the body. They became model-visible in round 5 and the arithmetic here did
 		// not follow: with the configured caps that is up to 200 chunks × 200 runes =
 		// ~40k runes entering the prompt uncounted — half the budget. It never
-		// overflowed, because buildDocumentPreviewPrompt's own bodyLimit is
+		// overflowed, because buildDocumentPreviewBody's own bodyLimit is
 		// authoritative, but it made budgetExhausted trip earlier than this loop
 		// believed, so real body text at the tail of a long, heavily-sectioned document
 		// was dropped to pay for titles this loop thought were free.
 		//
 		// The +len() is the rendered markup itself: the "### " prefix and the trailing
-		// newline that buildDocumentPreviewPrompt writes around every non-empty title.
+		// newline that buildDocumentPreviewBody writes around every non-empty title.
 		cost := utf8.RuneCountInString(chunk.Text)
 		titleCost := 0
 		if chunk.Title != "" {
@@ -474,6 +536,51 @@ func normalizeFetchedDocumentSource(doc *documentSummarySource, ref documentRefR
 	if len(normalized) == 0 && contentTruncated {
 		doc.Truncated = true
 	}
+	// COEXISTENCE GUARD — see the Content/Chunks contract on the struct.
+	//
+	// When chunks survive, buildDocumentPreviewBody renders them and drops Content on
+	// the floor. If Content carries text the chunks do not, that text never reaches the
+	// model, and because every value can sit far below every cap, none of the size
+	// checks above fire: Truncated stays false, no marker is emitted, and the user is
+	// billed for a complete-looking 速览 of part of their document. That is the same
+	// silent-content-loss shape this endpoint spent its whole review history removing,
+	// re-entering through field precedence instead of through a rewriting pass.
+	//
+	// We deliberately do NOT try to merge the two. A payload that violates the
+	// documented contract has no defined semantics — appending Content after the chunks
+	// would duplicate the whole document in the common redundant case — so the honest
+	// response is to tell the user the source was incomplete rather than to guess.
+	if len(normalized) > 0 && doc.Content != "" && !chunksCoverContent(normalized, doc.Content) {
+		doc.Truncated = true
+	}
+}
+
+// chunksCoverContent reports whether the chunk texts already carry everything in
+// content, so the coexistence guard can stay silent for a producer that merely sends
+// a redundant (fully segmented) payload and only fire when text would actually be
+// lost.
+//
+// Comparison ignores all whitespace: chunking legitimately changes how the text is
+// broken up, and a marker raised over re-flowed newlines would be a false alarm — the
+// one failure mode a truncation marker cannot afford, since it trains users to ignore
+// it. Both sides are already bounded by maxDocumentPromptRunes before this runs, and
+// strings.Contains is Rabin-Karp on inputs this size, so this stays linear.
+func chunksCoverContent(chunks []documentSourceChunk, content string) bool {
+	dropSpace := func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}
+	wanted := strings.Map(dropSpace, content)
+	if wanted == "" {
+		return true
+	}
+	var joined strings.Builder
+	for _, chunk := range chunks {
+		joined.WriteString(strings.Map(dropSpace, chunk.Text))
+	}
+	return strings.Contains(joined.String(), wanted)
 }
 
 // documentPreviewHasNoContent reports whether a normalized document has anything
