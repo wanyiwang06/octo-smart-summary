@@ -248,14 +248,31 @@ func TestStreamDocumentPreview_InlineContentDoesNotFetch(t *testing.T) {
 	}
 }
 
-func TestStreamDocumentPreview_BlankInlineContentFallsBackToFetch(t *testing.T) {
-	// Whitespace-only content is not a document; it must fall through to the fetch
-	// path rather than reaching the model with an empty body.
+func TestStreamDocumentPreview_BlankInlineContentIsRejected(t *testing.T) {
+	// Whitespace-only content is not a document. Round 12 fell through to the FETCH
+	// path here, which answered "document source is not configured" (50201) to a
+	// caller who never asked for the document source — accurate about the server's
+	// state, useless as an answer to the request that was made. Sending `content`
+	// selects the inline path; only OMITTING it is a by-reference request.
 	spy := &spyDocClient{doc: &documentSummarySource{DocumentID: "d1", Content: "来自文档服务的内容"}}
 	h := &AgentSummaryHandler{llmApiURL: "http://127.0.0.1:1/v1", llmModel: "m", llmTimeout: 1, documentClient: spy}
-	runPreview(t, h, `{"document_id":"d1","content":"   \n  "}`)
+	_, code := runPreview(t, h, `{"document_id":"d1","content":"   \n  "}`)
+	if code != 40004 {
+		t.Errorf("want app code 40004 for blank inline content, got %d", code)
+	}
+	if spy.called {
+		t.Error("blank inline content must not fall back to the document source client")
+	}
+}
+
+func TestStreamDocumentPreview_OmittedContentFetches(t *testing.T) {
+	// The other half of the rule above: a request with no `content` key at all IS a
+	// by-reference request and must still reach the document source client.
+	spy := &spyDocClient{doc: &documentSummarySource{DocumentID: "d1", Content: "来自文档服务的内容"}}
+	h := &AgentSummaryHandler{llmApiURL: "http://127.0.0.1:1/v1", llmModel: "m", llmTimeout: 1, documentClient: spy}
+	runPreview(t, h, `{"document_id":"d1"}`)
 	if !spy.called {
-		t.Error("blank inline content must fall back to the document source client")
+		t.Error("a request without content must use the document source client")
 	}
 }
 

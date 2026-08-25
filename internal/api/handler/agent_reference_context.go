@@ -62,8 +62,13 @@ func normalizeRefFenceSyntax(s string, preserveNewline bool) string {
 	// render sites, so it stays here; all fence structure is the shared guard's job.
 	if !preserveNewline {
 		s = strings.ReplaceAll(s, "\n", " ")
+		return refFenceGuard.neutralize(s)
 	}
-	return refFenceGuard.neutralize(s)
+	// Block sites keep leading indentation and trailing blank lines: that formatting
+	// IS the content (quoted code, paragraph structure). Round 12 centralized both
+	// guards onto fenceGuard.neutralize, which TrimSpace's, and silently started
+	// stripping it here — an unannounced behaviour change to already-shipped code.
+	return refFenceGuard.neutralizePreservingSpace(s)
 }
 
 // sanitizeRefLine sanitizes text rendered at single-value sites (bullets,

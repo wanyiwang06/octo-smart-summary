@@ -10,6 +10,7 @@ package handler
 // redefine these symbols.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -149,10 +151,10 @@ func (c *httpDocumentSourceClient) FetchSummarySource(ctx context.Context, space
 	// misconfiguration inside routine permission noise.
 	if resp.StatusCode == http.StatusUnauthorized {
 		log.Printf("[handler] document source rejected the forwarded Token (upstream 401) doc=%q user=%q space=%q — check token audience/format agreement between services", documentID, userID, spaceID)
-		return nil, &documentSourceError{status: http.StatusBadRequest, message: fmt.Sprintf("document %s is not accessible (upstream %d)", documentID, resp.StatusCode)}
+		return nil, &documentSourceError{status: http.StatusBadRequest, message: fmt.Sprintf("document %q is not accessible (upstream %d)", documentID, resp.StatusCode)}
 	}
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
-		return nil, &documentSourceError{status: http.StatusBadRequest, message: fmt.Sprintf("document %s is not accessible (upstream %d)", documentID, resp.StatusCode)}
+		return nil, &documentSourceError{status: http.StatusBadRequest, message: fmt.Sprintf("document %q is not accessible (upstream %d)", documentID, resp.StatusCode)}
 	}
 	// Upstream throttling is passed through as throttling. Folding it into the 502
 	// outage class inflates the document-service failure signal with load events —
@@ -181,9 +183,34 @@ func (c *httpDocumentSourceClient) FetchSummarySource(ctx context.Context, space
 		return nil, &documentSourceError{status: status, message: fmt.Sprintf("document source API status %d", resp.StatusCode)}
 	}
 	var out documentSummarySource
-	decoder := json.NewDecoder(io.LimitReader(resp.Body, maxDocumentSourceResponseBytes))
+	// The cap is enforced with an explicit +1 probe rather than by letting LimitReader
+	// truncate: io.LimitReader returns EOF at the boundary, so an oversized body
+	// surfaces as a decode error ("invalid or oversized payload", 502 文档服务暂不可用)
+	// when the document service is in fact healthy and merely verbose. Reading one byte
+	// past the cap distinguishes the two.
+	limited := io.LimitReader(resp.Body, maxDocumentSourceResponseBytes+1)
+	body, readErr := io.ReadAll(limited)
+	if readErr != nil {
+		return nil, &documentSourceError{status: http.StatusBadGateway, message: "document source API response could not be read"}
+	}
+	if len(body) > maxDocumentSourceResponseBytes {
+		// A well-formed but oversized payload is a CONTRACT disagreement, not an outage:
+		// reporting it as 文档服务暂不可用 sends an operator to look at a service that is fine.
+		// It keeps the 502 class (see the remaining-4xx branch above for why our-bug
+		// conditions live there) but says what actually happened.
+		return nil, &documentSourceError{status: http.StatusBadGateway, message: fmt.Sprintf("document source API payload exceeds %d bytes", maxDocumentSourceResponseBytes)}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	if err := decoder.Decode(&out); err != nil {
-		return nil, &documentSourceError{status: http.StatusBadGateway, message: "document source API returned invalid or oversized payload"}
+		return nil, &documentSourceError{status: http.StatusBadGateway, message: "document source API returned invalid payload"}
+	}
+	// Same discipline as the request path (document_preview.go): exactly one JSON
+	// object, not one object plus whatever follows it. Without this a valid object
+	// trailed by a second one — or by junk whose prefix happens to parse — is accepted
+	// silently, which is the one place this diff's own "reject, don't silently accept"
+	// rule was not applied.
+	if err := ensureJSONEOF(decoder); err != nil {
+		return nil, &documentSourceError{status: http.StatusBadGateway, message: "document source API response must contain one JSON object"}
 	}
 	if out.DocumentID == "" {
 		out.DocumentID = documentID
@@ -260,7 +287,22 @@ func validateDocumentRefs(refs []documentRefReq) error {
 	versionsByDoc := map[string]string{}
 	for _, ref := range refs {
 		if utf8.RuneCountInString(ref.DocumentID) > maxDocumentIDLen {
-			return fmt.Errorf("document_id too long: %s", ref.DocumentID)
+			return fmt.Errorf("document_id too long: %q", ref.DocumentID)
+		}
+		// Control characters are rejected outright rather than quoted at each use site.
+		// The id reaches operator logs through several paths — some quoted with %q, some
+		// via an error message interpolated with %v — and a single embedded newline in the
+		// unquoted path is enough to forge a complete, attacker-authored log line that is
+		// indistinguishable from a genuine one. Quoting every site is a rule that has to
+		// hold forever; rejecting the input is a rule that holds once. No legitimate
+		// document id contains a control character.
+		if i := strings.IndexFunc(ref.DocumentID, func(r rune) bool {
+			return r == utf8.RuneError || unicode.IsControl(r)
+		}); i >= 0 {
+			return fmt.Errorf("document_id must not contain control characters: %q", ref.DocumentID)
+		}
+		if strings.IndexFunc(ref.Version, unicode.IsControl) >= 0 {
+			return fmt.Errorf("document version must not contain control characters: %q", ref.Version)
 		}
 		// url.PathEscape leaves "." and ".." untouched (both are unreserved), so a bare
 		// dot-segment reaches the document service as GET /api/documents/../summary-source
@@ -268,13 +310,13 @@ func validateDocumentRefs(refs []documentRefReq) error {
 		// single-segment climb carrying the caller's own token. Every other dangerous
 		// character is already percent-encoded, so rejecting the two dot-segments closes it.
 		if ref.DocumentID == "." || ref.DocumentID == ".." {
-			return fmt.Errorf("document_id must not be a path segment: %s", ref.DocumentID)
+			return fmt.Errorf("document_id must not be a path segment: %q", ref.DocumentID)
 		}
 		if utf8.RuneCountInString(ref.Version) > maxDocumentVersionLen {
-			return fmt.Errorf("document version too long: %s", ref.Version)
+			return fmt.Errorf("document version too long: %q", ref.Version)
 		}
 		if existing, ok := versionsByDoc[ref.DocumentID]; ok && existing != ref.Version {
-			return fmt.Errorf("multiple versions of one document are not supported: %s", ref.DocumentID)
+			return fmt.Errorf("multiple versions of one document are not supported: %q", ref.DocumentID)
 		}
 		versionsByDoc[ref.DocumentID] = ref.Version
 	}

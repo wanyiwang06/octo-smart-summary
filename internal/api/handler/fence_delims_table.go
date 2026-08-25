@@ -39,3 +39,22 @@ var fenceDelimiterFolds = []string{
 	"＞", ">", // U+FF1E FULLWIDTH GREATER-THAN SIGN [NFKC]
 	"🙼", "/", // U+1F67C VERY HEAVY SOLIDUS [name]
 }
+
+// fenceTagNameFolds maps compatibility homoglyphs of the guarded tag-name runes
+// onto those runes (rule C). Without this the tag NAME is matched as exact literal
+// runes, and a homoglyph spelling that is visually identical to a real closing
+// fence reaches the model untouched.
+// Derived from Unicode properties; 3 entries; guarded names: 文档数据, 引用数据.
+var fenceTagNameFolds = []string{
+	"⽂", "文", // U+2F42 KANGXI RADICAL SCRIPT [NFKC-name]
+	"⽤", "用", // U+2F64 KANGXI RADICAL USE [NFKC-name]
+	"㉆", "文", // U+3246 CIRCLED IDEOGRAPH SCHOOL [NFKC-name]
+}
+
+// fenceGeneratedGuardedTagNames is the generator's view of which guards exist.
+// A guard whose name is missing here has NO tag-name fold coverage, so
+// TestFenceTagNameFoldsCoverGuardedNames fails rather than letting that ship.
+var fenceGeneratedGuardedTagNames = []string{
+	"文档数据",
+	"引用数据",
+}

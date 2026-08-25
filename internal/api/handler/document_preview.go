@@ -144,9 +144,23 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 		return
 	}
 
+	// Admission gate. Taken AFTER validation (so a malformed request cannot consume a
+	// slot) and BEFORE the fetch and the completion — the two expensive steps. See
+	// document_preview_limit.go for why this caps concurrency rather than rate, and
+	// for the honest statement of what a per-process counter does and does not buy.
+	releaseSlot, admitted := documentPreviewLimiterInstance.acquire(userID)
+	if !admitted {
+		log.Printf("[handler] preview rejected, per-user in-flight cap reached doc=%q user=%q space=%q", ref.DocumentID, userID, spaceID)
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusTooManyRequests, apiResponse{Code: 42902, Message: "速览请求过于频繁，请稍后重试"})
+		return
+	}
+	defer releaseSlot()
+
 	inlineContent := strings.TrimSpace(req.Content)
 	var doc *documentSummarySource
-	if inlineContent != "" {
+	switch {
+	case inlineContent != "":
 		// Inline path: no document-service dependency, no fetch timeout. The body is
 		// still funnelled through normalizeFetchedDocumentSource so the rune budget,
 		// title/version clamping, and the Truncated flag behave identically to fetched
@@ -157,7 +171,15 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 			Version:    ref.Version,
 			Content:    inlineContent,
 		}
-	} else {
+	case req.Content != "":
+		// The caller sent `content`, so they chose the inline path; it just trimmed to
+		// nothing. Falling through to the fetch path answers "document source is not
+		// configured" (50201) to a request that never wanted the document source — a
+		// confusing answer where "the document is empty" is the accurate one. Only a
+		// request that OMITS content is a by-reference request.
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40004, Message: "文档内容为空"})
+		return
+	default:
 		docClient := h.documentSourceClient()
 		if docClient == nil {
 			c.JSON(http.StatusBadGateway, apiResponse{Code: 50201, Message: "document summary source API is not configured"})
