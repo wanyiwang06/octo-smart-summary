@@ -254,7 +254,11 @@ func (h *AgentSummaryHandler) StreamDocumentPreview(c *gin.Context) {
 
 	// enableThinking=false: 速览 optimizes for latency (a "few seconds" glance), so
 	// thinking mode is intentionally off here regardless of the global LLM_ENABLE_THINKING.
-	client := service.NewLLMClient(h.llmApiURL, h.llmApiKey, h.llmModel, h.llmTimeout, h.llmMaxTokens, false, 30)
+	//
+	// fallbackModels=nil: LLM_FALLBACK_MODELS is not plumbed into AgentSummaryHandler, and
+	// 速览 is a latency-bound ephemeral path — a serial walk over extra models would burn the
+	// generation deadline rather than rescue the request. Primary model only, by design.
+	client := service.NewLLMClient(h.llmApiURL, h.llmApiKey, h.llmModel, h.llmTimeout, h.llmMaxTokens, false, 30, nil)
 	messages := []service.ChatMessage{
 		{Role: "system", Content: documentPreviewSystemPrompt},
 		{Role: "user", Content: prompt},
