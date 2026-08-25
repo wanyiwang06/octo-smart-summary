@@ -226,7 +226,7 @@ func TestValidateDocumentRefs(t *testing.T) {
 		t.Error("expected error for over-long document_id, got nil")
 	}
 	// url.PathEscape leaves dot-segments intact, so ".." would reach the document
-	// service as /api/documents/../summary-source.
+	// service as /api/v1/docs/../summary-source.
 	for _, id := range []string{".", ".."} {
 		if err := validateDocumentRefs([]documentRefReq{{DocumentID: id}}); err == nil {
 			t.Errorf("expected error for dot-segment document_id %q, got nil", id)

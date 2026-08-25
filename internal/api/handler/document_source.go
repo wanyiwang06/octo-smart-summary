@@ -112,7 +112,7 @@ func (c *httpDocumentSourceClient) FetchSummarySource(ctx context.Context, space
 		return nil, errDocumentSourceNotConfigured
 	}
 	escapedID := url.PathEscape(documentID)
-	u := c.baseURL + "/api/documents/" + escapedID + "/summary-source"
+	u := c.baseURL + "/api/v1/docs/" + escapedID + "/summary-source"
 	if version != "" {
 		u += "?version=" + url.QueryEscape(version)
 	}
@@ -305,8 +305,8 @@ func validateDocumentRefs(refs []documentRefReq) error {
 			return fmt.Errorf("document version must not contain control characters: %q", ref.Version)
 		}
 		// url.PathEscape leaves "." and ".." untouched (both are unreserved), so a bare
-		// dot-segment reaches the document service as GET /api/documents/../summary-source
-		// and any normalizing intermediary collapses it to /api/summary-source — a
+		// dot-segment reaches the document service as GET /api/v1/docs/../summary-source
+		// and any normalizing intermediary collapses it to /api/v1/summary-source — a
 		// single-segment climb carrying the caller's own token. Every other dangerous
 		// character is already percent-encoded, so rejecting the two dot-segments closes it.
 		if ref.DocumentID == "." || ref.DocumentID == ".." {
