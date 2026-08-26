@@ -658,9 +658,15 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	}
 
 	// Attention is caller-specific. Compute it only after schedule folding, then
-	// sort before pagination. A pending invitation outranks unread content; team
-	// and personal cursors are compared independently because their ids belong to
-	// different tables.
+	// sort before pagination. A pending invitation outranks a pending submission,
+	// which outranks unread content; team and personal cursors are compared
+	// independently because their ids belong to different tables.
+	//
+	// All three signals feed needs_attention (the per-card red dot) and
+	// attention_count (the sidebar badge). has_pending_submission is deliberately
+	// NOT cleared by MarkSummaryRead: opening the detail page marks the content
+	// read, but the participant still owes the team an explicit /submit, so the
+	// dot survives until submitted_at is set.
 	attentionJoins := `
  LEFT JOIN summary_user_read sur ON sur.task_id = sub.id AND sur.user_id = ?
  LEFT JOIN summary_result cr ON cr.id = sub.current_result_id AND cr.task_id = sub.id
@@ -683,7 +689,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	      THEN CASE WHEN cr.generated_at >= pv.generated_at THEN cr.generated_at ELSE pv.generated_at END
 	      ELSE COALESCE(cr.generated_at, pv.generated_at, sub.created_at) END AS activity_at`
 	pageSQL := "SELECT sub.*" + attentionSelect + " FROM (" + innerSQL + ") sub" + attentionJoins +
-		" WHERE sub.rn = 1 ORDER BY has_pending_invitation DESC, is_unread DESC, activity_at DESC, " + orderClause + ", sub.id DESC LIMIT ? OFFSET ?"
+		" WHERE sub.rn = 1 ORDER BY has_pending_invitation DESC, has_pending_submission DESC, is_unread DESC, activity_at DESC, " + orderClause + ", sub.id DESC LIMIT ? OFFSET ?"
 	pageArgs := []interface{}{model.ParticipantPending}
 	if h.db.Dialector.Name() == "mysql" {
 		pageArgs = append(pageArgs, userID)
@@ -909,7 +915,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			"is_unread":                    attention.IsUnread,
 			"has_pending_invitation":       attention.HasPendingInvitation,
 			"has_pending_submission":       attention.HasPendingSubmission,
-			"needs_attention":              attention.IsUnread || attention.HasPendingInvitation,
+			"needs_attention":              attention.IsUnread || attention.HasPendingInvitation || attention.HasPendingSubmission,
 			"current_result_id":            attention.ListCurrentResultID,
 			"current_personal_version_id":  attention.CurrentPersonalVersionID,
 			"activity_at":                  attention.ActivityAt,
@@ -922,16 +928,25 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	// Counts deliberately ignore the current list filters: the navigation badge
 	// represents all cards that require this user's attention in the space.
 	countInner := "SELECT *, ROW_NUMBER() OVER (PARTITION BY (CASE WHEN schedule_id IS NULL THEN CONCAT('t', id) ELSE CONCAT('s', schedule_id) END) ORDER BY id DESC) AS rn FROM summary_task WHERE space_id = ? AND deleted_at IS NULL AND (creator_id = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ?) OR " + scheduleVisibilityExpr + ")"
-	attentionCountSQL := "SELECT COALESCE(SUM(has_invite),0) pending_invitation_count, COALESCE(SUM(unread),0) unread_count, COALESCE(SUM(CASE WHEN has_invite=1 OR unread=1 THEN 1 ELSE 0 END),0) attention_count FROM (SELECT CASE WHEN me.status=? OR " + schedulePendingExpr + " THEN 1 ELSE 0 END has_invite, CASE WHEN (sub.current_result_id IS NOT NULL AND (sur.last_read_team_result_id IS NULL OR sur.last_read_team_result_id<>sub.current_result_id)) OR (pr.current_version_id IS NOT NULL AND (sur.last_read_personal_version_id IS NULL OR sur.last_read_personal_version_id<>pr.current_version_id)) THEN 1 ELSE 0 END unread FROM (" + countInner + ") sub" + attentionJoins + " WHERE sub.rn=1) attention"
+	//
+	// ⚠️ The placeholders below are positional and hand-assembled; countArgs must
+	// be appended in exactly the textual order the `?`s appear:
+	//   1. has_invite      -> ParticipantPending [+ userID when schedulePendingExpr is live (MySQL only)]
+	//   2. has_submit      -> PersonalStatusCompleted
+	//   3. countInner      -> spaceID, userID, userID [+ userID when scheduleVisibilityExpr is live]
+	//   4. attentionJoins  -> userID x4
+	attentionCountSQL := "SELECT COALESCE(SUM(has_invite),0) pending_invitation_count, COALESCE(SUM(unread),0) unread_count, COALESCE(SUM(has_submit),0) pending_submission_count, COALESCE(SUM(CASE WHEN has_invite=1 OR unread=1 OR has_submit=1 THEN 1 ELSE 0 END),0) attention_count FROM (SELECT CASE WHEN me.status=? OR " + schedulePendingExpr + " THEN 1 ELSE 0 END has_invite, CASE WHEN pr.worker_status=? AND pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id=sub.id) > 1 THEN 1 ELSE 0 END has_submit, CASE WHEN (sub.current_result_id IS NOT NULL AND (sur.last_read_team_result_id IS NULL OR sur.last_read_team_result_id<>sub.current_result_id)) OR (pr.current_version_id IS NOT NULL AND (sur.last_read_personal_version_id IS NULL OR sur.last_read_personal_version_id<>pr.current_version_id)) THEN 1 ELSE 0 END unread FROM (" + countInner + ") sub" + attentionJoins + " WHERE sub.rn=1) attention"
 	var counts struct {
 		AttentionCount         int64 `gorm:"column:attention_count"`
 		UnreadCount            int64 `gorm:"column:unread_count"`
 		PendingInvitationCount int64 `gorm:"column:pending_invitation_count"`
+		PendingSubmissionCount int64 `gorm:"column:pending_submission_count"`
 	}
 	countArgs := []interface{}{model.ParticipantPending}
 	if h.db.Dialector.Name() == "mysql" {
 		countArgs = append(countArgs, userID)
 	}
+	countArgs = append(countArgs, model.PersonalStatusCompleted)
 	countArgs = append(countArgs, spaceID, userID, userID)
 	if h.db.Dialector.Name() == "mysql" {
 		countArgs = append(countArgs, userID)
@@ -942,7 +957,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to list summaries"})
 		return
 	}
-	ok(c, gin.H{"total": total, "items": items, "attention_count": counts.AttentionCount, "unread_count": counts.UnreadCount, "pending_invitation_count": counts.PendingInvitationCount})
+	ok(c, gin.H{"total": total, "items": items, "attention_count": counts.AttentionCount, "unread_count": counts.UnreadCount, "pending_invitation_count": counts.PendingInvitationCount, "pending_submission_count": counts.PendingSubmissionCount})
 }
 
 type markSummaryReadRequest struct {
@@ -1002,13 +1017,19 @@ func (h *TaskHandler) MarkSummaryRead(c *gin.Context) {
 		ReadTeamID        *int64 `gorm:"column:read_team_id"`
 		ReadPersonalID    *int64 `gorm:"column:read_personal_id"`
 		PendingInvitation bool   `gorm:"column:pending_invitation"`
+		PendingSubmission bool   `gorm:"column:pending_submission"`
 	}
 	schedulePendingExpr := h.schedulePendingInvitationExpr("t")
+	// pending_submission mirrors the list projection. Marking content read must
+	// NOT clear it: the participant has seen their personal summary but still
+	// owes the team an explicit /submit. Returning it here keeps the client's
+	// optimistic needs_attention recompute from dropping the dot on read.
 	stateSQL := `SELECT t.current_result_id AS current_team_id,
  pr.current_version_id AS current_personal_id,
  sur.last_read_team_result_id AS read_team_id,
  sur.last_read_personal_version_id AS read_personal_id,
- CASE WHEN p.status = ? OR ` + schedulePendingExpr + ` THEN 1 ELSE 0 END AS pending_invitation
+ CASE WHEN p.status = ? OR ` + schedulePendingExpr + ` THEN 1 ELSE 0 END AS pending_invitation,
+ CASE WHEN pr.worker_status = ? AND pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id = t.id) > 1 THEN 1 ELSE 0 END AS pending_submission
  FROM summary_task t
  LEFT JOIN summary_personal_result pr ON pr.task_id=t.id AND pr.user_id=?
  LEFT JOIN summary_user_read sur ON sur.task_id=t.id AND sur.user_id=?
@@ -1018,6 +1039,7 @@ func (h *TaskHandler) MarkSummaryRead(c *gin.Context) {
 	if h.db.Dialector.Name() == "mysql" {
 		stateArgs = append(stateArgs, userID)
 	}
+	stateArgs = append(stateArgs, model.PersonalStatusCompleted)
 	stateArgs = append(stateArgs, userID, userID, userID, taskID)
 	if err := h.db.Raw(stateSQL, stateArgs...).Scan(&state).Error; err != nil {
 		log.Printf("mark summary read state query failed: %v", err)
@@ -1030,7 +1052,8 @@ func (h *TaskHandler) MarkSummaryRead(c *gin.Context) {
 	ok(c, gin.H{
 		"task_id": taskID, "team_result_id": req.TeamResultID, "personal_version_id": req.PersonalVersionID,
 		"is_unread": isUnread, "has_pending_invitation": state.PendingInvitation,
-		"needs_attention": isUnread || state.PendingInvitation,
+		"has_pending_submission": state.PendingSubmission,
+		"needs_attention":        isUnread || state.PendingInvitation || state.PendingSubmission,
 	})
 }
 
