@@ -9,6 +9,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // PersistEvidence writes citation evidence to DB for long-term recovery.
@@ -31,7 +32,9 @@ import (
 // in test paths that don't wire the full context chain, the latter in unit
 // tests.
 //
-// Upsert semantics (ON DUPLICATE KEY UPDATE) allow idempotent tool re-execution.
+// Upsert semantics allow idempotent tool re-execution. GORM renders the native
+// form for the active dialect (ON DUPLICATE KEY on MySQL, ON CONFLICT on
+// SQLite), which lets integration tests exercise the real fetch handler.
 func PersistEvidence(db *gorm.DB, ctx context.Context, handle string, messages []pipeline.Message) error {
 	if db == nil {
 		log.Printf("[evidence] skipping persistence: db is nil (likely test mode)")
@@ -64,12 +67,9 @@ func PersistEvidence(db *gorm.DB, ctx context.Context, handle string, messages [
 		UpdatedAt: now,
 	}
 
-	// Upsert: INSERT ... ON DUPLICATE KEY UPDATE
-	err = db.WithContext(ctx).
-		Exec(`INSERT INTO agent_message_evidence (user_id, session_id, handle, evidence, created_at, updated_at)
-		      VALUES (?, ?, ?, ?, ?, ?)
-		      ON DUPLICATE KEY UPDATE evidence = VALUES(evidence), updated_at = VALUES(updated_at)`,
-			evidence.UserID, evidence.SessionID, evidence.Handle, evidence.Evidence, evidence.CreatedAt, evidence.UpdatedAt).Error
+	// Keep CreatedAt from the first write; retries refresh only the snapshot and
+	// UpdatedAt, matching the previous MySQL-specific statement.
+	err = db.WithContext(ctx).Clauses(evidenceUpsertClause()).Create(&evidence).Error
 
 	if err != nil {
 		log.Printf("[evidence] upsert failed handle=%s session=%s: %v", handle, sessionID, err)
@@ -77,4 +77,18 @@ func PersistEvidence(db *gorm.DB, ctx context.Context, handle string, messages [
 	}
 	log.Printf("[evidence] persisted %d messages handle=%s session=%s", len(messages), handle, sessionID)
 	return nil
+}
+
+// evidenceUpsertClause is kept as a helper so dialect-specific SQL generation
+// can be pinned in tests. In particular, MySQL must preserve the original
+// created_at while refreshing only the evidence snapshot and updated_at.
+func evidenceUpsertClause() clause.OnConflict {
+	return clause.OnConflict{
+		Columns: []clause.Column{
+			{Name: "user_id"},
+			{Name: "session_id"},
+			{Name: "handle"},
+		},
+		DoUpdates: clause.AssignmentColumns([]string{"evidence", "updated_at"}),
+	}
 }

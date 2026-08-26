@@ -192,6 +192,59 @@ func TestRunner_Run(t *testing.T) {
 	}
 }
 
+func TestRunner_MaxStepsSoftLandingNudgeIsNotPersisted(t *testing.T) {
+	fc := &fakeClient{turns: []AssistantTurn{
+		{ToolCalls: []ToolCall{mkToolCall("c1", "alpha", `{}`)}, Tokens: 1},
+		{Content: "best effort", Tokens: 1},
+	}}
+	r := newTestRunner(fc, regWithEcho("alpha"), Policy{MaxSteps: 2, MaxTokens: 100000, StepTimeout: time.Second})
+
+	out, newMsgs, err := r.RunWithHistory(context.Background(), "system", nil, "original user turn")
+	if err != nil {
+		t.Fatalf("RunWithHistory: %v", err)
+	}
+	if out != "best effort" {
+		t.Fatalf("out = %q, want best effort", out)
+	}
+	for _, msg := range newMsgs {
+		if msg.Role == "user" && strings.Contains(msg.Content, "最大步骤数") {
+			t.Fatalf("runtime finalization nudge leaked into persisted messages: %+v", newMsgs)
+		}
+	}
+	if got := newMsgs[len(newMsgs)-1]; got.Role != "assistant" || got.Content != "best effort" {
+		t.Fatalf("final answer not persisted correctly: %+v", got)
+	}
+}
+
+func TestRunTools_FetchBeforeSummarizePreservesResultOrder(t *testing.T) {
+	fetched := false
+	reg := NewRegistry()
+	reg.Register(Tool{Type: "function", Function: ToolFunction{Name: "fetch_channel"}},
+		func(context.Context, json.RawMessage) (string, error) {
+			fetched = true
+			return "fetch-result", nil
+		})
+	reg.Register(Tool{Type: "function", Function: ToolFunction{Name: "summarize_chunk"}},
+		func(context.Context, json.RawMessage) (string, error) {
+			if !fetched {
+				return "stale-coverage", nil
+			}
+			return "summarize-result", nil
+		})
+
+	// A single worker makes the old implementation deterministic: because the
+	// summarize call appears first, it ran first. The phase barrier must reverse
+	// execution order without changing result order.
+	r := NewRunner(nil, reg, NewPool(1), Policy{})
+	results := r.runTools(context.Background(), []ToolCall{
+		mkToolCall("sum", "summarize_chunk", `{}`),
+		mkToolCall("fetch", "fetch_channel", `{}`),
+	}, 2, 20)
+	if len(results) != 2 || results[0] != "summarize-result" || results[1] != "fetch-result" {
+		t.Fatalf("results lost original tool-call order: %+v", results)
+	}
+}
+
 // TestRunner_ParallelToolsRace 专门给 -race 用：一跳内多工具高并发无竞争、顺序稳定。
 func TestRunner_ParallelToolsRace(t *testing.T) {
 	const n = 12
@@ -589,9 +642,10 @@ func TestRunner_WhitespaceOnlyContentTreatedAsEmpty(t *testing.T) {
 // legitimately exceed the per-step planning budget (default 60s).
 //
 // This test simulates:
-//   step 1: planning Chat returns a tool_call
-//   tool  : sleeps 200ms (well over StepTimeout=50ms)
-//   step 2: planning Chat returns final answer
+//
+//	step 1: planning Chat returns a tool_call
+//	tool  : sleeps 200ms (well over StepTimeout=50ms)
+//	step 2: planning Chat returns final answer
 //
 // If tool execution were bound by stepCtx (as it briefly was in 4f614cc),
 // the tool would be cancelled at 50ms and return a context.DeadlineExceeded
