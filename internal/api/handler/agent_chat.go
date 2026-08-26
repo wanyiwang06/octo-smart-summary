@@ -514,12 +514,15 @@ func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid strin
 		// Idempotent replay: the run already exists (e.g. SSE downgrade reusing
 		// the same request_id). Reuse its run_id; do not re-persist the spec.
 		//
-		// But DO clear a status=failed latched by the previous attempt. The
-		// SS-07b fatal marker lives in the per-runner hook closure, so the new
-		// attempt's OnToolSuccess cannot clear a marker it never set; without this
-		// reset a clean regenerated summary inherits the earlier attempt's failure
-		// and finalizeRun discloses FAILED for a good deliverable. Best-effort:
-		// a reset failure only costs the stale verdict, never the reply.
+		// Clear only the task-flow failure latched by the previous attempt.
+		// The SS-07b fatal marker lives in the per-runner hook closure, so the new
+		// attempt's OnToolSuccess cannot clear a marker it never set. Output
+		// truncation is deliberately NOT cleared here: attempt B may fail before it
+		// persists a replacement, leaving attempt A's message as the deliverable.
+		// Each final assistant row carries its own attempt-local truncation fact, so
+		// the save path can judge the selected message without mutating shared state
+		// at replay entry. Best-effort: a status reset failure only costs the stale
+		// verdict, never the reply.
 		if err := h.runStore.ClearFailedStatusForReplay(ctx, uid, run.RunID); err != nil {
 			log.Printf("[agent] v2 clear failed status on replay (run=%s): %v", run.RunID, err)
 		}
@@ -615,6 +618,11 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, apiResponse{Code: 40100, Message: "missing auth context"})
 		return
 	}
+	// The runner itself (not only tool handlers) records planner-answer
+	// degradations against the owner-scoped summary run. Use the bookkeeping-only
+	// key here: ContextKeyUID remains confined to buildRegistryWithUID so adding a
+	// future tool to the chat profile cannot silently widen its data-access scope.
+	ctx = context.WithValue(ctx, agent.ContextKeyRunOwnerID, uid)
 
 	// SS-03: persist the run/spec when V2 mode is enabled. Off → skipped entirely
 	// (byte-identical to pre-SS-03). Best-effort; never blocks the reply. The
@@ -915,6 +923,9 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		h.writeSSEErrorViaSink(sink, 40100, "missing auth context")
 		return
 	}
+	// ChatStream must carry the same runner-level bookkeeping identity as Chat.
+	// Tool authorization still uses the narrower buildRegistryWithUID wrapper.
+	ctx = context.WithValue(ctx, agent.ContextKeyRunOwnerID, uid)
 
 	// SS-03: persist run/spec when V2 mode is enabled (see Chat). Off → skipped.
 	// The returned run_id is injected into the tool context for the citation pass.

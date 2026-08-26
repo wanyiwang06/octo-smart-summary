@@ -350,6 +350,31 @@ func (s *Store) RecordChannelFetch(ctx context.Context, userID, runID, channelID
 	})
 }
 
+// MarkOutputTruncated latches the fact that a model completion on this run's
+// answer path was cut off by finish_reason=length.
+//
+// CONSERVATIVE RUN-LEVEL LATCH. The Reduce may be retried, the planner emits
+// several completions per attempt, and one run row may be reused by replay
+// attempts. A later clean call never clears the aggregate because truncated text
+// may already have been persisted or folded into a later answer. The exact
+// deliverable-level fact is stored on agent_message; this run-level latch remains
+// the compatibility fallback for legacy rows that predate that binding.
+//
+// Idempotent and lock-free: a single conditional UPDATE, so concurrent writers
+// (parallel Map/Reduce tool calls) converge without the row lock that
+// RecordChannelFetch needs for its read-modify-write JSON sets.
+func (s *Store) MarkOutputTruncated(ctx context.Context, userID, runID string) error {
+	if userID == "" || runID == "" {
+		return nil
+	}
+	return s.db.WithContext(ctx).Model(&model.AgentSummaryRun{}).
+		Where("run_id = ? AND user_id = ? AND output_truncated = ?", runID, userID, false).
+		Updates(map[string]interface{}{
+			"output_truncated": true,
+			"updated_at":       now(),
+		}).Error
+}
+
 // AddDroppedMessages atomically records messages discarded before the model.
 // It is owner-scoped and additive because summarize_chunk calls may run in
 // parallel for distinct handles.

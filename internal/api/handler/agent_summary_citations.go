@@ -310,16 +310,32 @@ func contentHasCitationSequence(content string) bool {
 	return false
 }
 
-// finalizeRun computes the SS-07 finish verdict (COMPLETE/PARTIAL/FAILED) for
-// the exact request that produced the saved content and persists it. It is
-// best-effort and flag-gated by the caller. A missing/unknown request_id is a
-// no-op: selecting "the latest run in the session" is unsafe because a late
-// status update on an older run can move its updated_at past the generating run.
+// finalizeRun is the legacy/test entry point for rows that are not yet bound to
+// a run id on agent_message. It falls back to the conservative run-level output
+// truncation latch.
+func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, requestID, content string, cits []model.Citation) (finishgate.Verdict, []finishgate.Gap) {
+	return h.finalizeRunForDeliverable(ctx, uid, sessionID, requestID, content, cits, "", false)
+}
+
+// finalizeRunForMessage computes the finish verdict for the exact persisted
+// assistant message selected by the save path. New V2 messages carry their run
+// id and attempt-local output-truncation fact on the same row as the content;
+// legacy rows have an empty run id and use the run-level fallback above.
+func (h *AgentSummaryHandler) finalizeRunForMessage(ctx context.Context, uid, sessionID, requestID, content string, cits []model.Citation, msg model.AgentMessage) (finishgate.Verdict, []finishgate.Gap) {
+	return h.finalizeRunForDeliverable(ctx, uid, sessionID, requestID, content, cits, msg.RunID, msg.OutputTruncated)
+}
+
+// finalizeRunForDeliverable computes the SS-07 finish verdict
+// (COMPLETE/PARTIAL/FAILED) for the exact request and deliverable, then persists
+// it. It is best-effort and flag-gated by the caller. A missing/unknown
+// request_id is a no-op: selecting "the latest run in the session" is unsafe
+// because a late status update on an older run can move its updated_at past the
+// generating run.
 //
 // Returns the verdict and gaps so the caller can surface them. A request with no
 // run row returns ("", nil) and the save proceeds unchanged; only a genuine
 // lookup FAILURE reports an unverified PARTIAL.
-func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, requestID, content string, cits []model.Citation) (finishgate.Verdict, []finishgate.Gap) {
+func (h *AgentSummaryHandler) finalizeRunForDeliverable(ctx context.Context, uid, sessionID, requestID, content string, cits []model.Citation, deliverableRunID string, deliverableOutputTruncated bool) (finishgate.Verdict, []finishgate.Gap) {
 	if h.db == nil || requestID == "" {
 		return "", nil
 	}
@@ -349,6 +365,26 @@ func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, r
 		}}
 	}
 
+	outputTruncated := run.OutputTruncated
+	if deliverableRunID != "" {
+		// Message-bound evidence is authoritative even when the shared run-level
+		// aggregate was latched by an abandoned replay attempt. Both targeted
+		// message_id saves and the legacy latest-assistant lookup therefore judge
+		// the same row whose content is being persisted.
+		if deliverableRunID != run.RunID {
+			log.Printf("[finish] selected message/run mismatch session=%s request=%s message_run=%s resolved_run=%s", sessionID, requestID, deliverableRunID, run.RunID)
+			gaps := []finishgate.Gap{{
+				Kind:   finishgate.GapToolError,
+				Detail: "selected deliverable does not match the summary run",
+			}}
+			if err := runStore.SetFinishStatus(ctx, uid, run.RunID, string(finishgate.Partial)); err != nil {
+				log.Printf("[finish] persist mismatched finish_status failed run=%s: %v", run.RunID, err)
+			}
+			return finishgate.Partial, gaps
+		}
+		outputTruncated = deliverableOutputTruncated
+	}
+
 	state := finishgate.RunState{
 		ScopeResolved:            run.SpecID != "",
 		SummaryGenerated:         content != "",
@@ -360,6 +396,7 @@ func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, r
 		FailedChannels:           decodeFinishChannelIDs(run.FailedChannels),
 		DiscoveredChannels:       decodeFinishChannelIDs(run.DiscoveredChannels),
 		Truncated:                run.CoverageTruncated,
+		OutputTruncated:          outputTruncated,
 		DroppedMessages:          run.DroppedMessages,
 	}
 

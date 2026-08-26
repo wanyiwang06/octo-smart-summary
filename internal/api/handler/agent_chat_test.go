@@ -316,7 +316,7 @@ func TestRowsDescToMessagesAsc(t *testing.T) {
 	tc := `[{"id":"call_1","type":"function","function":{"name":"foo","arguments":"{}"}}]`
 	// 模拟 DB Order("id DESC") 取回：最近(id=4)在前，最旧(id=1)在后。
 	descRows := []model.AgentMessage{
-		{ID: 4, SessionID: "s", Role: "assistant", Content: "reply2"},
+		{ID: 4, SessionID: "s", Role: "assistant", Content: "reply2", RunID: "run-2", OutputTruncated: true},
 		{ID: 3, SessionID: "s", Role: "user", Content: "q2"},
 		{ID: 2, SessionID: "s", Role: "assistant", Content: "", ToolCalls: &tc},
 		{ID: 1, SessionID: "s", Role: "user", Content: "q1"},
@@ -344,6 +344,9 @@ func TestRowsDescToMessagesAsc(t *testing.T) {
 	// tool_calls 应被反序列化到第 2 条 assistant（原 id=2）。
 	if len(msgs[1].ToolCalls) != 1 || msgs[1].ToolCalls[0].Function.Name != "foo" {
 		t.Fatalf("tool_calls not restored on ascending msg[1]: %+v", msgs[1].ToolCalls)
+	}
+	if msgs[3].RunID != "run-2" || !msgs[3].OutputTruncated {
+		t.Fatalf("deliverable metadata not restored on ascending msg[3]: %+v", msgs[3])
 	}
 }
 

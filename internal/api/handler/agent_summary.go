@@ -109,9 +109,9 @@ type createAgentSummaryReq struct {
 	// (方便日后做衍生关系追溯),不影响本次生成的 content/citations。
 	ReferencedTaskIDs []int64 `json:"referenced_task_ids,omitempty"`
 	// RequestID 可选:必须是生成当前最新 assistant 内容的同一 agent chat
-	// 轮次的 request_id (SS-03 idempotency key)。当前 AgentMessage 尚未持久化
-	// run_id，服务端无法验证跨轮错配；该绑定由客户端负责，SS-08 再持久化
-	// 校验。缺省/未知 → 与 legacy 一致的重算路径。
+	// 轮次的 request_id (SS-03 idempotency key)。新消息通过持久化的 run_id
+	// 在服务端验证；缺省时由该绑定反查。旧消息没有 run_id，继续走 legacy
+	// request_id 路径。
 	RequestID string `json:"request_id,omitempty"`
 	// AgentMessageID + SnapshotVersion form the trusted draft reference the
 	// design (section 6.5) requires. Both are optional in BE-2 for backward
@@ -384,6 +384,24 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		log.Printf("[handler] CreateAgentSummary load session %s: %v", req.SessionID, err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取 session 产出失败"})
 		return
+	}
+	resolvedRequestID := req.RequestID
+	if agent.SummaryV2Enabled() {
+		resolvedRequestID, err = resolveAgentMessageRequestID(
+			c.Request.Context(), h.db, userID, req.SessionID, req.RequestID, draftMsg,
+		)
+		if err != nil {
+			if errors.Is(err, errAgentMessageRunMismatch) {
+				// Reject before the transaction creates a task or deletes the session.
+				// A PARTIAL verdict after commit would still persist the wrong content /
+				// citation manifest pairing and destroy the recoverable draft.
+				c.JSON(http.StatusConflict, apiResponse{Code: 40901, Message: "agent_draft_stale: 消息与生成请求不匹配,请刷新草稿"})
+				return
+			}
+			log.Printf("[handler] CreateAgentSummary resolve message run failed session=%s message_id=%d: %v", req.SessionID, draftMsg.ID, err)
+			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取 agent 生成记录失败"})
+			return
+		}
 	}
 	content := draftMsg.Content
 	resolvedAgentMessageID := draftMsg.ID
@@ -687,8 +705,8 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	// The verdict is an internal, non-blocking quality signal; off / missing or
 	// unknown request_id → no-op.
 	if agent.SummaryV2Enabled() {
-		if v, gaps := h.finalizeRun(c.Request.Context(), userID, req.SessionID, req.RequestID, content, savedCitations); v != "" {
-			log.Printf("[handler] agent summary finish verdict=%s gaps=%d session=%s request=%s (recorded, non-blocking)", v, len(gaps), req.SessionID, req.RequestID)
+		if v, gaps := h.finalizeRunForMessage(c.Request.Context(), userID, req.SessionID, resolvedRequestID, content, savedCitations, draftMsg); v != "" {
+			log.Printf("[handler] agent summary finish verdict=%s gaps=%d session=%s request=%s (recorded, non-blocking)", v, len(gaps), req.SessionID, resolvedRequestID)
 			finishVerdict, finishGaps = v, gaps
 		}
 	}

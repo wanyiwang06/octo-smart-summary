@@ -37,3 +37,25 @@ func TestSummarySourceUniqueMigrationPinsBinaryCollationBeforeDedup(t *testing.T
 		t.Fatalf("dedup join must use byte-exact, NO PAD utf8mb4_0900_bin comparison")
 	}
 }
+
+func TestOutputTruncationMigrationBindsRunAndMessage(t *testing.T) {
+	runRaw, err := migrationsql.FS.ReadFile("20260822-01-add-run-output-truncated.sql")
+	if err != nil {
+		t.Fatalf("read run migration: %v", err)
+	}
+	if !strings.Contains(string(runRaw), "ALTER TABLE `agent_summary_run`") ||
+		!strings.Contains(string(runRaw), "ADD COLUMN `output_truncated`") {
+		t.Fatal("run migration must add agent_summary_run.output_truncated")
+	}
+
+	messageRaw, err := migrationsql.FS.ReadFile("20260824-01-bind-output-truncation-to-agent-message.sql")
+	if err != nil {
+		t.Fatalf("read message migration: %v", err)
+	}
+	messageSQL := string(messageRaw)
+	if !strings.Contains(messageSQL, "ALTER TABLE `agent_message`") ||
+		!strings.Contains(messageSQL, "ADD COLUMN `run_id`") ||
+		!strings.Contains(messageSQL, "ADD COLUMN `output_truncated`") {
+		t.Fatal("message migration must bind run_id and output_truncated to agent_message")
+	}
+}

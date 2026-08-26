@@ -24,6 +24,13 @@ type Message struct {
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	Name       string     `json:"name,omitempty"`
+
+	// RunID and OutputTruncated are persistence-only metadata. They are never
+	// sent to the LLM. Binding the degradation to the final assistant message
+	// lets the save path judge the exact deliverable the user selected instead
+	// of a run-level bit shared by multiple HTTP replay attempts.
+	RunID           string `json:"-"`
+	OutputTruncated bool   `json:"-"`
 }
 
 type ToolCall struct {
@@ -40,6 +47,18 @@ type AssistantTurn struct {
 	Content   string
 	ToolCalls []ToolCall
 	Tokens    int
+
+	// Truncated reports that this turn's content was cut off by
+	// finish_reason=length. It is only ever set on a CONTENT-ONLY turn, i.e. the
+	// planner's final user-facing answer: a truncated tool-call turn is rejected
+	// outright (its arguments may be cut mid-JSON) and an empty truncated turn is
+	// an error, so neither reaches a caller.
+	//
+	// Carried as a structural field rather than left implicit in the appended
+	// prose notice so the runner can record the degradation as a run fact. The
+	// prose alone is not enough: it lives inside model-authored text and can be
+	// rewritten away downstream.
+	Truncated bool
 }
 
 // ContextKeyUID is the context key for storing user ID in request context.
@@ -47,6 +66,15 @@ type contextKeyUID struct{}
 
 // ContextKeyUID is exported for use by handler to inject uid into context.
 var ContextKeyUID = contextKeyUID{}
+
+// ContextKeyRunOwnerID carries the authenticated owner only for runner-level
+// bookkeeping such as output-truncation recording. It is intentionally
+// distinct from ContextKeyUID: putting the tool-authorization identity on the
+// root runner context would let future chat-profile tools inherit data access
+// without going through buildRegistryWithUID's explicit allowlist.
+type contextKeyRunOwnerID struct{}
+
+var ContextKeyRunOwnerID = contextKeyRunOwnerID{}
 
 // ContextKeySessionID is the context key for storing session ID in request context.
 type contextKeySessionID struct{}
