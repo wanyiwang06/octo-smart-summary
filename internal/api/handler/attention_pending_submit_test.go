@@ -176,6 +176,122 @@ func TestListSummaries_SinglePersonTaskNeverPendsSubmission(t *testing.T) {
 	}
 }
 
+// A dead task must not keep nagging. The stuck-task reaper flips Processing ->
+// Failed once retries are exhausted (worker/scheduler.go) and CancelSummary
+// writes Cancelled; neither touches summary_personal_result, so without the
+// status guard the member who DID generate their summary keeps a red dot and a
+// non-zero space-level attention_count for a task nobody can revive
+// (Regenerate and Delete are creator-gated). A badge that cannot return to zero
+// is worse than no badge.
+func TestListSummaries_TerminalTaskDropsPendingSubmission(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		taskNo string
+		status int
+	}{
+		{"reaper marked it failed", "SUBMIT-FAILED", model.StatusFailed},
+		{"creator cancelled it", "SUBMIT-CANCELLED", model.StatusCancelled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, imDB := setupListTestDBs(t)
+			taskID := seedPendingSubmitTask(t, db, tc.taskNo, "participant1", []string{"participant2"})
+			if err := db.Model(&model.SummaryTask{}).Where("id = ?", taskID).
+				Update("status", tc.status).Error; err != nil {
+				t.Fatalf("set terminal status: %v", err)
+			}
+
+			r := setupListRouter(NewTaskHandler(db, imDB, ""))
+			w := doRequest(r, http.MethodGet, "/api/v1/summaries", "participant1")
+			resp := parseAttentionList(t, w)
+			if len(resp.Data.Items) != 1 {
+				t.Fatalf("expected the seeded task, got %+v", resp.Data)
+			}
+			if resp.Data.Items[0].HasPendingSubmission || resp.Data.Items[0].NeedsAttention {
+				t.Fatalf("a terminal task must not pend submission: %+v", resp.Data.Items[0])
+			}
+			if resp.Data.AttentionCount != 0 || resp.Data.PendingSubmissionCount != 0 {
+				t.Fatalf("terminal task must not hold the badge above zero: %+v", resp.Data)
+			}
+
+			// MarkSummaryRead must agree — it is the other needs_attention producer.
+			rr := setupReadRouter(NewTaskHandler(db, imDB, ""))
+			now := timezone.Now()
+			version := model.PersonalResultVersion{
+				TaskID: taskID, UserID: "participant1", Content: "personal", Version: 1,
+				GeneratedAt: now, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := db.Create(&version).Error; err != nil {
+				t.Fatalf("create personal version: %v", err)
+			}
+			if err := db.Model(&model.PersonalResult{}).
+				Where("task_id = ? AND user_id = ?", taskID, "participant1").
+				Update("current_version_id", version.ID).Error; err != nil {
+				t.Fatalf("attach current version: %v", err)
+			}
+			rw := markReadRequest(rr, taskID, "participant1", fmt.Sprintf(`{"personal_version_id":%d}`, version.ID))
+			var readResp struct {
+				Data struct {
+					HasPendingSubmission bool `json:"has_pending_submission"`
+					NeedsAttention       bool `json:"needs_attention"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(rw.Body.Bytes(), &readResp); err != nil {
+				t.Fatalf("unmarshal mark-read response: %v; body=%s", err, rw.Body.String())
+			}
+			if readResp.Data.HasPendingSubmission || readResp.Data.NeedsAttention {
+				t.Fatalf("mark-read must agree that a terminal task pends nothing: %+v", readResp.Data)
+			}
+		})
+	}
+}
+
+// Completed is deliberately NOT guarded. A personal-only regenerate on a
+// finished task leaves submitted_at NULL on purpose and waits for an explicit
+// submit (worker/personal_processor.go), so the dot is correct there. Pinning
+// this stops a future "just exclude every terminal status" simplification from
+// silently dropping the signal on the one terminal status that still needs it.
+func TestListSummaries_CompletedTaskStillPendsSubmission(t *testing.T) {
+	db, imDB := setupListTestDBs(t)
+	taskID := seedPendingSubmitTask(t, db, "SUBMIT-REGEN", "participant1", []string{"participant2"})
+	if err := db.Model(&model.SummaryTask{}).Where("id = ?", taskID).
+		Update("status", model.StatusCompleted).Error; err != nil {
+		t.Fatalf("set completed status: %v", err)
+	}
+
+	r := setupListRouter(NewTaskHandler(db, imDB, ""))
+	w := doRequest(r, http.MethodGet, "/api/v1/summaries", "participant1")
+	resp := parseAttentionList(t, w)
+	if len(resp.Data.Items) != 1 {
+		t.Fatalf("expected the seeded task, got %+v", resp.Data)
+	}
+	if !resp.Data.Items[0].HasPendingSubmission || !resp.Data.Items[0].NeedsAttention {
+		t.Fatalf("a regenerated personal result on a completed task still owes a submit: %+v", resp.Data.Items[0])
+	}
+	if resp.Data.AttentionCount != 1 || resp.Data.PendingSubmissionCount != 1 {
+		t.Fatalf("completed task must still hold the counts: %+v", resp.Data)
+	}
+}
+
+// The status=waiting list filter carries the same predicate as the badge. If
+// the two disagree, a card can be counted by the badge but hidden by the
+// filter the user clicks to find it (or vice versa).
+func TestListSummaries_WaitingFilterAgreesWithTerminalGuard(t *testing.T) {
+	db, imDB := setupListTestDBs(t)
+	liveID := seedPendingSubmitTask(t, db, "SUBMIT-WAIT-LIVE", "participant1", []string{"participant2"})
+	deadID := seedPendingSubmitTask(t, db, "SUBMIT-WAIT-DEAD", "participant1", []string{"participant2"})
+	if err := db.Model(&model.SummaryTask{}).Where("id = ?", deadID).
+		Update("status", model.StatusFailed).Error; err != nil {
+		t.Fatalf("set terminal status: %v", err)
+	}
+
+	r := setupListRouter(NewTaskHandler(db, imDB, ""))
+	w := doRequest(r, http.MethodGet, fmt.Sprintf("/api/v1/summaries?status=%d", model.StatusPending), "participant1")
+	resp := parseAttentionList(t, w)
+	if len(resp.Data.Items) != 1 || resp.Data.Items[0].TaskID != liveID {
+		t.Fatalf("waiting filter must keep the live task and drop the terminal one: %+v", resp.Data)
+	}
+}
+
 // Owner decision 2026-08-26: reading is not submitting. Opening the detail page
 // records the read cursor, but the participant still owes the team a /submit,
 // so the dot must survive MarkSummaryRead.

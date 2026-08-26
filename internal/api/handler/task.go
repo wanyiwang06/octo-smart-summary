@@ -77,6 +77,38 @@ func (h *TaskHandler) schedulePendingInvitationExpr(taskAlias string) string {
  AND ss.confirm_policy=1 AND sc.user_id=? AND sc.confirmed=false)`
 }
 
+// pendingSubmitStatusGuard excludes terminally-dead tasks from the
+// pending-submission signal, for the given summary_task alias.
+//
+// The raw predicate (personal worker_status=Completed AND submitted_at IS NULL
+// AND roster > 1) has no notion of the task's own lifecycle, and two ordinary
+// paths strand a task while a participant's personal result still matches it:
+//
+//  1. the stuck-task reaper flips Processing -> Failed once retry_count is
+//     exhausted (worker/scheduler.go), which is exactly the outcome of the
+//     situation this signal exists to prevent — metaCompletionReady blocks
+//     aggregation until every accepted participant is terminal, so one member
+//     who never submits stalls the task until the reaper kills it;
+//  2. CancelSummary writes status=Cancelled and nothing else.
+//
+// Neither touches summary_personal_result, so the member who *did* generate
+// their summary would keep a red dot — and a non-zero space-level
+// attention_count — for a task nobody can revive (Regenerate and Delete are
+// both creator-gated). A badge that cannot return to zero destroys the
+// credibility of the whole signal, so gate it server-side.
+//
+// Completed is deliberately NOT excluded: a personal-only regenerate on a
+// finished task intentionally leaves submitted_at NULL and waits for an
+// explicit submit (worker/personal_processor.go), so the dot is correct there.
+//
+// The constants are inlined rather than bound as parameters on purpose. Every
+// call site lives in hand-assembled SQL whose arguments are positional; adding
+// two placeholders in four statements is precisely the hazard the ordering
+// comment in ListSummaries warns about.
+func pendingSubmitStatusGuard(taskAlias string) string {
+	return fmt.Sprintf(" AND %s.status NOT IN (%d,%d)", taskAlias, model.StatusFailed, model.StatusCancelled)
+}
+
 // R11 Q2 (owner decision 2026-08-14, option 1): a task whose origin was
 // inherited from a DERIVED (worker-backfilled) source row carries
 // OriginFromDerived=true. List/detail projections mask such an origin to
@@ -585,7 +617,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 				// yet started, pending task invitations, and pending schedule invitations.
 				// Apply it before pagination to keep totals and pages accurate.
 				statusPendingExpr := h.schedulePendingInvitationExpr("summary_task")
-				whereSQL += " AND (status = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ? AND status = ?) OR EXISTS (SELECT 1 FROM summary_personal_result wait_pr WHERE wait_pr.task_id = summary_task.id AND wait_pr.user_id = ? AND wait_pr.worker_status = ? AND wait_pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id = summary_task.id) > 1) OR " + statusPendingExpr + ")"
+				whereSQL += " AND (status = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ? AND status = ?) OR EXISTS (SELECT 1 FROM summary_personal_result wait_pr WHERE wait_pr.task_id = summary_task.id AND wait_pr.user_id = ? AND wait_pr.worker_status = ? AND wait_pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id = summary_task.id) > 1" + pendingSubmitStatusGuard("summary_task") + ") OR " + statusPendingExpr + ")"
 				args = append(args, v, userID, model.ParticipantPending, userID, model.PersonalStatusCompleted)
 				if h.db.Dialector.Name() == "mysql" {
 					args = append(args, userID)
@@ -679,7 +711,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	schedulePendingExpr := h.schedulePendingInvitationExpr("sub")
 	attentionSelect := `,
  CASE WHEN me.status = ? OR ` + schedulePendingExpr + ` THEN 1 ELSE 0 END AS has_pending_invitation,
- CASE WHEN pr.worker_status = ? AND pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id = sub.id) > 1 THEN 1 ELSE 0 END AS has_pending_submission,
+ CASE WHEN pr.worker_status = ? AND pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id = sub.id) > 1` + pendingSubmitStatusGuard("sub") + ` THEN 1 ELSE 0 END AS has_pending_submission,
  CASE WHEN (sub.current_result_id IS NOT NULL AND (sur.last_read_team_result_id IS NULL OR sur.last_read_team_result_id <> sub.current_result_id))
         OR (pr.current_version_id IS NOT NULL AND (sur.last_read_personal_version_id IS NULL OR sur.last_read_personal_version_id <> pr.current_version_id))
       THEN 1 ELSE 0 END AS is_unread,
@@ -935,7 +967,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	//   2. has_submit      -> PersonalStatusCompleted
 	//   3. countInner      -> spaceID, userID, userID [+ userID when scheduleVisibilityExpr is live]
 	//   4. attentionJoins  -> userID x4
-	attentionCountSQL := "SELECT COALESCE(SUM(has_invite),0) pending_invitation_count, COALESCE(SUM(unread),0) unread_count, COALESCE(SUM(has_submit),0) pending_submission_count, COALESCE(SUM(CASE WHEN has_invite=1 OR unread=1 OR has_submit=1 THEN 1 ELSE 0 END),0) attention_count FROM (SELECT CASE WHEN me.status=? OR " + schedulePendingExpr + " THEN 1 ELSE 0 END has_invite, CASE WHEN pr.worker_status=? AND pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id=sub.id) > 1 THEN 1 ELSE 0 END has_submit, CASE WHEN (sub.current_result_id IS NOT NULL AND (sur.last_read_team_result_id IS NULL OR sur.last_read_team_result_id<>sub.current_result_id)) OR (pr.current_version_id IS NOT NULL AND (sur.last_read_personal_version_id IS NULL OR sur.last_read_personal_version_id<>pr.current_version_id)) THEN 1 ELSE 0 END unread FROM (" + countInner + ") sub" + attentionJoins + " WHERE sub.rn=1) attention"
+	attentionCountSQL := "SELECT COALESCE(SUM(has_invite),0) pending_invitation_count, COALESCE(SUM(unread),0) unread_count, COALESCE(SUM(has_submit),0) pending_submission_count, COALESCE(SUM(CASE WHEN has_invite=1 OR unread=1 OR has_submit=1 THEN 1 ELSE 0 END),0) attention_count FROM (SELECT CASE WHEN me.status=? OR " + schedulePendingExpr + " THEN 1 ELSE 0 END has_invite, CASE WHEN pr.worker_status=? AND pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id=sub.id) > 1" + pendingSubmitStatusGuard("sub") + " THEN 1 ELSE 0 END has_submit, CASE WHEN (sub.current_result_id IS NOT NULL AND (sur.last_read_team_result_id IS NULL OR sur.last_read_team_result_id<>sub.current_result_id)) OR (pr.current_version_id IS NOT NULL AND (sur.last_read_personal_version_id IS NULL OR sur.last_read_personal_version_id<>pr.current_version_id)) THEN 1 ELSE 0 END unread FROM (" + countInner + ") sub" + attentionJoins + " WHERE sub.rn=1) attention"
 	var counts struct {
 		AttentionCount         int64 `gorm:"column:attention_count"`
 		UnreadCount            int64 `gorm:"column:unread_count"`
@@ -1029,7 +1061,7 @@ func (h *TaskHandler) MarkSummaryRead(c *gin.Context) {
  sur.last_read_team_result_id AS read_team_id,
  sur.last_read_personal_version_id AS read_personal_id,
  CASE WHEN p.status = ? OR ` + schedulePendingExpr + ` THEN 1 ELSE 0 END AS pending_invitation,
- CASE WHEN pr.worker_status = ? AND pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id = t.id) > 1 THEN 1 ELSE 0 END AS pending_submission
+ CASE WHEN pr.worker_status = ? AND pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id = t.id) > 1` + pendingSubmitStatusGuard("t") + ` THEN 1 ELSE 0 END AS pending_submission
  FROM summary_task t
  LEFT JOIN summary_personal_result pr ON pr.task_id=t.id AND pr.user_id=?
  LEFT JOIN summary_user_read sur ON sur.task_id=t.id AND sur.user_id=?
