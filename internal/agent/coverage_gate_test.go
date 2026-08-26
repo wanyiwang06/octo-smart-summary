@@ -352,6 +352,100 @@ func TestRunToolsInjectsOneStepAcrossFanOut(t *testing.T) {
 	}
 }
 
+type nearCeilingCoverageRecoveryClient struct {
+	calls int
+}
+
+func (c *nearCeilingCoverageRecoveryClient) Chat(_ context.Context, msgs []Message, _ []Tool) (AssistantTurn, error) {
+	c.calls++
+	switch c.calls {
+	case 1:
+		return AssistantTurn{ToolCalls: []ToolCall{
+			mkToolCall("blocked-map", "summarize_chunk", `{"messages_handle":"old-handle"}`),
+		}}, nil
+	case 2:
+		return AssistantTurn{ToolCalls: []ToolCall{
+			mkToolCall("repair-fetch", "fetch_channel", `{"channel_id":"ch-B"}`),
+		}}, nil
+	case 3:
+		return AssistantTurn{ToolCalls: []ToolCall{
+			mkToolCall("repaired-map", "summarize_chunk", `{"messages_handle":"new-handle"}`),
+		}}, nil
+	case 4:
+		for _, msg := range msgs {
+			if msg.Role != "tool" || msg.Name != "summarize_chunk" {
+				continue
+			}
+			var result struct {
+				SummaryHandle string `json:"summary_handle"`
+			}
+			if json.Unmarshal([]byte(msg.Content), &result) == nil && result.SummaryHandle != "" {
+				args, _ := json.Marshal(map[string][]string{"summary_handles": {result.SummaryHandle}})
+				return AssistantTurn{ToolCalls: []ToolCall{
+					mkToolCall("reduce", "merge_summaries", string(args)),
+				}}, nil
+			}
+		}
+		return AssistantTurn{}, fmt.Errorf("repaired Map did not return a summary_handle")
+	default:
+		return AssistantTurn{Content: "best-effort summary"}, nil
+	}
+}
+
+// A coverage-gate rejection is a precondition failure, not a failed Map. The
+// repair may produce a fresh messages_handle, so latching the rejected handle
+// would make Reduce impossible and turn the final step into an HTTP 500.
+func TestRunner_CoverageGateRejectionDoesNotStrandNearCeilingRecovery(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
+	client := &nearCeilingCoverageRecoveryClient{}
+	reg := NewRegistry()
+	reg.Register(Tool{Type: "function", Function: ToolFunction{Name: "fetch_channel"}},
+		func(context.Context, json.RawMessage) (string, error) { return `{"messages_handle":"new-handle"}`, nil })
+
+	var mapCalls int
+	reg.Register(Tool{Type: "function", Function: ToolFunction{Name: "summarize_chunk"}},
+		func(ctx context.Context, _ json.RawMessage) (string, error) {
+			mapCalls++
+			if mapCalls == 1 {
+				return "", &CoverageGateError{
+					Missing:     []summaryspec.Channel{{ChannelID: "ch-B", Type: "group"}},
+					Instruction: "fetch ch-B before retrying Map",
+				}
+			}
+			store, _ := summaryHandleStoreFromContext(ctx)
+			handle, err := store.PutAtStep("repaired map body", 1, summaryToolStepFromContext(ctx))
+			if err != nil {
+				return "", err
+			}
+			return `{"summary_handle":"` + handle + `","chunk_count":1}`, nil
+		})
+	reg.Register(Tool{Type: "function", Function: ToolFunction{Name: "merge_summaries"}},
+		func(ctx context.Context, args json.RawMessage) (string, error) {
+			var req struct {
+				Handles []string `json:"summary_handles"`
+			}
+			if err := json.Unmarshal(args, &req); err != nil {
+				return "", err
+			}
+			store, _ := summaryHandleStoreFromContext(ctx)
+			resolved, err := store.ResolveAllBefore(req.Handles, summaryToolStepFromContext(ctx))
+			if err != nil {
+				return "", err
+			}
+			store.MarkReduced(resolved.Generation)
+			return `{"merged_summary":"complete"}`, nil
+		})
+
+	runner := NewRunner(client, reg, NewPool(2), Policy{MaxSteps: 5, MaxTokens: 10000, StepTimeout: time.Second})
+	out, _, err := runner.RunWithHistory(context.Background(), "system", nil, "summarize")
+	if err != nil {
+		t.Fatalf("near-ceiling recovery must still deliver: %v", err)
+	}
+	if out != "best-effort summary" || client.calls != 5 {
+		t.Fatalf("out=%q calls=%d, want delivery on final step", out, client.calls)
+	}
+}
+
 // P1-1 regression, pinned at the runner rather than asserted by inspection.
 //
 // The post-answer repair loop injected its instruction through
@@ -369,8 +463,13 @@ func TestCoverageGateInstructionNeverBecomesAUserMessage(t *testing.T) {
 	const instruction = "覆盖检查未通过:用户明确选定的以下频道还没有被 fetch_channel 抓取过"
 
 	reg := NewRegistry()
+	var summarizeCalls int
 	reg.Register(Tool{Type: "function", Function: ToolFunction{Name: "summarize_chunk"}},
 		func(ctx context.Context, args json.RawMessage) (string, error) {
+			summarizeCalls++
+			if summarizeCalls > 1 {
+				return `{"summary_handle":"summary-ok"}`, nil
+			}
 			return "", &CoverageGateError{
 				Missing:     []summaryspec.Channel{{ChannelID: "ch-B", Type: "group"}},
 				Instruction: instruction,
@@ -379,6 +478,10 @@ func TestCoverageGateInstructionNeverBecomesAUserMessage(t *testing.T) {
 
 	fc := &fakeClient{turns: []AssistantTurn{
 		{ToolCalls: []ToolCall{mkToolCall("call-1", "summarize_chunk", `{"messages_handle":"h1"}`)}},
+		// Model the intended later-step retry so this test isolates its real
+		// contract: the gate instruction stays a tool result and never becomes a
+		// persisted user message.
+		{ToolCalls: []ToolCall{mkToolCall("call-2", "summarize_chunk", `{"messages_handle":"h1"}`)}},
 		{Content: "final answer"},
 	}}
 	r := newTestRunner(fc, reg, Policy{MaxSteps: 5, MaxTokens: 10000, StepTimeout: 5 * time.Second})

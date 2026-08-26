@@ -389,7 +389,16 @@ func (r *Runner) runToolBatch(toolCtx context.Context, calls []ToolCall, indexes
 						target = anonymousMapFailurePrefix + tc.ID
 					}
 					if err != nil {
-						store.MarkMapFailed(target, step)
+						// The coverage gate rejects the call before Map reads or
+						// summarizes any messages. Recording that precondition as a
+						// failed Map would require a later success on the exact same
+						// messages_handle, even when the repair fetch legitimately
+						// gives the planner new handles. That can strand Reduce and the
+						// final-answer gate at the step ceiling.
+						var gateErr *CoverageGateError
+						if !errors.As(err, &gateErr) {
+							store.MarkMapFailed(target, step)
+						}
 					} else {
 						store.MarkMapSucceeded(target, step)
 					}

@@ -250,13 +250,14 @@ func TestCoverageGate_RepairedChannelIsCitable(t *testing.T) {
 	t.Cleanup(func() { SetSummaryDeps(nil, nil, nil, config.Config{}) })
 
 	_, h := SummarizeChunkTool()
+	toolCtx := f.toolCtx()
 	handleA := f.seedFetched(t, "ch-A", []pipeline.Message{
 		{ChannelID: "ch-A", MessageSeq: 1, Timestamp: 1000, Content: "A one"},
 	})
 
 	// Round 1: blocked.
 	argsA, _ := json.Marshal(map[string]string{"messages_handle": handleA})
-	if _, err := h(f.toolCtxAtStep(1), argsA); err == nil {
+	if _, err := h(withCoverageGateStep(toolCtx, 1, profiles["summary"].Policy.MaxSteps), argsA); err == nil {
 		t.Fatal("round 1 must be blocked")
 	}
 
@@ -270,12 +271,12 @@ func TestCoverageGate_RepairedChannelIsCitable(t *testing.T) {
 	// Round 2: coverage is complete, so the gate stands aside and the freeze
 	// happens over a pool that INCLUDES ch-B.
 	argsB, _ := json.Marshal(map[string]string{"messages_handle": handleB})
-	out, err := h(f.toolCtxAtStep(2), argsB)
+	out, err := h(withCoverageGateStep(toolCtx, 2, profiles["summary"].Policy.MaxSteps), argsB)
 	if err != nil {
 		t.Fatalf("round 2 summarize_chunk: %v", err)
 	}
 	var result struct {
-		Summary        string `json:"summary"`
+		SummaryHandle  string `json:"summary_handle"`
 		InputCount     int    `json:"input_count"`
 		ProcessedCount int    `json:"processed_count"`
 		DroppedCount   int    `json:"dropped_count"`
@@ -285,8 +286,19 @@ func TestCoverageGate_RepairedChannelIsCitable(t *testing.T) {
 	}
 
 	// The old failure mode, asserted directly.
-	if result.Summary == "无可总结内容" {
-		t.Fatal(`repaired channel summarized as "无可总结内容" — this is exactly the post-freeze defect: the model would then tell the user the channel was empty`)
+	if result.SummaryHandle == "" {
+		t.Fatalf("repaired channel produced no summary handle; out=%s", out)
+	}
+	store, err := summaryHandleStoreFromContext(toolCtx)
+	if err != nil {
+		t.Fatalf("load request-scoped summary store: %v", err)
+	}
+	resolved, err := store.ResolveAll([]string{result.SummaryHandle})
+	if err != nil {
+		t.Fatalf("resolve repaired-channel summary handle: %v", err)
+	}
+	if len(resolved.Entries) != 1 || resolved.Entries[0].Text == "" || resolved.Entries[0].Text == "无可总结内容" {
+		t.Fatalf("repaired channel did not produce a real summary: %+v", resolved.Entries)
 	}
 	if result.DroppedCount != 0 {
 		t.Fatalf("dropped_count = %d, want 0 — the repaired channel's messages must be IN the manifest, not dropped by it", result.DroppedCount)
@@ -442,6 +454,7 @@ func TestCoverageGate_AfterCapFreezeProceedsAndRunStillSummarizes(t *testing.T) 
 	})
 	_, h := SummarizeChunkTool()
 	args, _ := json.Marshal(map[string]string{"messages_handle": handle})
+	toolCtx := f.toolCtx()
 
 	// The planner keeps re-calling without ever fetching ch-B (it can't).
 	var lastOut string
@@ -449,7 +462,7 @@ func TestCoverageGate_AfterCapFreezeProceedsAndRunStillSummarizes(t *testing.T) 
 	calls := 0
 	for i := 0; i < 40; i++ {
 		calls++
-		lastOut, lastErr = h(f.toolCtxAtStep(i+1), args)
+		lastOut, lastErr = h(withCoverageGateStep(toolCtx, i+1, profiles["summary"].Policy.MaxSteps), args)
 		if lastErr == nil {
 			break
 		}
@@ -466,14 +479,25 @@ func TestCoverageGate_AfterCapFreezeProceedsAndRunStillSummarizes(t *testing.T) 
 	}
 
 	var result struct {
-		Summary      string `json:"summary"`
-		DroppedCount int    `json:"dropped_count"`
+		SummaryHandle string `json:"summary_handle"`
+		DroppedCount  int    `json:"dropped_count"`
 	}
 	if err := json.Unmarshal([]byte(lastOut), &result); err != nil {
 		t.Fatalf("decode result: %v; out=%s", err, lastOut)
 	}
-	if result.Summary == "" || result.Summary == "无可总结内容" {
-		t.Fatalf("after the cap the run must still produce a real summary, got %q", result.Summary)
+	if result.SummaryHandle == "" {
+		t.Fatalf("after the cap the run must still produce a summary handle; out=%s", lastOut)
+	}
+	store, err := summaryHandleStoreFromContext(toolCtx)
+	if err != nil {
+		t.Fatalf("load request-scoped summary store: %v", err)
+	}
+	resolved, err := store.ResolveAll([]string{result.SummaryHandle})
+	if err != nil {
+		t.Fatalf("resolve produced summary handle: %v", err)
+	}
+	if len(resolved.Entries) != 1 || resolved.Entries[0].Text == "" || resolved.Entries[0].Text == "无可总结内容" {
+		t.Fatalf("after the cap the run must still produce a real summary, got %+v", resolved.Entries)
 	}
 	if !f.frozen(t) {
 		t.Fatal("freeze must proceed once the gate gives up")
