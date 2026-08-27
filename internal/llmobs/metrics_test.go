@@ -144,7 +144,8 @@ func TestWritePrometheus_ExpositionFormat(t *testing.T) {
 		"llm_model_switch_total":                     "counter",
 		"llm_calls_total":                            "counter",
 		"llm_call_duration_seconds_total":            "counter",
-		"llm_call_duration_seconds":                  "histogram",
+		"llm_run_duration_seconds":                   "histogram",
+		"llm_attempt_duration_seconds":               "histogram",
 		"llm_primary_last_success_timestamp_seconds": "gauge",
 	}
 	for name, typ := range want {
@@ -687,9 +688,9 @@ func TestHistogram_QuantileInputsAreExact(t *testing.T) {
 	m.WritePrometheus(&buf)
 	fams := parseExposition(t, buf.String())
 
-	f := fams["llm_call_duration_seconds"]
+	f := fams["llm_run_duration_seconds"]
 	if f == nil {
-		t.Fatal("missing llm_call_duration_seconds family")
+		t.Fatal("missing llm_run_duration_seconds family")
 	}
 	if f.typ != "histogram" {
 		t.Errorf("TYPE = %q, want histogram", f.typ)
@@ -708,14 +709,14 @@ func TestHistogram_QuantileInputsAreExact(t *testing.T) {
 
 	// Cumulative: each bucket counts everything at or below its boundary.
 	want := map[string]string{
-		"llm_call_duration_seconds_bucket|0.5":  "2",
-		"llm_call_duration_seconds_bucket|1":    "2",
-		"llm_call_duration_seconds_bucket|60":   "2",
-		"llm_call_duration_seconds_bucket|90":   "3",
-		"llm_call_duration_seconds_bucket|300":  "3",
-		"llm_call_duration_seconds_bucket|+Inf": "4",
-		"llm_call_duration_seconds_count":       "4",
-		"llm_call_duration_seconds_sum":         "475.75",
+		"llm_run_duration_seconds_bucket|0.5":  "2",
+		"llm_run_duration_seconds_bucket|1":    "2",
+		"llm_run_duration_seconds_bucket|60":   "2",
+		"llm_run_duration_seconds_bucket|90":   "3",
+		"llm_run_duration_seconds_bucket|300":  "3",
+		"llm_run_duration_seconds_bucket|+Inf": "4",
+		"llm_run_duration_seconds_count":       "4",
+		"llm_run_duration_seconds_sum":         "475.75",
 	}
 	for k, v := range want {
 		if got[k] != v {
@@ -725,7 +726,7 @@ func TestHistogram_QuantileInputsAreExact(t *testing.T) {
 
 	// The over-range sample must still reach _sum/_count. A histogram that
 	// drops outliers hides exactly the tail these percentiles are for.
-	if got["llm_call_duration_seconds_bucket|300"] == got["llm_call_duration_seconds_bucket|+Inf"] {
+	if got["llm_run_duration_seconds_bucket|300"] == got["llm_run_duration_seconds_bucket|+Inf"] {
 		t.Error("the 400s sample never reached +Inf; over-range observations are being dropped")
 	}
 }
@@ -746,6 +747,10 @@ func leOf(labelsPart string) string {
 // position, result and anything derived from request data must stay out.
 func TestHistogram_LabelSetMatchesCounter(t *testing.T) {
 	m := NewMetrics(fixedNow)
+	m.ObserveAttempt(llmfallback.AttemptEvent{
+		Path: llmfallback.PathWorkerMap, Model: "primary-a", Position: llmfallback.PositionPrimary,
+		Attempt: 1, MaxAttempts: 3, Outcome: llmfallback.Success, Duration: time.Second,
+	})
 	m.ObserveResult(llmfallback.ResultEvent{
 		Path: llmfallback.PathWorkerMap, Model: "primary-a", Position: llmfallback.PositionPrimary,
 		OK: true, Duration: time.Second,
@@ -755,13 +760,29 @@ func TestHistogram_LabelSetMatchesCounter(t *testing.T) {
 	m.WritePrometheus(&buf)
 	fams := parseExposition(t, buf.String())
 
-	for _, line := range fams["llm_call_duration_seconds"].samples {
-		_, rest, _ := strings.Cut(line, "{")
-		labelsPart, _, _ := strings.Cut(rest, "} ")
-		for _, kv := range strings.Split(labelsPart, ",") {
-			key, _, _ := strings.Cut(kv, "=")
-			if key != "path" && key != "le" {
-				t.Errorf("unexpected histogram label %q in %q: bucket series must stay bounded by path alone", key, line)
+	// Nil-guarded: without this a rename turns a clean failure into a panic.
+	allowed := map[string]map[string]bool{
+		"llm_run_duration_seconds":     {"path": true, "le": true},
+		"llm_attempt_duration_seconds": {"path": true, "outcome": true, "le": true},
+	}
+	for name, keys := range allowed {
+		f := fams[name]
+		if f == nil {
+			t.Errorf("missing histogram family %q", name)
+			continue
+		}
+		if len(f.samples) == 0 {
+			t.Errorf("%s: no samples; the label assertion below would be vacuous", name)
+			continue
+		}
+		for _, line := range f.samples {
+			_, rest, _ := strings.Cut(line, "{")
+			labelsPart, _, _ := strings.Cut(rest, "} ")
+			for _, kv := range strings.Split(labelsPart, ",") {
+				key, _, _ := strings.Cut(kv, "=")
+				if !keys[key] {
+					t.Errorf("unexpected label %q on %s in %q: bucket series multiply by len(buckets)+3, so this dimension is expensive", key, name, line)
+				}
 			}
 		}
 	}
@@ -786,7 +807,78 @@ func TestHistogram_ConcurrentObserveIsRaceFree(t *testing.T) {
 
 	var buf bytes.Buffer
 	m.WritePrometheus(&buf)
-	if !strings.Contains(buf.String(), `llm_call_duration_seconds_count{path="worker_map"} 50`) {
+	if !strings.Contains(buf.String(), `llm_run_duration_seconds_count{path="worker_map"} 50`) {
 		t.Errorf("lost observations under concurrency:\n%s", buf.String())
+	}
+}
+
+// TestHistogram_NegativeObservationIsClamped covers the guard in observe().
+// A monotonic clock cannot produce a negative duration, but a bad caller must
+// not be able to corrupt _sum for every other observer on the series: _sum is
+// what the mean and any error-budget arithmetic is built on, and a single
+// negative sample silently drags it down forever.
+func TestHistogram_NegativeObservationIsClamped(t *testing.T) {
+	m := NewMetrics(fixedNow)
+	m.ObserveResult(llmfallback.ResultEvent{
+		Path: llmfallback.PathAgentChat, Model: "p", Position: llmfallback.PositionPrimary,
+		OK: true, Duration: -5 * time.Second,
+	})
+
+	var buf bytes.Buffer
+	m.WritePrometheus(&buf)
+	out := buf.String()
+
+	// Clamped to 0: counted, in the lowest bucket, contributing nothing to _sum.
+	if !strings.Contains(out, `llm_run_duration_seconds_sum{path="agent_chat"} 0`) {
+		t.Errorf("negative sample reached _sum; the mean is now permanently skewed:\n%s", out)
+	}
+	if !strings.Contains(out, `llm_run_duration_seconds_count{path="agent_chat"} 1`) {
+		t.Errorf("clamped sample should still be counted:\n%s", out)
+	}
+	if !strings.Contains(out, `llm_run_duration_seconds_bucket{path="agent_chat",le="0.5"} 1`) {
+		t.Errorf("clamped sample should land in the lowest bucket:\n%s", out)
+	}
+}
+
+// TestAttemptHistogram_IsPerAttemptNotPerRun is the point of the second
+// histogram. LLM_TIMEOUT is a PER-ATTEMPT cap, but a run's wall-clock also
+// carries backoff sleeps and every earlier model, so sizing the cap from the
+// run distribution over-estimates exactly where it matters — the P99 IS the
+// retried runs. This pins that the two series report different things for the
+// same logical call.
+func TestAttemptHistogram_IsPerAttemptNotPerRun(t *testing.T) {
+	m := NewMetrics(fixedNow)
+
+	// One run: two attempts of 10s each, plus a 1s backoff -> a 21s run.
+	for i := 0; i < 2; i++ {
+		m.ObserveAttempt(llmfallback.AttemptEvent{
+			Path: llmfallback.PathAgentChat, Model: "p", Position: llmfallback.PositionPrimary,
+			Attempt: i + 1, MaxAttempts: 3, Outcome: llmfallback.RetrySameModel,
+			Duration: 10 * time.Second,
+		})
+	}
+	m.ObserveResult(llmfallback.ResultEvent{
+		Path: llmfallback.PathAgentChat, Model: "p", Position: llmfallback.PositionPrimary,
+		OK: true, Duration: 21 * time.Second,
+	})
+
+	var buf bytes.Buffer
+	m.WritePrometheus(&buf)
+	out := buf.String()
+
+	// Attempts: two samples of 10s each.
+	if !strings.Contains(out, `llm_attempt_duration_seconds_count{path="agent_chat",outcome="retry_same_model"} 2`) {
+		t.Errorf("expected two attempt observations:\n%s", out)
+	}
+	if !strings.Contains(out, `llm_attempt_duration_seconds_sum{path="agent_chat",outcome="retry_same_model"} 20`) {
+		t.Errorf("attempt _sum should be 20s (2x10s), not the run's 21s:\n%s", out)
+	}
+	// Run: one sample of 21s. Sizing a 10s-per-attempt cap from this would be
+	// wrong by more than 2x.
+	if !strings.Contains(out, `llm_run_duration_seconds_count{path="agent_chat"} 1`) {
+		t.Errorf("expected exactly one run observation:\n%s", out)
+	}
+	if !strings.Contains(out, `llm_run_duration_seconds_sum{path="agent_chat"} 21`) {
+		t.Errorf("run _sum should carry the backoff:\n%s", out)
 	}
 }

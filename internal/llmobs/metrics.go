@@ -177,10 +177,15 @@ type histogramVec struct {
 }
 
 func newHistogramVec(name, help string, buckets []float64) *histogramVec {
+	// Copy: observe relies on sort.SearchFloat64s, which is only correct on a
+	// strictly increasing slice. Keeping the caller's backing array would let a
+	// later append/sort elsewhere silently corrupt every bucket assignment.
+	b := make([]float64, len(buckets))
+	copy(b, buckets)
 	return &histogramVec{
 		name:    name,
 		help:    help,
-		buckets: buckets,
+		buckets: b,
 		counts:  map[labelSet][]uint64{},
 		sums:    map[labelSet]float64{},
 		totals:  map[labelSet]uint64{},
@@ -264,13 +269,14 @@ func formatBucket(b float64) string {
 // Metrics is the LLM fallback metric set. The zero value is not usable; call
 // NewMetrics.
 type Metrics struct {
-	attempts *counterVec
-	switches *counterVec
-	calls    *counterVec
-	callSecs *counterVec
-	callDur  *histogramVec
-	lastOK   *gaugeVec
-	nowFn    func() time.Time
+	attempts   *counterVec
+	switches   *counterVec
+	calls      *counterVec
+	callSecs   *counterVec
+	runDur     *histogramVec
+	attemptDur *histogramVec
+	lastOK     *gaugeVec
+	nowFn      func() time.Time
 }
 
 // NewMetrics builds the metric set. nowFn is injectable for tests; nil uses
@@ -288,8 +294,26 @@ func NewMetrics(nowFn func() time.Time) *Metrics {
 			"Completed LLM calls by call path, the position of the model that served them, and the outcome: ok; failed (no model could serve it); cancelled (the caller went away — not an upstream fault, do not alert on it); timeout (our own deadline expired before any model answered — nobody walked away, so this one IS alertable)."),
 		callSecs: newCounterVec("llm_call_duration_seconds_total",
 			"Cumulative wall-clock seconds spent in llmfallback.Run, by call path. Labelled by path only, so a mean needs sum by(path)(llm_call_duration_seconds_total) / sum by(path)(llm_calls_total) — dividing the raw series returns an empty vector."),
-		callDur: newHistogramVec("llm_call_duration_seconds",
-			"Distribution of llmfallback.Run wall-clock, by call path. This is the series to take quantiles from: histogram_quantile(0.95, sum by (path, le) (rate(llm_call_duration_seconds_bucket[1h]))). The companion llm_call_duration_seconds_total only supports a mean.",
+		// Named llm_RUN_duration_seconds, not llm_call_duration_seconds: the
+		// latter would collide with the existing llm_call_duration_seconds_total
+		// counter under OpenMetrics, where a counter's family name is its name
+		// minus _total. Both families would normalize to one name with
+		// conflicting TYPEs for any consumer that normalizes (the OTel Collector
+		// prometheus receiver, promtool, OpenMetrics-negotiating scrapers).
+		// Prometheus text format 0.0.4 tolerates it; the rename is free now and
+		// expensive after dashboards exist.
+		runDur: newHistogramVec("llm_run_duration_seconds",
+			"Distribution of whole-llmfallback.Run wall-clock, by call path — INCLUDING backoff sleeps and every model tried. Use it to size PARENT budgets (REFINE_TIMEOUT, AGENT_STEP_TIMEOUT): histogram_quantile(0.95, sum by (path, le) (rate(llm_run_duration_seconds_bucket[1h]))). To size a per-attempt cap such as LLM_TIMEOUT, use llm_attempt_duration_seconds instead.",
+			durationBuckets),
+		// A run and an attempt diverge exactly where it matters. LLM_TIMEOUT is
+		// applied per attempt (http.Client.Timeout in service/llm.go, the
+		// per-attempt context in agent/llm.go), but a run's wall-clock also
+		// carries backoffs and earlier models. On the happy path the two
+		// coincide, so a run-level P95 is roughly usable; a run-level P99 is
+		// not, because the P99 IS the retried runs. Sizing a per-attempt cap
+		// from the run distribution therefore over-estimates systematically.
+		attemptDur: newHistogramVec("llm_attempt_duration_seconds",
+			"Distribution of a SINGLE upstream attempt's wall-clock, by call path and classified outcome. This is the series to size the per-attempt LLM_TIMEOUT from; llm_run_duration_seconds includes backoffs and other models and will over-estimate it.",
 			durationBuckets),
 		lastOK: newGaugeVec("llm_primary_last_success_timestamp_seconds",
 			"Unix timestamp of the most recent successful call served by the PRIMARY model, per call path. A stale value means sustained silent degradation onto a fallback."),
@@ -305,6 +329,15 @@ func (m *Metrics) ObserveAttempt(e llmfallback.AttemptEvent) {
 		"position", e.Position,
 		"outcome", outcomeLabel(e.Outcome),
 	))
+	// Deliberately narrower than the counter's label set: no model, no position.
+	// Bucket series multiply by len(buckets)+3, so carrying the model dimension
+	// here would scale the series count with the configured model list. outcome
+	// is kept because a timed-out attempt and a fast 403 have different
+	// distributions and folding them together is what hides a degrading model.
+	m.attemptDur.observe(labels(
+		"path", string(e.Path),
+		"outcome", outcomeLabel(e.Outcome),
+	), e.Duration.Seconds())
 }
 
 // ObserveSwitch implements llmfallback.Observer.
@@ -341,7 +374,7 @@ func (m *Metrics) ObserveResult(e llmfallback.ResultEvent) {
 	// Labelled by path only, exactly like callSecs. Adding result/position here
 	// would multiply every bucket series by those dimensions for a question the
 	// counters already answer.
-	m.callDur.observe(labels("path", string(e.Path)), e.Duration.Seconds())
+	m.runDur.observe(labels("path", string(e.Path)), e.Duration.Seconds())
 
 	if e.OK && e.Position == llmfallback.PositionPrimary {
 		m.lastOK.set(labels("path", string(e.Path)), float64(m.nowFn().Unix()))
@@ -354,7 +387,8 @@ func (m *Metrics) WritePrometheus(w io.Writer) {
 	m.switches.write(w)
 	m.calls.write(w)
 	m.callSecs.write(w)
-	m.callDur.write(w)
+	m.runDur.write(w)
+	m.attemptDur.write(w)
 	m.lastOK.write(w)
 }
 

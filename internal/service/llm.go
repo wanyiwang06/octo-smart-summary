@@ -267,18 +267,26 @@ func (c *LLMClient) callWithPolicyAndModel(ctx context.Context, messages []ChatM
 	// Keep retry ownership in the shared runner: exhaust transient failures on
 	// one model before switching to the next model.
 	//
-	// PerModelTimeout is what arms the runner's deadline-aware escalation: before
-	// sleeping a backoff it checks whether the remaining parent budget can still
-	// fit that sleep, the pending retry AND one full attempt on the next model,
-	// and escalates early (SwitchReason budget_starved) when it cannot. Omitting
-	// it silently disabled that guard on every worker Map/Reduce and API refine
-	// call — the agent path (agent/llm.go) and CallWithTools already pass it —
-	// so those paths would spend the primary's whole retry budget and hand the
-	// fallback whatever was left, which is the starvation #220 describes.
+	// PerModelTimeout is deliberately NOT set here, and setting it is not the
+	// harmless hardening it looks like. It arms Run's deadline-aware escalation,
+	// which is gated on the parent context carrying a deadline. The two consumers
+	// of this entry point sit on opposite sides of that gate:
+	//
+	//   - worker Map/Reduce roots at context.Background() with no deadline
+	//     anywhere down the chain, so the guard cannot fire and the field would
+	//     be inert. The aggregate worker deadline is issue #220 §2.
+	//   - API refine passes a 90s budget while this client's per-attempt timeout
+	//     is LLM_TIMEOUT (180s default), so the guard's condition
+	//     (remaining < backoff + 2*PerModelTimeout) would hold on EVERY first
+	//     retry, abandoning the primary's remaining attempts on any transient
+	//     blip and logging budget_starved at ERROR each time.
+	//
+	// Arming it therefore requires either the worker deadline from #220 §2 or a
+	// per-attempt budget derived from the remaining parent budget — not this
+	// field on this line.
 	res, usedModel, err := llmfallback.Run(ctx, llmfallback.Config{
-		Models:          c.models(),
-		PerModelTimeout: c.timeout,
-		MaxAttempts:     3,
+		Models:      c.models(),
+		MaxAttempts: 3,
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
 		temp := temperature
 		if config.IsKimiModel(model) {
@@ -401,12 +409,12 @@ func (c *LLMClient) callStreamWithModel(ctx context.Context, messages []ChatMess
 	// delta may still try the next model. Transient failures exhaust the current
 	// model's retry budget before switching models.
 	//
-	// PerModelTimeout arms the deadline-aware escalation; see the note in
-	// callWithPolicyAndModel for why leaving it unset starves the fallback.
+	// PerModelTimeout is intentionally unset; see callWithPolicyAndModel for why
+	// arming the deadline guard on this entry point is either inert (worker) or
+	// actively harmful (refine).
 	res, usedModel, err := llmfallback.Run(ctx, llmfallback.Config{
-		Models:          c.models(),
-		PerModelTimeout: c.timeout,
-		MaxAttempts:     3,
+		Models:      c.models(),
+		MaxAttempts: 3,
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
 		temp := temperature
 		if config.IsKimiModel(model) {

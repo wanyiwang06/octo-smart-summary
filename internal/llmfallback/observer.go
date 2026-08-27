@@ -15,6 +15,10 @@ const (
 	PathWorkerReduce Path = "worker_reduce"
 	PathAPIRefine    Path = "api_refine"
 	PathToolCall     Path = "tool_call"
+	// PathDocumentPreview is the AI 速览 streaming endpoint
+	// (POST /v1/summaries/document/preview). It is a live route with real
+	// traffic whose latency previously landed in PathUnknown.
+	PathDocumentPreview Path = "document_preview"
 )
 
 // SwitchReason explains why Run advanced from one model to the next. The three
