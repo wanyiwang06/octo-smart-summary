@@ -743,8 +743,9 @@ func leOf(labelsPart string) string {
 
 // TestHistogram_LabelSetMatchesCounter pins the cardinality contract. Bucket
 // series multiply by len(buckets)+3, so adding a dimension here is far more
-// expensive than on a counter. path is the only permitted label; model,
-// position, result and anything derived from request data must stay out.
+// expensive than on a counter. runDur permits path only; attemptDur also
+// permits outcome. model, position, result and anything derived from request
+// data must stay out of both.
 func TestHistogram_LabelSetMatchesCounter(t *testing.T) {
 	m := NewMetrics(fixedNow)
 	m.ObserveAttempt(llmfallback.AttemptEvent{

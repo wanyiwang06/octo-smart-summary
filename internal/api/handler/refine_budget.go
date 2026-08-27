@@ -18,19 +18,40 @@ import (
 // hanging primary consumes the whole budget and no fallback attempt can start,
 // so LLM_FALLBACK_MODELS is effectively inert on refine.
 //
-// For a fallback to get one full attempt the budget must satisfy roughly:
+// Sizing this correctly requires the runner's ACTUAL retry semantics, which are
+// harsher than they look. Run gives the primary all MaxAttempts (3) attempts
+// before it considers another model, and the early-escalation guard that would
+// cut that short is deliberately not armed here (see service/llm.go). A hanging
+// attempt is cut by http.Client.Timeout and classified RetrySameModel, so it
+// costs a full LLM_TIMEOUT and the loop continues; only when the PARENT deadline
+// fires inside an attempt does it classify Terminal, at which point Run returns
+// without ever trying a fallback. So:
 //
-//	REFINE_TIMEOUT >= 2 * LLM_TIMEOUT + backoff
+//	fallback gets one complete attempt  <=>  REFINE_TIMEOUT >= (MaxAttempts+1)*LLM_TIMEOUT + backoffs
+//	                                                        =  4*180s + 3s = 723s at defaults
+//	fallback cannot start at all         <=  REFINE_TIMEOUT <  MaxAttempts*LLM_TIMEOUT + backoffs
+//	                                                        =  3*180s + 3s = 543s at defaults
 //
-// This file deliberately does NOT raise the default to satisfy that: 90s is the
-// latency users experience today on a path that currently errors at 90s, and
-// the right value depends on the refine percentiles that
+// An earlier revision of this comment stated 2*LLM_TIMEOUT + backoff, which was
+// only true under a budget-guard behaviour that was reverted. Following that
+// number would have put an operator squarely in the second regime while
+// believing they were in the first.
+//
+// This file deliberately does NOT raise the default to reach 723s: 90s is the
+// latency users experience today on a path that currently errors at 90s, and an
+// eightfold increase in worst-case refine latency is not a change to make
+// blind. The right value depends on the refine percentiles that
 // llm_run_duration_seconds now exposes (#220 defers the number to measured
 // P95/P99). What changes here is only that the value stops being welded into
 // four call sites.
+//
+// Note also that on the two STREAMING refine handlers this bounds the LLM run,
+// not the request: both clear the response write deadline before streaming, so
+// a connected-but-not-reading client is bounded by neither this value nor a
+// server WriteTimeout. That predates this knob.
 const defaultRefineTimeout = 90 * time.Second
 
-// Clamp bounds for REFINE_TIMEOUT.
+// maxRefineTimeout bounds REFINE_TIMEOUT.
 //
 // Parsing alone is not enough to make a typo safe. Two values parse cleanly and
 // are still wrong in ways that are invisible in production:
@@ -43,11 +64,12 @@ const defaultRefineTimeout = 90 * time.Second
 //     already-expired context — all four handlers would fail instantly, and
 //     silently.
 //
-// Clamping converts both into a bounded, logged deviation.
-const (
-	minRefineTimeout = 1 * time.Second
-	maxRefineTimeout = 30 * time.Minute
-)
+// The ceiling comfortably clears the worst-case reachable run
+// ((MaxAttempts+1)*LLM_TIMEOUT + backoffs = 723s at defaults) so it never
+// silently truncates a legitimately-sized budget. There is no floor constant:
+// the <= 0 rejection below already guarantees at least 1s, so a floor clamp
+// would be unreachable code.
+const maxRefineTimeout = 30 * time.Minute
 
 // refineTimeoutEnvVar overrides the refine budget, in seconds.
 const refineTimeoutEnvVar = "REFINE_TIMEOUT"
@@ -60,9 +82,9 @@ var refineTimeoutWarnOnce sync.Once
 // refineTimeout returns the refine LLM budget.
 //
 // An unset value keeps the historical 90s. An unparsable or non-positive value
-// also keeps 90s; an out-of-range value is clamped into [1s, 30m]. Every
-// deviation from the configured input is logged once, so a typo is visible
-// instead of silently reshaping every refine request.
+// also keeps 90s; a value above the ceiling is clamped to it. Every deviation
+// from the configured input is logged once, so a typo is visible instead of
+// silently reshaping every refine request.
 //
 // Read from the environment rather than threaded through config.Config,
 // following agentStepTimeoutOverride's precedent in agent/profile.go: these
@@ -72,23 +94,22 @@ func refineTimeout() time.Duration {
 	if raw == "" {
 		return defaultRefineTimeout
 	}
-	secs, err := strconv.Atoi(raw)
+	// ParseInt with an explicit 64-bit width rather than Atoi: Atoi returns a
+	// platform-width int, so on a 32-bit build a value like 9223372036854775807
+	// would take the ErrRange path instead of being clamped, making the
+	// behaviour architecture-dependent.
+	secs, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || secs <= 0 {
 		warnRefineTimeoutOnce("%s=%q is not a positive integer; using default %s", refineTimeoutEnvVar, raw, defaultRefineTimeout)
 		return defaultRefineTimeout
 	}
-	// Guard the multiplication itself: seconds beyond this bound cannot be
-	// represented and would wrap to a negative duration.
-	if secs > int(maxRefineTimeout/time.Second) {
+	// Check before multiplying: seconds beyond this bound cannot be represented
+	// and would wrap to a negative duration.
+	if secs > int64(maxRefineTimeout/time.Second) {
 		warnRefineTimeoutOnce("%s=%q exceeds the maximum %s; clamped", refineTimeoutEnvVar, raw, maxRefineTimeout)
 		return maxRefineTimeout
 	}
-	d := time.Duration(secs) * time.Second
-	if d < minRefineTimeout {
-		warnRefineTimeoutOnce("%s=%q is below the minimum %s; clamped", refineTimeoutEnvVar, raw, minRefineTimeout)
-		return minRefineTimeout
-	}
-	return d
+	return time.Duration(secs) * time.Second
 }
 
 func warnRefineTimeoutOnce(format string, args ...any) {

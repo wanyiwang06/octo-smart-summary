@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"os"
 	"testing"
 	"time"
 )
@@ -24,7 +25,7 @@ func TestRefineTimeout_ParseTable(t *testing.T) {
 		{name: "whitespace only is treated as unset", set: true, env: "   ", want: defaultRefineTimeout},
 		{name: "plain value", set: true, env: "120", want: 120 * time.Second},
 		{name: "surrounding whitespace is tolerated", set: true, env: "  120  ", want: 120 * time.Second},
-		{name: "at the minimum", set: true, env: "1", want: time.Second},
+		{name: "one second is the smallest accepted value", set: true, env: "1", want: time.Second},
 		{name: "at the maximum", set: true, env: "1800", want: maxRefineTimeout},
 
 		// Malformed input must degrade to the default, never to "no deadline".
@@ -43,12 +44,23 @@ func TestRefineTimeout_ParseTable(t *testing.T) {
 		// all four endpoints instantly and silently.
 		{name: "int64 max does not wrap negative", set: true, env: "9223372036854775807", want: maxRefineTimeout},
 		{name: "beyond int64 is unparsable", set: true, env: "99999999999999999999", want: defaultRefineTimeout},
+
+		// The budget at which a fallback model gets one complete attempt under
+		// the runner's real semantics: (MaxAttempts+1)*LLM_TIMEOUT + backoffs
+		// = 4*180 + 3. Documented in CONFIGURATION.md and refine_budget.go, and
+		// it must be expressible through this knob rather than hitting the
+		// ceiling.
+		{name: "the documented fallback-reachable budget is expressible", set: true, env: "723", want: 723 * time.Second},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.set {
-				t.Setenv(refineTimeoutEnvVar, tc.env)
+			// t.Setenv first even in the unset case: it registers the cleanup
+			// AND lets Unsetenv pin the row against an ambient REFINE_TIMEOUT in
+			// the developer's shell, which would otherwise make this row lie.
+			t.Setenv(refineTimeoutEnvVar, tc.env)
+			if !tc.set {
+				os.Unsetenv(refineTimeoutEnvVar)
 			}
 			got := refineTimeout()
 			if got != tc.want {
@@ -59,8 +71,8 @@ func TestRefineTimeout_ParseTable(t *testing.T) {
 			if got <= 0 {
 				t.Errorf("refineTimeout() = %v; a non-positive budget builds an already-expired context", got)
 			}
-			if got < minRefineTimeout || got > maxRefineTimeout {
-				t.Errorf("refineTimeout() = %v, outside the clamp range [%v, %v]", got, minRefineTimeout, maxRefineTimeout)
+			if got > maxRefineTimeout {
+				t.Errorf("refineTimeout() = %v, above the ceiling %v", got, maxRefineTimeout)
 			}
 		})
 	}

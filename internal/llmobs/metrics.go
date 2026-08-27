@@ -293,7 +293,7 @@ func NewMetrics(nowFn func() time.Time) *Metrics {
 		calls: newCounterVec("llm_calls_total",
 			"Completed LLM calls by call path, the position of the model that served them, and the outcome: ok; failed (no model could serve it); cancelled (the caller went away — not an upstream fault, do not alert on it); timeout (our own deadline expired before any model answered — nobody walked away, so this one IS alertable)."),
 		callSecs: newCounterVec("llm_call_duration_seconds_total",
-			"Cumulative wall-clock seconds spent in llmfallback.Run, by call path. Labelled by path only, so a mean needs sum by(path)(llm_call_duration_seconds_total) / sum by(path)(llm_calls_total) — dividing the raw series returns an empty vector."),
+			"DEPRECATED, prefer llm_run_duration_seconds: this counter is now exactly that histogram's _sum, fed from the same ResultEvent.Duration, and two hand-maintained copies of one quantity will diverge the first time somebody edits one observe site. Retained so existing dashboards keep working. Cumulative wall-clock seconds spent in llmfallback.Run, by call path; a mean needs sum by(path)(llm_call_duration_seconds_total) / sum by(path)(llm_calls_total)."),
 		// Named llm_RUN_duration_seconds, not llm_call_duration_seconds: the
 		// latter would collide with the existing llm_call_duration_seconds_total
 		// counter under OpenMetrics, where a counter's family name is its name
@@ -313,7 +313,7 @@ func NewMetrics(nowFn func() time.Time) *Metrics {
 		// not, because the P99 IS the retried runs. Sizing a per-attempt cap
 		// from the run distribution therefore over-estimates systematically.
 		attemptDur: newHistogramVec("llm_attempt_duration_seconds",
-			"Distribution of a SINGLE upstream attempt's wall-clock, by call path and classified outcome. This is the series to size the per-attempt LLM_TIMEOUT from; llm_run_duration_seconds includes backoffs and other models and will over-estimate it.",
+			"Distribution of a SINGLE upstream attempt's wall-clock, by call path and classified outcome. Use it to size the per-attempt LLM_TIMEOUT; llm_run_duration_seconds includes backoffs and other models and will over-estimate it. CENSORED ON THE RIGHT: every attempt is already capped by the current LLM_TIMEOUT, so an upstream that would have taken longer is recorded at the cap and the top bucket is a pile-up, not a tail. Sound for deciding whether to LOWER the cap; it cannot tell you what raising it would recover.",
 			durationBuckets),
 		lastOK: newGaugeVec("llm_primary_last_success_timestamp_seconds",
 			"Unix timestamp of the most recent successful call served by the PRIMARY model, per call path. A stale value means sustained silent degradation onto a fallback."),
@@ -334,6 +334,11 @@ func (m *Metrics) ObserveAttempt(e llmfallback.AttemptEvent) {
 	// here would scale the series count with the configured model list. outcome
 	// is kept because a timed-out attempt and a fast 403 have different
 	// distributions and folding them together is what hides a degrading model.
+	//
+	// outcome is not free either, and the arithmetic belongs here so the next
+	// person adding a label sees the real cost: paths x outcomes x (buckets+3)
+	// = 8 x 4 x 15 = ~480 series for this family, against 8 x 15 = 120 for
+	// runDur. That is affordable; a third dimension likely is not.
 	m.attemptDur.observe(labels(
 		"path", string(e.Path),
 		"outcome", outcomeLabel(e.Outcome),
