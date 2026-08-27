@@ -33,6 +33,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 
 	"gorm.io/gorm"
@@ -44,6 +45,11 @@ import (
 // the existing binding to decide replay vs mismatch (parallels
 // errBotIdempotencyConflict in bot_summary_create.go).
 var errAgentSaveIdempotencyConflict = errors.New("agent save idempotency conflict")
+
+// errAgentMessageRunMismatch is returned only after the message itself has
+// passed the owner/session/role checks. It therefore means the selected draft's
+// persisted run binding is stale or conflicts with the caller's request_id.
+var errAgentMessageRunMismatch = errors.New("agent message does not match summary run")
 
 // Reuse the bot handler's Idempotency-Key regex + length cap so the two
 // user-facing endpoints share one canonical validation rule. Declared here as
@@ -103,6 +109,30 @@ func loadAgentMessageForSave(db *gorm.DB, sessionID, userID string, messageID in
 		return model.AgentMessage{}, err
 	}
 	return msg, nil
+}
+
+// resolveAgentMessageRequestID makes the server-persisted message→run binding
+// authoritative before any deliverable rows are written. New messages can
+// derive a missing request_id and reject an explicit mismatch; legacy messages
+// (RunID empty) preserve the previous request_id-based behaviour.
+func resolveAgentMessageRequestID(ctx context.Context, db *gorm.DB, userID, sessionID, requestID string, msg model.AgentMessage) (string, error) {
+	if msg.RunID == "" {
+		return requestID, nil
+	}
+	run, err := summaryrun.NewStore(db).GetByID(ctx, userID, msg.RunID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", fmt.Errorf("%w: bound run not found", errAgentMessageRunMismatch)
+		}
+		return "", err
+	}
+	if run.SessionID != sessionID {
+		return "", fmt.Errorf("%w: session differs", errAgentMessageRunMismatch)
+	}
+	if requestID != "" && requestID != run.RequestID {
+		return "", fmt.Errorf("%w: request differs", errAgentMessageRunMismatch)
+	}
+	return run.RequestID, nil
 }
 
 // canonicalAgentSaveRequestHash returns a deterministic sha256 fingerprint of

@@ -333,17 +333,15 @@ func buildSelectedChannelsPrompt(selected []selectedChannel) string {
 	return b.String()
 }
 
+// toolChannelType is the handler-local alias for agent.ToolChannelType, the ONE
+// definition of the chat-type string → fetch_channel integer mapping. It stays a
+// thin forwarder (rather than the mapping itself) because the SS-12-b coverage
+// gate lives in internal/agent and prints the same value in the same argument
+// slot: two copies is precisely how the gate ended up emitting the Spec's STRING
+// type into an INTEGER parameter, which fetch_channel rejects during argument
+// decoding — before recordFetch runs, so the channel stayed "never attempted".
 func toolChannelType(chatType string) int {
-	switch chatType {
-	case "direct":
-		return 1
-	case "group":
-		return 2
-	case "thread":
-		return 5
-	default:
-		return 0
-	}
+	return agent.ToolChannelType(chatType)
 }
 
 func truncateRunes(s string, max int) string {
@@ -372,9 +370,11 @@ func truncateRunes(s string, max int) string {
 // second fetch_channel, the model re-calls it and it works, the summary is
 // complete — and the user was shown finish_status=FAILED on a good deliverable.
 //
-// The hooks run concurrently from the tool worker pool, so state is mutex-guarded
-// and DB writes use a fresh context (the request context may already be canceled
-// by the very error being reported); SetStatus is a plain idempotent UPDATE.
+// The runner settles each tool step as a batch (errors before successes), so a
+// same-step success deterministically clears a duplicate sibling failure for the
+// same key. State remains mutex-guarded for direct/test callers, and DB writes use
+// a fresh context (the request context may already be canceled by the very error
+// being reported); SetStatus is a plain idempotent UPDATE.
 func (h *AgentChatHandler) attachToolErrorHook(runner *agent.Runner, userID, runID string) {
 	if runner == nil || userID == "" || runID == "" || h.runStore == nil {
 		return
@@ -512,12 +512,15 @@ func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid strin
 		// Idempotent replay: the run already exists (e.g. SSE downgrade reusing
 		// the same request_id). Reuse its run_id; do not re-persist the spec.
 		//
-		// But DO clear a status=failed latched by the previous attempt. The
-		// SS-07b fatal marker lives in the per-runner hook closure, so the new
-		// attempt's OnToolSuccess cannot clear a marker it never set; without this
-		// reset a clean regenerated summary inherits the earlier attempt's failure
-		// and finalizeRun discloses FAILED for a good deliverable. Best-effort:
-		// a reset failure only costs the stale verdict, never the reply.
+		// Clear only the task-flow failure latched by the previous attempt.
+		// The SS-07b fatal marker lives in the per-runner hook closure, so the new
+		// attempt's OnToolSuccess cannot clear a marker it never set. Output
+		// truncation is deliberately NOT cleared here: attempt B may fail before it
+		// persists a replacement, leaving attempt A's message as the deliverable.
+		// Each final assistant row carries its own attempt-local truncation fact, so
+		// the save path can judge the selected message without mutating shared state
+		// at replay entry. Best-effort: a status reset failure only costs the stale
+		// verdict, never the reply.
 		if err := h.runStore.ClearFailedStatusForReplay(ctx, uid, run.RunID); err != nil {
 			log.Printf("[agent] v2 clear failed status on replay (run=%s): %v", run.RunID, err)
 		}
@@ -613,6 +616,11 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, apiResponse{Code: 40100, Message: "missing auth context"})
 		return
 	}
+	// The runner itself (not only tool handlers) records planner-answer
+	// degradations against the owner-scoped summary run. Use the bookkeeping-only
+	// key here: ContextKeyUID remains confined to buildRegistryWithUID so adding a
+	// future tool to the chat profile cannot silently widen its data-access scope.
+	ctx = context.WithValue(ctx, agent.ContextKeyRunOwnerID, uid)
 
 	// SS-03: persist the run/spec when V2 mode is enabled. Off → skipped entirely
 	// (byte-identical to pre-SS-03). Best-effort; never blocks the reply. The
@@ -712,6 +720,10 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 	traceOutcome := "panic"
 	defer func() { trace.Report(traceOutcome) }()
 
+	// SS-12-b coverage enforcement is NOT here: it lives inside summarize_chunk,
+	// before the citation manifest freezes (internal/agent/coverage_gate.go). A
+	// post-answer repair round fetches after the freeze, so its messages are not
+	// citable and get dropped — see that file for the full argument.
 	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
 	if err != nil {
 		traceOutcome = "error"
@@ -922,6 +934,9 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 		h.writeSSEErrorViaSink(sink, 40100, "missing auth context")
 		return
 	}
+	// ChatStream must carry the same runner-level bookkeeping identity as Chat.
+	// Tool authorization still uses the narrower buildRegistryWithUID wrapper.
+	ctx = context.WithValue(ctx, agent.ContextKeyRunOwnerID, uid)
 
 	// SS-03: persist run/spec when V2 mode is enabled (see Chat). Off → skipped.
 	// The returned run_id is injected into the tool context for the citation pass.
@@ -1018,7 +1033,8 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	traceOutcome := "panic"
 	defer func() { trace.Report(traceOutcome) }()
 
-	// Run agent with history
+	// Run agent with history. Coverage enforcement happens inside the run
+	// (summarize_chunk's pre-freeze gate), not around it — see Chat().
 	reply, newMsgs, err := runner.RunWithHistory(ctx, system, history, req.Message)
 	if err != nil {
 		traceOutcome = "error"
@@ -1139,6 +1155,14 @@ func safeErrorDetail(err error) string {
 	case strings.Contains(err.Error(), "LLM returned empty response with no tool_calls"):
 		// runner.go final-step empty content guard (SUM-158 blocker follow-up).
 		return "LLM returned empty response with no tool_calls at final step"
+	case strings.Contains(err.Error(), "successful Map retries and Reduce required before final answer"):
+		// runner.go final-step completeness gate: the model never landed a
+		// successful merge_summaries over every Map handle (or left a Map retry
+		// outstanding). Generic "internal error" is actively misleading here —
+		// nothing broke server-side, the run failed to converge on a complete
+		// summary — and the wording is a constant errors.New with no interpolated
+		// data, so it is safe to pass through.
+		return "successful Map retries and Reduce required before final answer"
 	case strings.Contains(err.Error(), "unknown agent profile"):
 		// profile.go GetProfile lookup miss.
 		return "unknown agent profile"

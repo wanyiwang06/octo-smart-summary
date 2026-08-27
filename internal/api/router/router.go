@@ -5,6 +5,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/handler"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/api/ws"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmobs"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/streaming"
@@ -25,6 +26,12 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Content-Type,Authorization,Token,X-Space-Id,Accept,Accept-Language,Idempotency-Key")
+		// Without this, a cross-origin browser client can read only the CORS-safelisted
+		// response headers. Retry-After is what /summaries/document/preview returns
+		// alongside 429 to say HOW LONG to back off; unexposed, the front-end gets the
+		// status but not the advice, which is the difference between a contract and a
+		// suggestion.
+		c.Header("Access-Control-Expose-Headers", "Retry-After")
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)
 			return
@@ -165,6 +172,9 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	// reference-based chat flow — see CHAT-REFERENCE-BASED-DESIGN-v1.)
 	agentSummaryH := handler.NewAgentSummaryHandler(db, imDB, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
 	v1.POST("/summaries/agent", agentSummaryH.CreateAgentSummary)
+	// Document "AI 速览": ephemeral streaming quick-glance, never persisted. See
+	// handler/document_preview.go.
+	v1.POST("/summaries/document/preview", agentSummaryH.StreamDocumentPreview)
 
 	return r
 }
@@ -178,6 +188,15 @@ func SetupInternal(hub *ws.Hub, streamHub ...*streaming.Hub) (*gin.Engine, *hand
 	intH := handler.NewInternalHandler(hub)
 	r.GET("/internal/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+	// Prometheus scrape target. Deliberately on the INTERNAL router only: it
+	// exposes model identifiers and failure volumes, which are operational
+	// details that should not be reachable from the public listener.
+	r.GET("/internal/metrics", func(c *gin.Context) {
+		c.Header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		if m := llmobs.Default(); m != nil {
+			m.WritePrometheus(c.Writer)
+		}
 	})
 	r.POST("/internal/task-event", intH.TaskEvent)
 	r.POST("/internal/worker-trigger", intH.WorkerTrigger)
