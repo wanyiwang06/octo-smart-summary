@@ -77,11 +77,27 @@ func parseExposition(t *testing.T, out string) map[string]*family {
 				t.Errorf("sample line is not name{labels} value: %q", line)
 				continue
 			}
-			if fams[name] == nil {
+			// A histogram publishes ONE HELP/TYPE header under its base name but
+			// emits samples under _bucket/_sum/_count. Resolve those back to the
+			// base family instead of reporting a missing header, which is what
+			// a real scraper does.
+			fam := fams[name]
+			if fam == nil {
+				for _, suffix := range []string{"_bucket", "_sum", "_count"} {
+					if !strings.HasSuffix(name, suffix) {
+						continue
+					}
+					if base := fams[strings.TrimSuffix(name, suffix)]; base != nil && base.typ == "histogram" {
+						fam = base
+						break
+					}
+				}
+			}
+			if fam == nil {
 				t.Errorf("sample for %q has no HELP/TYPE header", name)
 				continue
 			}
-			fams[name].samples = append(fams[name].samples, line)
+			fam.samples = append(fam.samples, line)
 		}
 	}
 	return fams
@@ -128,6 +144,7 @@ func TestWritePrometheus_ExpositionFormat(t *testing.T) {
 		"llm_model_switch_total":                     "counter",
 		"llm_calls_total":                            "counter",
 		"llm_call_duration_seconds_total":            "counter",
+		"llm_call_duration_seconds":                  "histogram",
 		"llm_primary_last_success_timestamp_seconds": "gauge",
 	}
 	for name, typ := range want {
@@ -637,5 +654,139 @@ func TestWritePrometheus_CarriageReturnIsFlattenedNotEscaped(t *testing.T) {
 	// And the series is still there, flattened rather than dropped.
 	if !strings.Contains(out, `model="we ird-model"`) {
 		t.Errorf("CR should flatten to a space, keeping the series intact:\n%s", out)
+	}
+}
+
+// TestHistogram_QuantileInputsAreExact is the reason this histogram exists: the
+// pre-existing llm_call_duration_seconds_total is a cumulative sum, and a sum
+// over a mixed workload (sub-second refines alongside 60-100s long-context
+// agent turns) yields a mean that describes no real request. #220 defers the
+// final LLM_TIMEOUT to measured P95/P99, which needs bucket counts.
+//
+// The assertions are on exact cumulative values, not on "some bucket moved":
+// an off-by-one in the boundary search still produces plausible-looking output.
+func TestHistogram_QuantileInputsAreExact(t *testing.T) {
+	m := NewMetrics(fixedNow)
+	// Deliberately spans boundaries: 0.25 and 0.5 land in le=0.5 (SearchFloat64s
+	// is lower-bound, so a sample exactly ON a boundary belongs to that bucket,
+	// which is what the exposition format requires), 75 lands in le=90, and 400
+	// exceeds the last finite boundary so it may only appear in +Inf.
+	for _, d := range []time.Duration{
+		250 * time.Millisecond,
+		500 * time.Millisecond,
+		75 * time.Second,
+		400 * time.Second,
+	} {
+		m.ObserveResult(llmfallback.ResultEvent{
+			Path: llmfallback.PathAgentChat, Model: "p", Position: llmfallback.PositionPrimary,
+			OK: true, Duration: d,
+		})
+	}
+
+	var buf bytes.Buffer
+	m.WritePrometheus(&buf)
+	fams := parseExposition(t, buf.String())
+
+	f := fams["llm_call_duration_seconds"]
+	if f == nil {
+		t.Fatal("missing llm_call_duration_seconds family")
+	}
+	if f.typ != "histogram" {
+		t.Errorf("TYPE = %q, want histogram", f.typ)
+	}
+
+	got := map[string]string{}
+	for _, line := range f.samples {
+		name, rest, _ := strings.Cut(line, "{")
+		labelsPart, val, _ := strings.Cut(rest, "} ")
+		key := name
+		if le := leOf(labelsPart); le != "" {
+			key = name + "|" + le
+		}
+		got[key] = val
+	}
+
+	// Cumulative: each bucket counts everything at or below its boundary.
+	want := map[string]string{
+		"llm_call_duration_seconds_bucket|0.5":  "2",
+		"llm_call_duration_seconds_bucket|1":    "2",
+		"llm_call_duration_seconds_bucket|60":   "2",
+		"llm_call_duration_seconds_bucket|90":   "3",
+		"llm_call_duration_seconds_bucket|300":  "3",
+		"llm_call_duration_seconds_bucket|+Inf": "4",
+		"llm_call_duration_seconds_count":       "4",
+		"llm_call_duration_seconds_sum":         "475.75",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %q, want %q", k, got[k], v)
+		}
+	}
+
+	// The over-range sample must still reach _sum/_count. A histogram that
+	// drops outliers hides exactly the tail these percentiles are for.
+	if got["llm_call_duration_seconds_bucket|300"] == got["llm_call_duration_seconds_bucket|+Inf"] {
+		t.Error("the 400s sample never reached +Inf; over-range observations are being dropped")
+	}
+}
+
+// leOf extracts the le dimension from a rendered label set.
+func leOf(labelsPart string) string {
+	for _, kv := range strings.Split(labelsPart, ",") {
+		if rest, ok := strings.CutPrefix(kv, `le="`); ok {
+			return strings.TrimSuffix(rest, `"`)
+		}
+	}
+	return ""
+}
+
+// TestHistogram_LabelSetMatchesCounter pins the cardinality contract. Bucket
+// series multiply by len(buckets)+3, so adding a dimension here is far more
+// expensive than on a counter. path is the only permitted label; model,
+// position, result and anything derived from request data must stay out.
+func TestHistogram_LabelSetMatchesCounter(t *testing.T) {
+	m := NewMetrics(fixedNow)
+	m.ObserveResult(llmfallback.ResultEvent{
+		Path: llmfallback.PathWorkerMap, Model: "primary-a", Position: llmfallback.PositionPrimary,
+		OK: true, Duration: time.Second,
+	})
+
+	var buf bytes.Buffer
+	m.WritePrometheus(&buf)
+	fams := parseExposition(t, buf.String())
+
+	for _, line := range fams["llm_call_duration_seconds"].samples {
+		_, rest, _ := strings.Cut(line, "{")
+		labelsPart, _, _ := strings.Cut(rest, "} ")
+		for _, kv := range strings.Split(labelsPart, ",") {
+			key, _, _ := strings.Cut(kv, "=")
+			if key != "path" && key != "le" {
+				t.Errorf("unexpected histogram label %q in %q: bucket series must stay bounded by path alone", key, line)
+			}
+		}
+	}
+}
+
+// TestHistogram_ConcurrentObserveIsRaceFree covers the worker's parallel Map
+// chunks: several goroutines observe onto the same series at once.
+func TestHistogram_ConcurrentObserveIsRaceFree(t *testing.T) {
+	m := NewMetrics(fixedNow)
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.ObserveResult(llmfallback.ResultEvent{
+				Path: llmfallback.PathWorkerMap, Model: "p", Position: llmfallback.PositionPrimary,
+				OK: true, Duration: 100 * time.Millisecond,
+			})
+		}()
+	}
+	wg.Wait()
+
+	var buf bytes.Buffer
+	m.WritePrometheus(&buf)
+	if !strings.Contains(buf.String(), `llm_call_duration_seconds_count{path="worker_map"} 50`) {
+		t.Errorf("lost observations under concurrency:\n%s", buf.String())
 	}
 }

@@ -266,9 +266,19 @@ func (c *LLMClient) callWithPolicyAndModel(ctx context.Context, messages []ChatM
 	}
 	// Keep retry ownership in the shared runner: exhaust transient failures on
 	// one model before switching to the next model.
+	//
+	// PerModelTimeout is what arms the runner's deadline-aware escalation: before
+	// sleeping a backoff it checks whether the remaining parent budget can still
+	// fit that sleep, the pending retry AND one full attempt on the next model,
+	// and escalates early (SwitchReason budget_starved) when it cannot. Omitting
+	// it silently disabled that guard on every worker Map/Reduce and API refine
+	// call — the agent path (agent/llm.go) and CallWithTools already pass it —
+	// so those paths would spend the primary's whole retry budget and hand the
+	// fallback whatever was left, which is the starvation #220 describes.
 	res, usedModel, err := llmfallback.Run(ctx, llmfallback.Config{
-		Models:      c.models(),
-		MaxAttempts: 3,
+		Models:          c.models(),
+		PerModelTimeout: c.timeout,
+		MaxAttempts:     3,
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
 		temp := temperature
 		if config.IsKimiModel(model) {
@@ -390,9 +400,13 @@ func (c *LLMClient) callStreamWithModel(ctx context.Context, messages []ChatMess
 	// would double-emit. Failures after HTTP 200 but before the first delivered
 	// delta may still try the next model. Transient failures exhaust the current
 	// model's retry budget before switching models.
+	//
+	// PerModelTimeout arms the deadline-aware escalation; see the note in
+	// callWithPolicyAndModel for why leaving it unset starves the fallback.
 	res, usedModel, err := llmfallback.Run(ctx, llmfallback.Config{
-		Models:      c.models(),
-		MaxAttempts: 3,
+		Models:          c.models(),
+		PerModelTimeout: c.timeout,
+		MaxAttempts:     3,
 	}, func(ctx context.Context, model string) (result, llmfallback.Outcome, error) {
 		temp := temperature
 		if config.IsKimiModel(model) {
@@ -926,12 +940,14 @@ func buildReduceByPersonMessages(participantSummaries []struct{ Name, Summary st
 // CallReduceByPerson merges participant-level summaries.
 // Each participant is assigned a [Pn] tag that the LLM should reference in the output.
 func (c *LLMClient) CallReduceByPerson(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) (string, int, error) {
+	ctx = llmfallback.WithPath(ctx, llmfallback.PathWorkerReduce)
 	content, tokens, _, err := c.callDisclosingTerminalReduceWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic))
 	return content, tokens, err
 }
 
 // CallReduceByPersonWithModel is CallReduceByPerson with the actual producing model included.
 func (c *LLMClient) CallReduceByPersonWithModel(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string) (string, int, string, error) {
+	ctx = llmfallback.WithPath(ctx, llmfallback.PathWorkerReduce)
 	return c.callDisclosingTerminalReduceWithModel(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic))
 }
 
@@ -939,6 +955,7 @@ func (c *LLMClient) CallReduceByPersonWithModel(ctx context.Context, participant
 // final team summary. Each participant is assigned a [Pn] tag that the LLM should
 // reference in the output.
 func (c *LLMClient) CallReduceByPersonStream(ctx context.Context, participantSummaries []struct{ Name, Summary string }, startTime, endTime string, topic string, onDelta func(string) error) (string, int, error) {
+	ctx = llmfallback.WithPath(ctx, llmfallback.PathWorkerReduce)
 	return c.callStreamWithTruncationNotice(ctx, buildReduceByPersonMessages(participantSummaries, startTime, endTime, topic), 0.1, onDelta)
 }
 

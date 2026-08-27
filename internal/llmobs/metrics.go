@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -143,6 +144,123 @@ func (g *gaugeVec) write(w io.Writer) {
 	}
 }
 
+// durationBuckets are the shared second-boundaries for every latency
+// histogram in this package.
+//
+// Why a histogram at all, next to the existing callSecs counter: a cumulative
+// seconds total divided by a call count yields a MEAN, and a mean cannot
+// answer the question the timeout work actually asks. #220 defers the final
+// LLM_TIMEOUT to per-scenario P95/P99, and long-context agent turns are
+// documented at 60-100s while a refine is sub-second — an average over that
+// mix describes no real request.
+//
+// The layout is fixed at package scope on purpose. Per-call-site buckets would
+// make cross-path comparison meaningless, and bucket count is the cardinality
+// cost here (series = paths x (len(buckets)+3)), so this list stays short and
+// spans a sub-second refine through a 300s long-context turn in one series.
+var durationBuckets = []float64{0.5, 1, 2, 5, 10, 20, 30, 60, 90, 120, 180, 300}
+
+// histogramVec is a labelled cumulative histogram.
+//
+// Buckets are stored as per-bucket hit counts and made cumulative only at
+// render time: an observation touches exactly one slot, so the write path
+// stays O(log n) on the boundary search and O(1) on the update, which matters
+// because ObserveResult runs on every LLM call.
+type histogramVec struct {
+	name    string
+	help    string
+	buckets []float64
+	mu      sync.Mutex
+	counts  map[labelSet][]uint64
+	sums    map[labelSet]float64
+	totals  map[labelSet]uint64
+}
+
+func newHistogramVec(name, help string, buckets []float64) *histogramVec {
+	return &histogramVec{
+		name:    name,
+		help:    help,
+		buckets: buckets,
+		counts:  map[labelSet][]uint64{},
+		sums:    map[labelSet]float64{},
+		totals:  map[labelSet]uint64{},
+	}
+}
+
+// observe records one sample. Values above the last boundary still count
+// toward _sum and _count (and the +Inf bucket), so a pathological outlier is
+// never silently dropped from the total.
+func (h *histogramVec) observe(l labelSet, v float64) {
+	// A negative duration cannot happen from a monotonic clock, but a bad
+	// caller must not corrupt _sum for everyone else on this series.
+	if v < 0 {
+		v = 0
+	}
+	i := sort.SearchFloat64s(h.buckets, v)
+	h.mu.Lock()
+	if h.counts[l] == nil {
+		h.counts[l] = make([]uint64, len(h.buckets))
+	}
+	if i < len(h.buckets) {
+		h.counts[l][i]++
+	}
+	h.sums[l] += v
+	h.totals[l]++
+	h.mu.Unlock()
+}
+
+func (h *histogramVec) write(w io.Writer) {
+	h.mu.Lock()
+	keys := make([]labelSet, 0, len(h.counts))
+	snapCounts := make(map[labelSet][]uint64, len(h.counts))
+	for k, v := range h.counts {
+		keys = append(keys, k)
+		c := make([]uint64, len(v))
+		copy(c, v)
+		snapCounts[k] = c
+	}
+	snapSums := make(map[labelSet]float64, len(h.sums))
+	for k, v := range h.sums {
+		snapSums[k] = v
+	}
+	snapTotals := make(map[labelSet]uint64, len(h.totals))
+	for k, v := range h.totals {
+		snapTotals[k] = v
+	}
+	h.mu.Unlock()
+
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s histogram\n", h.name, h.help, h.name)
+	for _, k := range keys {
+		var cum uint64
+		for i, b := range h.buckets {
+			cum += snapCounts[k][i]
+			fmt.Fprintf(w, "%s_bucket{%s} %d\n", h.name, withLE(k, formatBucket(b)), cum)
+		}
+		total := snapTotals[k]
+		fmt.Fprintf(w, "%s_bucket{%s} %d\n", h.name, withLE(k, "+Inf"), total)
+		fmt.Fprintf(w, "%s_sum{%s} %g\n", h.name, k, snapSums[k])
+		fmt.Fprintf(w, "%s_count{%s} %d\n", h.name, k, total)
+	}
+}
+
+// withLE appends the le dimension that the histogram exposition format
+// requires. It is built here rather than by the caller so no observe path can
+// forget it and emit a bucket line a scraper will reject.
+func withLE(l labelSet, le string) labelSet {
+	if l == "" {
+		return labelSet(`le="` + le + `"`)
+	}
+	return l + labelSet(`,le="`+le+`"`)
+}
+
+// formatBucket renders a boundary the way the text format expects: the
+// shortest representation that round-trips, so 0.5 stays "0.5" and 60 stays
+// "60" rather than "60.000000".
+func formatBucket(b float64) string {
+	return strconv.FormatFloat(b, 'g', -1, 64)
+}
+
 // Metrics is the LLM fallback metric set. The zero value is not usable; call
 // NewMetrics.
 type Metrics struct {
@@ -150,6 +268,7 @@ type Metrics struct {
 	switches *counterVec
 	calls    *counterVec
 	callSecs *counterVec
+	callDur  *histogramVec
 	lastOK   *gaugeVec
 	nowFn    func() time.Time
 }
@@ -169,6 +288,9 @@ func NewMetrics(nowFn func() time.Time) *Metrics {
 			"Completed LLM calls by call path, the position of the model that served them, and the outcome: ok; failed (no model could serve it); cancelled (the caller went away — not an upstream fault, do not alert on it); timeout (our own deadline expired before any model answered — nobody walked away, so this one IS alertable)."),
 		callSecs: newCounterVec("llm_call_duration_seconds_total",
 			"Cumulative wall-clock seconds spent in llmfallback.Run, by call path. Labelled by path only, so a mean needs sum by(path)(llm_call_duration_seconds_total) / sum by(path)(llm_calls_total) — dividing the raw series returns an empty vector."),
+		callDur: newHistogramVec("llm_call_duration_seconds",
+			"Distribution of llmfallback.Run wall-clock, by call path. This is the series to take quantiles from: histogram_quantile(0.95, sum by (path, le) (rate(llm_call_duration_seconds_bucket[1h]))). The companion llm_call_duration_seconds_total only supports a mean.",
+			durationBuckets),
 		lastOK: newGaugeVec("llm_primary_last_success_timestamp_seconds",
 			"Unix timestamp of the most recent successful call served by the PRIMARY model, per call path. A stale value means sustained silent degradation onto a fallback."),
 		nowFn: nowFn,
@@ -216,6 +338,10 @@ func (m *Metrics) ObserveResult(e llmfallback.ResultEvent) {
 	}
 	m.calls.inc(labels("path", string(e.Path), "position", position, "result", result))
 	m.callSecs.add(labels("path", string(e.Path)), e.Duration.Seconds())
+	// Labelled by path only, exactly like callSecs. Adding result/position here
+	// would multiply every bucket series by those dimensions for a question the
+	// counters already answer.
+	m.callDur.observe(labels("path", string(e.Path)), e.Duration.Seconds())
 
 	if e.OK && e.Position == llmfallback.PositionPrimary {
 		m.lastOK.set(labels("path", string(e.Path)), float64(m.nowFn().Unix()))
@@ -228,6 +354,7 @@ func (m *Metrics) WritePrometheus(w io.Writer) {
 	m.switches.write(w)
 	m.calls.write(w)
 	m.callSecs.write(w)
+	m.callDur.write(w)
 	m.lastOK.write(w)
 }
 
