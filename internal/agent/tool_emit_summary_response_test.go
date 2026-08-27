@@ -1,0 +1,79 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+func TestEmitSummaryResponseSeparatesReplyFromPreview(t *testing.T) {
+	_, handler := EmitSummaryResponseTool()
+	args := json.RawMessage(`{
+		"result_type":"agent_preview",
+		"reply":"已按默认条件生成一版。",
+		"execution_target":"agent_preview",
+		"preview":{"content":"# 风险总结\n正文","version":1,"assumptions":["最近 7 天"]}
+	}`)
+
+	outcome, err := handler(context.Background(), args)
+	if err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	if outcome.VisibleContent != "已按默认条件生成一版。" {
+		t.Fatalf("VisibleContent = %q", outcome.VisibleContent)
+	}
+	if strings.Contains(outcome.VisibleContent, "# 风险总结") {
+		t.Fatal("preview document leaked into the visible reply")
+	}
+	var payload SummaryResponsePayload
+	if err := json.Unmarshal(outcome.Payload, &payload); err != nil {
+		t.Fatalf("payload is not reusable structured JSON: %v", err)
+	}
+	if payload.Preview == nil || payload.Preview.Content != "# 风险总结\n正文" {
+		t.Fatalf("preview payload lost: %+v", payload.Preview)
+	}
+}
+
+func TestEmitSummaryResponseHonorsContextAllowlist(t *testing.T) {
+	_, handler := EmitSummaryResponseTool()
+	args := json.RawMessage(`{"result_type":"agent_preview","reply":"ready","execution_target":"agent_preview","preview":{"content":"body","version":1}}`)
+
+	allowed := WithAllowedSummaryResultTypes(context.Background(), SummaryResultAgentPreview)
+	if _, err := handler(allowed, args); err != nil {
+		t.Fatalf("allowed result rejected: %v", err)
+	}
+	denied := WithAllowedSummaryResultTypes(context.Background(), SummaryResultClarification)
+	if _, err := handler(denied, args); err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("disallowed result accepted: %v", err)
+	}
+	empty := WithAllowedSummaryResultTypes(context.Background())
+	if _, err := handler(empty, args); err == nil {
+		t.Fatal("explicitly empty allowlist must deny all results")
+	}
+}
+
+func TestEmitSummaryResponseRejectsInvalidShapes(t *testing.T) {
+	_, handler := EmitSummaryResponseTool()
+	tests := []struct {
+		name string
+		args string
+		want string
+	}{
+		{name: "unknown type", args: `{"result_type":"draft","reply":"x"}`, want: "invalid result_type"},
+		{name: "missing reply", args: `{"result_type":"explanation","reply":" "}`, want: "reply is required"},
+		{name: "preview missing content", args: `{"result_type":"agent_preview","reply":"x","execution_target":"agent_preview","preview":{"content":"","version":1}}`, want: "preview content"},
+		{name: "revision missing parent", args: `{"result_type":"agent_revision","reply":"x","execution_target":"agent_preview","preview":{"content":"body","version":2}}`, want: "parent_message_id"},
+		{name: "completed not saved", args: `{"result_type":"workflow_completed","reply":"x","execution_target":"personal_workflow","workflow":{"task_id":1,"status":"completed","saved":false}}`, want: "saved=true"},
+		{name: "plain response carries preview", args: `{"result_type":"explanation","reply":"x","preview":{"content":"body","version":1}}`, want: "cannot include"},
+		{name: "unknown field", args: `{"result_type":"explanation","reply":"x","surprise":true}`, want: "unknown field"},
+		{name: "two values", args: `{"result_type":"explanation","reply":"x"} {}`, want: "multiple JSON values"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := handler(context.Background(), json.RawMessage(tt.args)); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want substring %q", err, tt.want)
+			}
+		})
+	}
+}

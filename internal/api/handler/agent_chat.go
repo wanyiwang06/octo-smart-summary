@@ -114,6 +114,10 @@ type AgentChatHandler struct {
 	// flag is off, the chat path is byte-identical to pre-SS-03 behavior.
 	runStore *summaryrun.Store
 
+	// workspace is configured by the public router for the unified smart-summary
+	// entry. Nil keeps legacy/test constructors byte-compatible.
+	workspace *summaryWorkspaceCoordinator
+
 	// test-only fields: when set, bypass dynamic runner construction
 	testRunner *agent.Runner
 	testSystem string
@@ -171,6 +175,8 @@ func (h *AgentChatHandler) buildRunnerForProfile(profileName, uid, sessionID str
 		reg, err = h.buildRegistryWithUID(uid, sessionID, refineRewriteToolNames)
 	case (profileName == "summary" || profileName == "summary_refine") && uid != "":
 		reg, err = h.buildSummaryRegistryWithUID(uid, sessionID)
+	case profileName == summaryWorkspaceProfile && uid != "":
+		reg, err = h.buildRegistryWithUID(uid, sessionID, profile.Tools)
 	default:
 		reg, err = agent.BuildRegistry(profile.Tools)
 	}
@@ -216,17 +222,27 @@ func (h *AgentChatHandler) buildSummaryRegistryWithUID(uid, sessionID string) (*
 func (h *AgentChatHandler) buildRegistryWithUID(uid, sessionID string, toolNames []string) (*agent.Registry, error) {
 	reg := agent.NewRegistry()
 	for _, name := range toolNames {
-		factory, ok := agent.GetToolFactory(name)
-		if !ok {
-			return nil, fmt.Errorf("unknown tool %q", name)
+		if factory, ok := agent.GetToolFactory(name); ok {
+			schema, origHandler := factory()
+			wrappedHandler := func(ctx context.Context, args json.RawMessage) (string, error) {
+				ctx = context.WithValue(ctx, agent.ContextKeyUID, uid)
+				ctx = context.WithValue(ctx, agent.ContextKeySessionID, sessionID)
+				return origHandler(ctx, args)
+			}
+			reg.Register(schema, wrappedHandler)
+			continue
 		}
-		schema, origHandler := factory()
-		wrappedHandler := func(ctx context.Context, args json.RawMessage) (string, error) {
-			ctx = context.WithValue(ctx, agent.ContextKeyUID, uid)
-			ctx = context.WithValue(ctx, agent.ContextKeySessionID, sessionID)
-			return origHandler(ctx, args)
+		if factory, ok := agent.GetTerminalToolFactory(name); ok {
+			schema, origHandler := factory()
+			wrappedHandler := func(ctx context.Context, args json.RawMessage) (agent.TerminalOutcome, error) {
+				ctx = context.WithValue(ctx, agent.ContextKeyUID, uid)
+				ctx = context.WithValue(ctx, agent.ContextKeySessionID, sessionID)
+				return origHandler(ctx, args)
+			}
+			reg.RegisterTerminal(schema, wrappedHandler)
+			continue
 		}
-		reg.Register(schema, wrappedHandler)
+		return nil, fmt.Errorf("unknown tool %q", name)
 	}
 	return reg, nil
 }
@@ -238,11 +254,14 @@ func (h *AgentChatHandler) buildRegistryWithUID(uid, sessionID string, toolNames
 // 若空数组或字段缺,当轮 chat 无引用材料(等同普通 chat)。
 // 见 CHAT-REFERENCE-BASED-DESIGN-v1。
 type agentChatRequest struct {
-	Message           string            `json:"message"`
-	SessionID         string            `json:"session_id"`
-	Profile           string            `json:"profile,omitempty"`
-	ReferencedTaskIDs []int64           `json:"referenced_task_ids,omitempty"`
-	SelectedChannels  []selectedChannel `json:"selected_channels,omitempty"`
+	Message           string                  `json:"message"`
+	SessionID         string                  `json:"session_id"`
+	Profile           string                  `json:"profile,omitempty"`
+	Action            string                  `json:"action,omitempty"`
+	ScopeVersion      int                     `json:"scope_version,omitempty"`
+	SummaryContext    summaryWorkspaceContext `json:"summary_context,omitempty"`
+	ReferencedTaskIDs []int64                 `json:"referenced_task_ids,omitempty"`
+	SelectedChannels  []selectedChannel       `json:"selected_channels,omitempty"`
 
 	// SS-03 (accepted always, acted on only when AGENT_SUMMARY_V2_MODE != off).
 	// RequestID is the client-generated per-submit idempotency key. Optional —
@@ -566,6 +585,10 @@ func (h *AgentChatHandler) Chat(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
 		return
 	}
+	if req.Profile == summaryWorkspaceProfile {
+		h.handleSummaryWorkspaceChat(c, req, false)
+		return
+	}
 	if req.Message == "" {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "message 不能为空"})
 		return
@@ -788,6 +811,14 @@ func (h *AgentChatHandler) History(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, apiResponse{Code: 40100, Message: "missing auth context"})
 		return
 	}
+	if strings.TrimSpace(c.Query("profile")) == summaryWorkspaceProfile {
+		if h == nil || h.workspace == nil || h.workspace.store == nil {
+			c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50300, Message: "summary workspace is not configured"})
+			return
+		}
+		h.handleSummaryWorkspaceHistory(c, sessionID, uid)
+		return
+	}
 
 	ctx := c.Request.Context()
 	history, err := h.store.LoadHistory(ctx, sessionID, uid)
@@ -849,6 +880,10 @@ func (h *AgentChatHandler) ChatStream(c *gin.Context) {
 	var req agentChatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
+		return
+	}
+	if req.Profile == summaryWorkspaceProfile {
+		h.handleSummaryWorkspaceChat(c, req, true)
 		return
 	}
 	if req.Message == "" {

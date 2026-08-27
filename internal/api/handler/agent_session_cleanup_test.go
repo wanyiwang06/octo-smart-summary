@@ -10,7 +10,7 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-// helper: 起一个私有内存 sqlite + 迁移 agent_message 表
+// helper: 起一个私有内存 sqlite + 迁移 cleanup 涉及的表
 // 使用 ":memory:"(不加 file:: / ?cache=shared)确保每个测试独立 DB 不串
 // 需 CGO(mattn/go-sqlite3) — CGO_ENABLED=0 环境自动 skip
 func newCleanupTestDB(t *testing.T) (*gorm.DB, bool) {
@@ -22,7 +22,11 @@ func newCleanupTestDB(t *testing.T) (*gorm.DB, bool) {
 		t.Skipf("CGO required for sqlite: %v", err)
 		return nil, true
 	}
-	if err := db.AutoMigrate(&model.AgentMessage{}, &model.AgentMessageEvidence{}); err != nil {
+	if err := db.AutoMigrate(
+		&model.AgentMessage{},
+		&model.AgentMessageEvidence{},
+		&model.AgentSummarySession{},
+	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return db, false
@@ -30,7 +34,13 @@ func newCleanupTestDB(t *testing.T) (*gorm.DB, bool) {
 
 func seedMsg(t *testing.T, db *gorm.DB, sessionID, userID, role string, createdAt time.Time) {
 	t.Helper()
+	seedMsgInSpace(t, db, "", sessionID, userID, role, createdAt)
+}
+
+func seedMsgInSpace(t *testing.T, db *gorm.DB, spaceID, sessionID, userID, role string, createdAt time.Time) {
+	t.Helper()
 	if err := db.Create(&model.AgentMessage{
+		SpaceID:   spaceID,
 		SessionID: sessionID,
 		UserID:    userID,
 		Role:      role,
@@ -39,6 +49,17 @@ func seedMsg(t *testing.T, db *gorm.DB, sessionID, userID, role string, createdA
 	}).Error; err != nil {
 		t.Fatalf("seed msg: %v", err)
 	}
+}
+
+func countMsgsInSpace(t *testing.T, db *gorm.DB, spaceID, userID, sessionID string) int64 {
+	t.Helper()
+	var n int64
+	if err := db.Model(&model.AgentMessage{}).
+		Where("space_id = ? AND user_id = ? AND session_id = ?", spaceID, userID, sessionID).
+		Count(&n).Error; err != nil {
+		t.Fatalf("count for (space=%s user=%s session=%s): %v", spaceID, userID, sessionID, err)
+	}
+	return n
 }
 
 func countMsgs(t *testing.T, db *gorm.DB, sessionID string) int64 {
@@ -64,7 +85,9 @@ func countMsgsFor(t *testing.T, db *gorm.DB, userID, sessionID string) int64 {
 
 func TestRunOnce_expiredSessionCleaned(t *testing.T) {
 	db, skip := newCleanupTestDB(t)
-	if skip { return }
+	if skip {
+		return
+	}
 	// session A: 最后一条 25h 前 → 过期,该清
 	seedMsg(t, db, "session-A", "user-1", "user", time.Now().Add(-30*time.Hour))
 	seedMsg(t, db, "session-A", "user-1", "assistant", time.Now().Add(-25*time.Hour))
@@ -78,7 +101,9 @@ func TestRunOnce_expiredSessionCleaned(t *testing.T) {
 
 func TestRunOnce_freshSessionUntouched(t *testing.T) {
 	db, skip := newCleanupTestDB(t)
-	if skip { return }
+	if skip {
+		return
+	}
 	// session B: 最后一条 1h 前 → 活跃,不动
 	seedMsg(t, db, "session-B", "user-1", "user", time.Now().Add(-2*time.Hour))
 	seedMsg(t, db, "session-B", "user-1", "assistant", time.Now().Add(-1*time.Hour))
@@ -92,7 +117,9 @@ func TestRunOnce_freshSessionUntouched(t *testing.T) {
 
 func TestRunOnce_borderline23_9hUntouched(t *testing.T) {
 	db, skip := newCleanupTestDB(t)
-	if skip { return }
+	if skip {
+		return
+	}
 	// session C: 最后一条 23h55min 前 → 还没到 24h,不动
 	seedMsg(t, db, "session-C", "user-1", "user", time.Now().Add(-23*time.Hour-55*time.Minute))
 
@@ -108,7 +135,9 @@ func TestRunOnce_mixedFreshAndOldSessionPartiallyPreserved(t *testing.T) {
 	//   如果按"某条消息很老"就删,会误删活跃 session
 	//   正确语义:按 session 的 MAX(created_at) 判断,只清全 session 都过期的
 	db, skip := newCleanupTestDB(t)
-	if skip { return }
+	if skip {
+		return
+	}
 	// session D: 有老消息 (30h 前) 也有新消息 (1h 前) → 整段 session 应保留
 	seedMsg(t, db, "session-D", "user-1", "user", time.Now().Add(-30*time.Hour))
 	seedMsg(t, db, "session-D", "user-1", "assistant", time.Now().Add(-1*time.Hour))
@@ -122,7 +151,9 @@ func TestRunOnce_mixedFreshAndOldSessionPartiallyPreserved(t *testing.T) {
 
 func TestRunOnce_multipleSessionsIsolated(t *testing.T) {
 	db, skip := newCleanupTestDB(t)
-	if skip { return }
+	if skip {
+		return
+	}
 	seedMsg(t, db, "session-old", "user-1", "user", time.Now().Add(-48*time.Hour))
 	seedMsg(t, db, "session-old", "user-1", "assistant", time.Now().Add(-40*time.Hour))
 	seedMsg(t, db, "session-new", "user-1", "user", time.Now().Add(-30*time.Minute))
@@ -138,9 +169,48 @@ func TestRunOnce_multipleSessionsIsolated(t *testing.T) {
 	}
 }
 
+func TestRunOnce_expiredWorkspaceMessagesPreserved(t *testing.T) {
+	db, skip := newCleanupTestDB(t)
+	if skip {
+		return
+	}
+
+	seedMsgInSpace(t, db, "space-1", "workspace-old", "user-1", "user", time.Now().Add(-30*time.Hour))
+	seedMsgInSpace(t, db, "space-1", "workspace-old", "user-1", "assistant", time.Now().Add(-25*time.Hour))
+
+	runOnce(db)
+
+	if got := countMsgsInSpace(t, db, "space-1", "user-1", "workspace-old"); got != 2 {
+		t.Errorf("expired workspace messages must survive Legacy cleanup, got %d rows (want 2)", got)
+	}
+}
+
+func TestRunOnce_legacyAndWorkspaceMessagesSameTupleIsolated(t *testing.T) {
+	db, skip := newCleanupTestDB(t)
+	if skip {
+		return
+	}
+
+	// A fresh workspace message must neither be deleted nor keep the stale
+	// Legacy tuple alive when both reuse the same owner/session identifiers.
+	seedMsg(t, db, "shared-session", "user-1", "user", time.Now().Add(-30*time.Hour))
+	seedMsgInSpace(t, db, "space-1", "shared-session", "user-1", "assistant", time.Now().Add(-1*time.Hour))
+
+	runOnce(db)
+
+	if got := countMsgsInSpace(t, db, "", "user-1", "shared-session"); got != 0 {
+		t.Errorf("expired Legacy messages should be cleaned independently, got %d rows", got)
+	}
+	if got := countMsgsInSpace(t, db, "space-1", "user-1", "shared-session"); got != 1 {
+		t.Errorf("fresh workspace message must survive Legacy cleanup, got %d rows", got)
+	}
+}
+
 func TestRunOnce_emptyTable(t *testing.T) {
 	db, skip := newCleanupTestDB(t)
-	if skip { return }
+	if skip {
+		return
+	}
 	// 表空,不应 panic 也不应报错
 	runOnce(db)
 
@@ -161,7 +231,9 @@ func TestRunOnce_emptyTable(t *testing.T) {
 // both users' rows). Verify BOTH users' rows disappear when BOTH are expired.
 func TestRunOnce_sameSessionIDDifferentUsers_scopedByOwner(t *testing.T) {
 	db, skip := newCleanupTestDB(t)
-	if skip { return }
+	if skip {
+		return
+	}
 
 	// Two users share the same session_id literal, both idle > 24h.
 	seedMsg(t, db, "sess-shared", "user-alice", "user", time.Now().Add(-30*time.Hour))
@@ -188,7 +260,9 @@ func TestRunOnce_sameSessionIDDifferentUsers_scopedByOwner(t *testing.T) {
 // stale tuple gone, active tuple preserved.
 func TestRunOnce_sameSessionIDDifferentUsers_activeTuplePreserved(t *testing.T) {
 	db, skip := newCleanupTestDB(t)
-	if skip { return }
+	if skip {
+		return
+	}
 
 	// Alice: idle > 24h → must be cleaned.
 	seedMsg(t, db, "sess-shared", "user-alice", "user", time.Now().Add(-30*time.Hour))
@@ -235,6 +309,28 @@ func countEvidence(t *testing.T, db *gorm.DB, userID, sessionID string) int64 {
 	return n
 }
 
+func seedWorkspaceSession(t *testing.T, db *gorm.DB, spaceID, userID, sessionID string) {
+	t.Helper()
+	now := time.Now()
+	pendingProposalJSON := "{}"
+	if err := db.Create(&model.AgentSummarySession{
+		SpaceID:             spaceID,
+		UserID:              userID,
+		SessionID:           sessionID,
+		AgentSessionID:      summaryWorkspaceAgentSessionID(spaceID, sessionID, 1),
+		ContractVersion:     "1",
+		State:               "idle",
+		StateVersion:        1,
+		ScopeVersion:        1,
+		ScopeJSON:           "{}",
+		PendingProposalJSON: &pendingProposalJSON,
+		CreatedAt:           now,
+		UpdatedAt:           now,
+	}).Error; err != nil {
+		t.Fatalf("seed workspace session (space=%s user=%s session=%s): %v", spaceID, userID, sessionID, err)
+	}
+}
+
 // TestRunOnce_expiredEvidenceCleaned is the #161 P2 (yujiawei) regression:
 // agent_message_evidence must be cleaned symmetrically with agent_message so
 // stale evidence rows don't accumulate indefinitely and inflate the citation
@@ -271,6 +367,43 @@ func TestRunOnce_freshEvidenceUntouched(t *testing.T) {
 
 	if got := countEvidence(t, db, "user-1", "session-B"); got != 1 {
 		t.Errorf("fresh evidence-B should NOT be cleaned, got %d rows", got)
+	}
+}
+
+func TestRunOnce_expiredEvidenceReferencedByWorkspacePreserved(t *testing.T) {
+	db, skip := newCleanupTestDB(t)
+	if skip {
+		return
+	}
+
+	seedEvidence(t, db, "user-1", summaryWorkspaceAgentSessionID("space-1", "workspace-session", 1), "msg_u1_3", time.Now().Add(-30*time.Hour))
+	seedWorkspaceSession(t, db, "space-1", "user-1", "workspace-session")
+
+	runOnce(db)
+
+	if got := countEvidence(t, db, "user-1", summaryWorkspaceAgentSessionID("space-1", "workspace-session", 1)); got != 1 {
+		t.Errorf("workspace-referenced evidence must survive Legacy cleanup, got %d rows", got)
+	}
+}
+
+func TestRunOnce_workspaceEvidenceProtectionScopedByOwner(t *testing.T) {
+	db, skip := newCleanupTestDB(t)
+	if skip {
+		return
+	}
+
+	internalSessionID := summaryWorkspaceAgentSessionID("space-1", "shared-session", 1)
+	seedEvidence(t, db, "user-1", internalSessionID, "msg_u1_4", time.Now().Add(-30*time.Hour))
+	seedEvidence(t, db, "user-2", internalSessionID, "msg_u2_2", time.Now().Add(-30*time.Hour))
+	seedWorkspaceSession(t, db, "space-1", "user-1", "shared-session")
+
+	runOnce(db)
+
+	if got := countEvidence(t, db, "user-1", internalSessionID); got != 1 {
+		t.Errorf("matching owner's workspace evidence must survive, got %d rows", got)
+	}
+	if got := countEvidence(t, db, "user-2", internalSessionID); got != 0 {
+		t.Errorf("another user's unreferenced expired evidence should be cleaned, got %d rows", got)
 	}
 }
 

@@ -283,3 +283,90 @@ func TestValidSummaryWorkflowIdempotencyKey(t *testing.T) {
 		}
 	}
 }
+
+func baseAgentWorkflowInput() AgentCreateSummaryWorkflowInput {
+	return AgentCreateSummaryWorkflowInput{
+		ActorID:        "creator",
+		SpaceID:        "space-1",
+		Title:          "Agent weekly summary",
+		Requirement:    "Summarize delivery status",
+		Sources:        []SummaryWorkflowSource{{SourceType: model.SourceGroup, SourceID: "group-1"}},
+		IdempotencyKey: "agent-workflow-001",
+	}
+}
+
+func TestAgentPersonalWorkflowRequiresSafeBoundary(t *testing.T) {
+	svc, db := newSummaryWorkflowTestService(t)
+	in := baseAgentWorkflowInput()
+
+	got, err := svc.CreatePersonalFromAgent(context.Background(), in)
+	if err != nil {
+		t.Fatalf("CreatePersonalFromAgent() error: %v", err)
+	}
+	if got.Target != SummaryWorkflowPersonal || got.Task.CreatorID != in.ActorID {
+		t.Fatalf("result = %#v, want personal task owned by actor", got)
+	}
+	if got.Task.TimeRangeEnd.Sub(got.Task.TimeRangeStart) < (AgentSummaryDefaultTimeRangeDays*24*time.Hour)-time.Second ||
+		got.Task.TimeRangeEnd.Sub(got.Task.TimeRangeStart) > (AgentSummaryDefaultTimeRangeDays*24*time.Hour)+time.Second {
+		t.Fatalf("default range = %s, want %d days", got.Task.TimeRangeEnd.Sub(got.Task.TimeRangeStart), AgentSummaryDefaultTimeRangeDays)
+	}
+
+	replay, err := svc.CreatePersonalFromAgent(context.Background(), in)
+	if err != nil || !replay.Replayed || replay.Task.ID != got.Task.ID || replay.WorkerTrigger != nil {
+		t.Fatalf("replay = %#v, err=%v", replay, err)
+	}
+	var count int64
+	db.Model(&model.SummaryTask{}).Count(&count)
+	if count != 1 {
+		t.Fatalf("task count = %d, want 1", count)
+	}
+}
+
+func TestAgentWorkflowRejectsWrongTargetMissingSourceOrKey(t *testing.T) {
+	svc, _ := newSummaryWorkflowTestService(t)
+
+	personalWithParticipant := baseAgentWorkflowInput()
+	personalWithParticipant.Participants = []SummaryWorkflowParticipant{{UserID: "p1"}}
+	if _, err := svc.CreatePersonalFromAgent(context.Background(), personalWithParticipant); err == nil {
+		t.Fatal("personal workflow accepted another participant")
+	}
+
+	teamWithoutParticipant := baseAgentWorkflowInput()
+	if _, err := svc.CreateTeamFromAgent(context.Background(), teamWithoutParticipant); err == nil {
+		t.Fatal("team workflow accepted no other participant")
+	}
+
+	missingSource := baseAgentWorkflowInput()
+	missingSource.Sources = nil
+	if _, err := svc.CreatePersonalFromAgent(context.Background(), missingSource); err == nil {
+		t.Fatal("agent workflow accepted no source")
+	}
+
+	missingKey := baseAgentWorkflowInput()
+	missingKey.IdempotencyKey = ""
+	if _, err := svc.CreatePersonalFromAgent(context.Background(), missingKey); err == nil {
+		t.Fatal("agent workflow accepted no idempotency key")
+	}
+}
+
+func TestAgentTeamWorkflowCreatesCollaborators(t *testing.T) {
+	svc, db := newSummaryWorkflowTestService(t)
+	in := baseAgentWorkflowInput()
+	in.IdempotencyKey = "agent-team-001"
+	in.Participants = []SummaryWorkflowParticipant{{UserID: "p1", UserName: "P1"}}
+
+	got, err := svc.CreateTeamFromAgent(context.Background(), in)
+	if err != nil {
+		t.Fatalf("CreateTeamFromAgent() error: %v", err)
+	}
+	if got.Target != SummaryWorkflowTeam {
+		t.Fatalf("target = %q, want team", got.Target)
+	}
+	var participants []model.SummaryParticipant
+	if err := db.Order("user_id").Find(&participants).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(participants) != 2 {
+		t.Fatalf("participants = %d, want creator + collaborator", len(participants))
+	}
+}
