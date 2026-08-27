@@ -42,11 +42,14 @@ type TaskHandler struct {
 	imDB                *gorm.DB
 	workerTriggerURL    string
 	customTemplateLimit int
+	// attentionCache serves the polling endpoint only. See attention.go for
+	// the TTL and the no-invalidation rationale.
+	attentionCache *attentionCache
 }
 
 // NewTaskHandler creates a new TaskHandler.
 func NewTaskHandler(db, imDB *gorm.DB, workerTriggerURL string) *TaskHandler {
-	return &TaskHandler{db: db, imDB: imDB, workerTriggerURL: workerTriggerURL, customTemplateLimit: defaultCustomTemplateLimit}
+	return &TaskHandler{db: db, imDB: imDB, workerTriggerURL: workerTriggerURL, customTemplateLimit: defaultCustomTemplateLimit, attentionCache: newAttentionCache()}
 }
 
 func (h *TaskHandler) SetCustomTemplateLimit(limit int) {
@@ -699,12 +702,9 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	// NOT cleared by MarkSummaryRead: opening the detail page marks the content
 	// read, but the participant still owes the team an explicit /submit, so the
 	// dot survives until submitted_at is set.
-	attentionJoins := `
- LEFT JOIN summary_user_read sur ON sur.task_id = sub.id AND sur.user_id = ?
- LEFT JOIN summary_result cr ON cr.id = sub.current_result_id AND cr.task_id = sub.id
- LEFT JOIN summary_personal_result pr ON pr.task_id = sub.id AND pr.user_id = ?
- LEFT JOIN summary_personal_result_version pv ON pv.id = pr.current_version_id AND pv.task_id = sub.id AND pv.user_id = ?
- LEFT JOIN summary_participant me ON me.task_id = sub.id AND me.user_id = ?`
+	// Shared with the attention-count query (attention.go) so the per-card dots
+	// and the badge are computed over identical rows.
+	attentionJoins := attentionJoinsSQL
 	// Schedule-level confirmation lives in participant_config rather than
 	// summary_participant. Expand the V5 roster so these invitations share the
 	// same attention/red-dot semantics as ordinary task invitations.
@@ -957,38 +957,24 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		})
 	}
 
-	// Counts deliberately ignore the current list filters: the navigation badge
-	// represents all cards that require this user's attention in the space.
-	countInner := "SELECT *, ROW_NUMBER() OVER (PARTITION BY (CASE WHEN schedule_id IS NULL THEN CONCAT('t', id) ELSE CONCAT('s', schedule_id) END) ORDER BY id DESC) AS rn FROM summary_task WHERE space_id = ? AND deleted_at IS NULL AND (creator_id = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ?) OR " + scheduleVisibilityExpr + ")"
+	// The badge numbers come from the shared helper (attention.go), which owns
+	// the only copy of the attention statistics SQL. Keeping a second copy here
+	// would let the list badge and the polled badge drift apart.
 	//
-	// ⚠️ The placeholders below are positional and hand-assembled; countArgs must
-	// be appended in exactly the textual order the `?`s appear:
-	//   1. has_invite      -> ParticipantPending [+ userID when schedulePendingExpr is live (MySQL only)]
-	//   2. has_submit      -> PersonalStatusCompleted
-	//   3. countInner      -> spaceID, userID, userID [+ userID when scheduleVisibilityExpr is live]
-	//   4. attentionJoins  -> userID x4
-	attentionCountSQL := "SELECT COALESCE(SUM(has_invite),0) pending_invitation_count, COALESCE(SUM(unread),0) unread_count, COALESCE(SUM(has_submit),0) pending_submission_count, COALESCE(SUM(CASE WHEN has_invite=1 OR unread=1 OR has_submit=1 THEN 1 ELSE 0 END),0) attention_count FROM (SELECT CASE WHEN me.status=? OR " + schedulePendingExpr + " THEN 1 ELSE 0 END has_invite, CASE WHEN pr.worker_status=? AND pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id=sub.id) > 1" + pendingSubmitStatusGuard("sub") + " THEN 1 ELSE 0 END has_submit, CASE WHEN (sub.current_result_id IS NOT NULL AND (sur.last_read_team_result_id IS NULL OR sur.last_read_team_result_id<>sub.current_result_id)) OR (pr.current_version_id IS NOT NULL AND (sur.last_read_personal_version_id IS NULL OR sur.last_read_personal_version_id<>pr.current_version_id)) THEN 1 ELSE 0 END unread FROM (" + countInner + ") sub" + attentionJoins + " WHERE sub.rn=1) attention"
-	var counts struct {
-		AttentionCount         int64 `gorm:"column:attention_count"`
-		UnreadCount            int64 `gorm:"column:unread_count"`
-		PendingInvitationCount int64 `gorm:"column:pending_invitation_count"`
-		PendingSubmissionCount int64 `gorm:"column:pending_submission_count"`
-	}
-	countArgs := []interface{}{model.ParticipantPending}
-	if h.db.Dialector.Name() == "mysql" {
-		countArgs = append(countArgs, userID)
-	}
-	countArgs = append(countArgs, model.PersonalStatusCompleted)
-	countArgs = append(countArgs, spaceID, userID, userID)
-	if h.db.Dialector.Name() == "mysql" {
-		countArgs = append(countArgs, userID)
-	}
-	countArgs = append(countArgs, userID, userID, userID, userID)
-	if err := h.db.Raw(attentionCountSQL, countArgs...).Scan(&counts).Error; err != nil {
+	// This path deliberately does NOT read the cache — it has just executed the
+	// full page query anyway, so a cache read could only serve a staler answer
+	// than the rows being rendered right next to it, which is exactly the
+	// inconsistency (dots say one thing, badge another) worth avoiding. It DOES
+	// populate the cache: the value was computed by the same SQL, so it is no
+	// staler than any other write, and it makes the polls that follow a list
+	// load cheap.
+	counts, err := h.attentionCounts(spaceID, userID)
+	if err != nil {
 		log.Printf("list summaries attention count query failed: %v", err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to list summaries"})
 		return
 	}
+	h.attentionCachePut(attentionCacheKey{userID: userID, spaceID: spaceID}, counts)
 	ok(c, gin.H{"total": total, "items": items, "attention_count": counts.AttentionCount, "unread_count": counts.UnreadCount, "pending_invitation_count": counts.PendingInvitationCount, "pending_submission_count": counts.PendingSubmissionCount})
 }
 
