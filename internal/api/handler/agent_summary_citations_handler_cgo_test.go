@@ -7,15 +7,15 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 )
 
-// A save may omit request_id even when its selected assistant message is
-// bound to a V2 run. The derived request id is for validating/finalizing that
-// message only; it must not silently switch citation building from the legacy
-// recompute to the run's frozen manifest.
-func TestCreateAgentSummary_OmittedRequestIDKeepsLegacyCitationRecompute(t *testing.T) {
+// History hydration does not carry the generation request_id. A strict workspace
+// save must therefore use the request id derived from the selected preview's
+// persisted run binding when it resolves the frozen citation manifest.
+func TestCreateAgentSummary_WorkspaceSaveDerivesRequestIDForFrozenCitations(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
 	if err := db.AutoMigrate(
 		&model.AgentSummaryRun{},
@@ -28,25 +28,48 @@ func TestCreateAgentSummary_OmittedRequestIDKeepsLegacyCitationRecompute(t *test
 	seedV2Scenario(t, db)
 	t.Setenv("AGENT_SUMMARY_V2_MODE", "on")
 
-	draft := model.AgentMessage{
-		UserID:    "test-user",
-		SessionID: "session-1",
-		Role:      "assistant",
-		Content:   "Charlie said [3]",
-		RunID:     "run-v2-1",
+	fixture := seedWorkspaceSaveFixture(t, db, "session-1")
+	internalSessionID := summaryWorkspaceAgentSessionID(
+		fixture.Session.SpaceID,
+		fixture.Session.SessionID,
+		fixture.Session.ScopeVersion,
+	)
+	if err := db.Model(&model.AgentSummaryRun{}).Where("run_id = ?", "run-v2-1").
+		Update("session_id", internalSessionID).Error; err != nil {
+		t.Fatalf("scope workspace run: %v", err)
 	}
-	if err := db.Create(&draft).Error; err != nil {
-		t.Fatalf("seed assistant draft: %v", err)
+	if err := db.Model(&model.AgentMessageEvidence{}).
+		Where("user_id = ? AND session_id = ?", "test-user", "session-1").
+		Update("session_id", internalSessionID).Error; err != nil {
+		t.Fatalf("scope workspace evidence: %v", err)
+	}
+	if err := db.Model(&model.AgentEvidenceArtifact{}).Where("run_id = ?", "run-v2-1").
+		Update("session_id", internalSessionID).Error; err != nil {
+		t.Fatalf("scope workspace artifact: %v", err)
+	}
+	payloadJSON, err := json.Marshal(agent.SummaryResponsePayload{
+		ResultType:      agent.SummaryResultAgentPreview,
+		Reply:           "preview ready",
+		ExecutionTarget: "agent_preview",
+		Preview: &agent.SummaryResponsePreview{
+			Content: "Charlie said [3]",
+			Version: fixture.Message.ArtifactVersion,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal preview payload: %v", err)
+	}
+	if err := db.Model(&model.AgentMessage{}).Where("id = ?", fixture.Message.ID).Updates(map[string]interface{}{
+		"run_id":                "run-v2-1",
+		"response_payload_json": string(payloadJSON),
+	}).Error; err != nil {
+		t.Fatalf("bind workspace preview to run: %v", err)
 	}
 
 	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
-	w := doAgentSave(t, setupAgentSummaryRouter(h), map[string]interface{}{
-		"session_id":          draft.SessionID,
-		"origin_channel_id":   "channel-1",
-		"origin_channel_type": 1,
-		"agent_message_id":    draft.ID,
-		"snapshot_version":    1,
-	}, nil)
+	w := doAgentSave(t, setupAgentSummaryRouter(h), fixture.Body, map[string]string{
+		"Idempotency-Key": "workspace-history-save",
+	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("save status = %d, body=%s", w.Code, w.Body.String())
 	}
@@ -67,10 +90,7 @@ func TestCreateAgentSummary_OmittedRequestIDKeepsLegacyCitationRecompute(t *test
 		t.Fatalf("load saved deliverable: %v", err)
 	}
 	citations := saved.GetCitations()
-	if len(citations) != 1 {
-		t.Fatalf("saved citations = %d, want recomputed Charlie citation", len(citations))
-	}
-	if citations[0].Index != 3 || citations[0].Sender != "Charlie" {
-		t.Fatalf("saved citation = %+v, want recomputed [3]=Charlie", citations[0])
+	if len(citations) != 0 {
+		t.Fatalf("saved citations = %+v, want frozen manifest to drop post-freeze Charlie [3]", citations)
 	}
 }

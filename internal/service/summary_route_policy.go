@@ -42,6 +42,7 @@ const (
 type SummaryRouteInput struct {
 	Action                     SummaryAction
 	Intent                     SummaryIntent
+	HasExplicitRunIntent       bool
 	HasValidSource             bool
 	HasSelectedTemplate        bool
 	HasOtherParticipants       bool
@@ -104,7 +105,7 @@ func DeriveSummaryRoute(in SummaryRouteInput) SummaryRoute {
 			}
 			return SummaryRouteTeamConfirmation
 		}
-		if in.HasValidSource && in.HasSelectedTemplate {
+		if in.HasExplicitRunIntent && in.HasValidSource && in.HasSelectedTemplate {
 			return SummaryRoutePersonalWorkflow
 		}
 		if in.HasEnoughContextForPreview {

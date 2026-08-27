@@ -12,9 +12,10 @@ import (
 // agent_message 清理策略(CHAT-REFERENCE-BASED-DESIGN 后续加固,
 // 见主人 2026-07-15 决策 D1..D5):
 //
-//   D1: 清所有过期 session (保存成总结的 session 在 CreateAgentSummary
-//       tx 里已被销毁,活着的 session = 用户没保存的临时对话残留)
-//   D2: 「过期」= 该 session 最后一条消息 created_at > 24h 前
+//   D1: 清所有过期 Legacy session (保存成总结的 session 在 CreateAgentSummary
+//       tx 里已被销毁,活着的 Legacy session = 用户没保存的临时对话残留)
+//       summary workspace 由 agent_summary_session 管理生命周期,不在这里清理。
+//   D2: 「过期」= 该 Legacy session 最后一条消息 created_at > 24h 前
 //   D3: goroutine + time.Ticker,和 summary-api 进程同生命周期
 //   D4: 日志折中 —— 只在清了 > 0 行、或耗时异常、或出错时打
 //   D5: 独立分支/PR:feat/agent-session-cleanup-24h → feat/agent-framework-poc
@@ -69,10 +70,11 @@ func StartAgentSessionCleanup(ctx context.Context, db *gorm.DB) {
 // (user_id, session_id)——按 blocker 1 的设计,两个不同用户允许偶然共用同一
 // session_id 字面值。因此清理粒度也必须是 (user_id, session_id) 而不是裸
 // session_id,否则:
-//   1. 一个 (user, session) tuple 的活跃会保护另一个 (other_user, same_session)
-//      的老 tuple 过期不掉——过度保留。
-//   2. 当两个 tuple 都空闲后,`WHERE session_id IN (...)` 会一次删掉整段,
-//      连带把最后活动比另一 tuple 更晚的行也误删——跨用户误删。
+//  1. 一个 (user, session) tuple 的活跃会保护另一个 (other_user, same_session)
+//     的老 tuple 过期不掉——过度保留。
+//  2. 当两个 tuple 都空闲后,`WHERE session_id IN (...)` 会一次删掉整段,
+//     连带把最后活动比另一 tuple 更晚的行也误删——跨用户误删。
+//
 // 用 (user_id, session_id) 复合筛选,精确到属主。
 //
 // #161 P2 (yujiawei): agent_message_evidence must be cleaned symmetrically.
@@ -80,23 +82,27 @@ func StartAgentSessionCleanup(ctx context.Context, db *gorm.DB) {
 // both getSessionMessagePool (mid-run) and buildCitationsForSession
 // (save-time). Without cleanup, evidence rows accumulate indefinitely for
 // any reused session_id and inflate the citation pool of every subsequent
-// summarize_chunk. The evidence table has no created_at index on its own
-// key columns — the age predicate reuses agent_message's last-activity
-// timestamp so both tables retire together per (user_id, session_id).
+// summarize_chunk. Evidence expiry uses its own last-activity timestamp, while
+// durable workspace references below prevent premature collection.
 func runOnce(db *gorm.DB) {
 	cutoff := time.Now().Add(-cleanupAge)
 	start := time.Now()
 
-	// 按 (user_id, session_id) 聚合 MAX(created_at),定位两键都过期的 tuple.
+	// 只在 Legacy 消息(space_id = '')中按 (user_id, session_id) 聚合
+	// MAX(created_at),定位两键都过期的 tuple。workspace 消息由持久化 session
+	// 引用,不能被 Legacy 24h 清理删除；同 tuple 下的新 workspace 消息也不能
+	// 反过来阻止过期 Legacy 消息清理。
 	// 组合 IN 子查询在 MySQL 和 SQLite 3.7+ 都支持 (`WHERE (a, b) IN (SELECT a, b ...)`).
 	//
 	// 单条 SQL 不用事务(DELETE 天然是原子写),避免长事务锁。
 	result := db.Exec(`
 		DELETE FROM agent_message
-		WHERE (user_id, session_id) IN (
+		WHERE space_id = ''
+		  AND (user_id, session_id) IN (
 			SELECT user_id, session_id FROM (
 				SELECT user_id, session_id, MAX(created_at) AS last_at
 				FROM agent_message
+				WHERE space_id = ''
 				GROUP BY user_id, session_id
 				HAVING last_at <= ?
 			) AS expired
@@ -128,6 +134,10 @@ func runOnce(db *gorm.DB) {
 	// simpler and self-contained — evidence is written synchronously by
 	// PersistEvidence at fetch/peek/search/filter time, so its timestamps
 	// reflect real user activity independent of AppendMessages ordering.
+	// Evidence has no space_id, so workspace Agent runs use a space-derived
+	// agent_session_id. Preserve every (user_id, agent_session_id) tuple referenced
+	// by agent_summary_session; workspace retirement must remove that session
+	// before this Legacy cleanup may collect its evidence.
 	evStart := time.Now()
 	evResult := db.Exec(`
 		DELETE FROM agent_message_evidence
@@ -138,6 +148,12 @@ func runOnce(db *gorm.DB) {
 				GROUP BY user_id, session_id
 				HAVING last_at <= ?
 			) AS expired
+		)
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM agent_summary_session
+			WHERE agent_summary_session.user_id = agent_message_evidence.user_id
+			  AND agent_summary_session.agent_session_id = agent_message_evidence.session_id
 		)
 	`, cutoff)
 	evElapsed := time.Since(evStart)

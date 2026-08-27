@@ -95,7 +95,7 @@ func TestFetchChannelTool_AccessControl(t *testing.T) {
 		t.Fatalf("Expected tool name 'fetch_channel', got %s", toolObj.Function.Name)
 	}
 
-	ctx := context.Background()
+	ctx := context.WithValue(context.Background(), ContextKeySessionID, "fetch-access-session")
 	testUID := "user-1"
 
 	t.Run("AccessDenied_ChannelNotInAllowedSet", func(t *testing.T) {
@@ -188,7 +188,7 @@ func TestPeekChannelTool_AccessControl(t *testing.T) {
 		t.Fatalf("Expected tool name 'peek_channel', got %s", toolObj.Function.Name)
 	}
 
-	ctx := context.Background()
+	ctx := context.WithValue(context.Background(), ContextKeySessionID, "peek-access-session")
 	testUID := "user-2"
 
 	t.Run("AccessDenied_ChannelNotInAllowedSet", func(t *testing.T) {
@@ -254,6 +254,28 @@ func TestPeekChannelTool_AccessControl(t *testing.T) {
 	})
 }
 
+func TestChannelReadToolsAcceptLogicalDMID(t *testing.T) {
+	db := setupAgentImDB(t)
+	db.Exec(`INSERT INTO conversation_extra (uid, channel_id, channel_type, updated_at) VALUES ('user-dm', 'peer-dm', 1, 1)`)
+
+	SetSummaryDeps(nil, db, nil, config.Config{MsgTableCount: 1, MaxMessagesPerChannel: 10})
+	defer SetSummaryDeps(nil, nil, nil, config.Config{})
+
+	ctx := context.WithValue(context.Background(), ContextKeyUID, "user-dm")
+	ctx = context.WithValue(ctx, ContextKeySessionID, "logical-dm-session")
+	ctx = WithAllowedChannelScope(ctx, []ChannelScope{{ChannelID: "peer-dm", ChannelType: 1}})
+
+	_, fetch := FetchChannelTool()
+	if result, err := fetch(ctx, json.RawMessage(`{"channel_id":"peer-dm","channel_type":1,"time_start":"2024-01-01T00:00:00Z","time_end":"2024-01-02T00:00:00Z"}`)); err != nil && (strings.Contains(err.Error(), "not accessible") || strings.Contains(result, "channel not accessible")) {
+		t.Fatalf("fetch rejected accessible logical DM id: result=%q err=%v", result, err)
+	}
+
+	_, peek := PeekChannelTool()
+	if result, err := peek(ctx, json.RawMessage(`{"channel_id":"peer-dm","channel_type":1}`)); err != nil && (strings.Contains(err.Error(), "not accessible") || strings.Contains(result, "channel not accessible")) {
+		t.Fatalf("peek rejected accessible logical DM id: result=%q err=%v", result, err)
+	}
+}
+
 // TestSelectedArchivedChannelsBridge locks the UI-selection bridge across all
 // four channel tools. The selected archived thread is visible without the LLM
 // setting include_archived; a selected ID the user does not belong to remains
@@ -271,6 +293,7 @@ func TestSelectedArchivedChannelsBridge(t *testing.T) {
 	defer SetSummaryDeps(nil, nil, nil, config.Config{})
 
 	ctx := context.WithValue(context.Background(), ContextKeyUID, "user-1")
+	ctx = context.WithValue(ctx, ContextKeySessionID, "archived-channel-session")
 	ctx = context.WithValue(ctx, ContextKeyAllowedArchivedChannels, map[string]bool{
 		"grp1____arch":   true,
 		"grp2____secret": true,

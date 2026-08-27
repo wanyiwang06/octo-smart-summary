@@ -159,12 +159,15 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	// (not from LLM params); the summary profile injects it into tool handlers for
 	// channel/message-level permission isolation. db backs multi-turn history.
 	agentChatH := handler.NewAgentChatHandler(db, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens, llmFallbackModels)
+	agentChatH.ConfigureSummaryWorkspace(imDB, workerTriggerURL)
+	v1.GET("/summary-workbench/capabilities", agentChatH.SummaryWorkspaceCapabilities)
 	agentGroup := r.Group("/api/v1/agent")
 	agentGroup.Use(middleware.StrictAuthMiddleware(authResolver), middleware.StrictSpaceMiddleware())
 	{
 		agentGroup.POST("/chat", agentChatH.Chat)
 		agentGroup.POST("/chat/stream", agentChatH.ChatStream)
 		agentGroup.GET("/chat/history", agentChatH.History)
+		agentGroup.POST("/summary-sessions/:session/proposals/:version/confirm", agentChatH.ConfirmSummaryWorkspaceProposal)
 	}
 
 	// Agent summary: persists agent-generated summaries.

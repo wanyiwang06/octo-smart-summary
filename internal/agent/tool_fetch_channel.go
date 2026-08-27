@@ -70,11 +70,13 @@ func FetchChannelTool() (Tool, Handler) {
 		if !ok || uid == "" {
 			return "", fmt.Errorf("missing user identity in context")
 		}
-
-		summaryDB, imDB, _, cfg := GetSummaryDeps()
 		runID, _ := ctx.Value(ContextKeyRunID).(string)
 		recordFetch := func(succeeded, truncated bool) {
-			if !SummaryV2Enabled() || summaryDB == nil || runID == "" || req.ChannelID == "" {
+			if !SummaryV2Enabled() || runID == "" || req.ChannelID == "" {
+				return
+			}
+			summaryDB, _, _, _ := GetSummaryDeps()
+			if summaryDB == nil {
 				return
 			}
 			// WithoutCancel, not ctx: the dominant cause of the failures we are trying
@@ -104,7 +106,18 @@ func FetchChannelTool() (Tool, Handler) {
 			recordFetch(false, false)
 			return "", fmt.Errorf("channel_type is required (1=DM, 2=Group, 5=Thread); check reference material's candidate channels for the correct value")
 		}
-
+		// Enforce the request-level allowlist after validating the type, but before
+		// resolving any database dependency. A missing type is a repairable model
+		// argument error, not an outside-scope attempt.
+		if restricted, allowed := ChannelAllowedByScope(ctx, req.ChannelID, req.ChannelType); restricted && !allowed {
+			return "", &ErrChannelOutsideSelectedScope{ChannelID: req.ChannelID, ChannelType: req.ChannelType}
+		}
+		sessionID, _ := ctx.Value(ContextKeySessionID).(string)
+		if sessionID == "" {
+			return "", fmt.Errorf("missing session_id in context")
+		}
+		lookupChannelID := pipeline.NormalizeDMChannelID(req.ChannelID, uid, req.ChannelType)
+		summaryDB, imDB, _, cfg := GetSummaryDeps()
 		timeStart, err := time.Parse(time.RFC3339, req.TimeStart)
 		if err != nil {
 			recordFetch(false, false)
@@ -133,7 +146,7 @@ func FetchChannelTool() (Tool, Handler) {
 			allowedSet[ch.ChannelID] = true
 		}
 
-		if !allowedSet[req.ChannelID] {
+		if !allowedSet[lookupChannelID] {
 			errResult := map[string]interface{}{
 				"error":      "channel not accessible",
 				"channel_id": req.ChannelID,
@@ -162,9 +175,9 @@ func FetchChannelTool() (Tool, Handler) {
 		// (1) tool layer already has accessibleChannels with ChannelName/ChannelType
 		// (2) keeps pipeline focused on message fetching, not metadata resolution
 		// (3) no circular dependency risk
-		enrichMessagesWithMetadata(ctx, messages, req.ChannelID, accessibleChannels, imDB)
+		enrichMessagesWithMetadata(ctx, messages, lookupChannelID, accessibleChannels, imDB)
 
-		handle := messageCache.Store(messages, uid)
+		handle := messageCache.Store(messages, uid, sessionID)
 		// Persist evidence to DB for citation fallback on cache miss (Stage 3 Blocker C).
 		// #161 P1-B (yujiawei): evidence is now the sole discovery source
 		// for CitationIndex in both getSessionMessagePool and

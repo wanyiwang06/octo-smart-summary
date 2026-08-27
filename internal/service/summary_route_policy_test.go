@@ -11,11 +11,22 @@ func TestDeriveSummaryRoute(t *testing.T) {
 		{
 			name: "personal workflow requires source template and generate intent",
 			in: SummaryRouteInput{
-				Intent:              SummaryIntentGenerate,
-				HasValidSource:      true,
-				HasSelectedTemplate: true,
+				Intent:               SummaryIntentGenerate,
+				HasExplicitRunIntent: true,
+				HasValidSource:       true,
+				HasSelectedTemplate:  true,
 			},
 			want: SummaryRoutePersonalWorkflow,
+		},
+		{
+			name: "template context without explicit run intent stays in agent preview",
+			in: SummaryRouteInput{
+				Intent:                     SummaryIntentGenerate,
+				HasValidSource:             true,
+				HasSelectedTemplate:        true,
+				HasEnoughContextForPreview: true,
+			},
+			want: SummaryRouteAgentPreview,
 		},
 		{
 			name: "participants take the team confirmation route without template",
@@ -127,6 +138,7 @@ func TestDeriveSummaryRoute(t *testing.T) {
 			name: "hard missing data overrides all routes",
 			in: SummaryRouteInput{
 				Intent:                     SummaryIntentGenerate,
+				HasExplicitRunIntent:       true,
 				HasValidSource:             true,
 				HasSelectedTemplate:        true,
 				ParticipantsValid:          true,

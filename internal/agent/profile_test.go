@@ -162,3 +162,45 @@ func TestGetProfile_UnknownProfile(t *testing.T) {
 		t.Errorf("error message should mention unknown profile, got: %v", err)
 	}
 }
+
+func TestGetProfile_SummaryWorkspace(t *testing.T) {
+	profile, err := GetProfile("summary_workspace")
+	if err != nil {
+		t.Fatalf("GetProfile(summary_workspace): %v", err)
+	}
+	if profile.PromptFile != "summary_workspace" {
+		t.Fatalf("PromptFile = %q", profile.PromptFile)
+	}
+	if profile.Policy.TerminalTool != "emit_summary_response" {
+		t.Fatalf("TerminalTool = %q", profile.Policy.TerminalTool)
+	}
+	if profile.Policy.MaxSteps != 24 || profile.Policy.MaxTokens != 120000 || profile.Policy.StepTimeout != 240*time.Second {
+		t.Fatalf("Policy = %+v", profile.Policy)
+	}
+
+	reg, err := BuildRegistry(profile.Tools)
+	if err != nil {
+		t.Fatalf("BuildRegistry: %v", err)
+	}
+	if !reg.IsTerminal("emit_summary_response") {
+		t.Fatal("summary_workspace registry is missing its terminal tool")
+	}
+	if got := len(reg.Schemas()); got != 9 {
+		t.Fatalf("Schemas len = %d, want 9", got)
+	}
+	for _, forbidden := range []string{"list_channels", "narrow_channels_by_topic", "find_shared_channels"} {
+		if reg.Has(forbidden) {
+			t.Fatalf("summary_workspace must not expose cross-scope discovery tool %q", forbidden)
+		}
+	}
+
+	prompt, err := LoadPrompt(profile.PromptFile)
+	if err != nil {
+		t.Fatalf("LoadPrompt: %v", err)
+	}
+	for _, phrase := range []string{"emit_summary_response", "preview.content", "禁止直接输出自由文本"} {
+		if !strings.Contains(prompt, phrase) {
+			t.Errorf("prompt missing %q", phrase)
+		}
+	}
+}

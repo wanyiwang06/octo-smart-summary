@@ -1,6 +1,11 @@
 package agent
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
+)
 
 // 自定义线格式类型：贴 OpenAI chat/completions，刻意不复用 internal/service，
 // 以保证 internal/agent 零侵入、零本项目依赖。
@@ -62,6 +67,29 @@ type AssistantTurn struct {
 	Truncated bool
 }
 
+// TerminalOutcome is the structured result produced by a terminal tool. The
+// visible assistant bubble is deliberately separate from Payload: callers can
+// render a short conversational reply while persisting a preview document (or
+// workflow metadata) as structured state instead of treating every assistant
+// sentence as a saveable summary.
+type TerminalOutcome struct {
+	VisibleContent string
+	ResultType     string
+	Payload        json.RawMessage
+}
+
+// TerminalHandler validates and accepts one terminal tool invocation. Terminal
+// handlers do not run through the ordinary string-returning tool dispatcher:
+// a successful outcome ends the Agent loop and is returned to the caller.
+type TerminalHandler func(ctx context.Context, args json.RawMessage) (TerminalOutcome, error)
+
+// RunResult is the structured form of a completed Agent run. Terminal is nil
+// for legacy profiles that still finish with a free-text assistant response.
+type RunResult struct {
+	Reply    string
+	Terminal *TerminalOutcome
+}
+
 // ContextKeyUID is the context key for storing user ID in request context.
 type contextKeyUID struct{}
 
@@ -111,4 +139,64 @@ func SelectedArchivedChannelIDs(ctx context.Context) []string {
 		}
 	}
 	return ids
+}
+
+// ChannelScope identifies one channel selected in a trusted application UI.
+// ChannelType uses the WuKongIM storage values (1=DM, 2=group, 5=thread).
+type ChannelScope struct {
+	ChannelID   string
+	ChannelType int
+}
+
+type contextKeyAllowedChannelScope struct{}
+
+// WithAllowedChannelScope restricts channel-reading tools to the exact set
+// already authorised by the application layer. Calling it with an empty slice
+// intentionally installs an empty allowlist; absence of the value keeps legacy
+// Agent profiles unchanged.
+func WithAllowedChannelScope(ctx context.Context, channels []ChannelScope) context.Context {
+	uid, _ := ctx.Value(ContextKeyUID).(string)
+	allowed := make(map[int]map[string]struct{})
+	for _, channel := range channels {
+		if channel.ChannelID == "" || channel.ChannelType == 0 {
+			continue
+		}
+		if uid != "" {
+			channel.ChannelID = pipeline.NormalizeDMChannelID(channel.ChannelID, uid, channel.ChannelType)
+		}
+		byID := allowed[channel.ChannelType]
+		if byID == nil {
+			byID = make(map[string]struct{})
+			allowed[channel.ChannelType] = byID
+		}
+		byID[channel.ChannelID] = struct{}{}
+	}
+	return context.WithValue(ctx, contextKeyAllowedChannelScope{}, allowed)
+}
+
+// ChannelAllowedByScope reports whether a request-scoped allowlist exists and
+// whether the exact channel/type pair belongs to it.
+func ChannelAllowedByScope(ctx context.Context, channelID string, channelType int) (restricted, allowed bool) {
+	scope, restricted := ctx.Value(contextKeyAllowedChannelScope{}).(map[int]map[string]struct{})
+	if !restricted {
+		return false, false
+	}
+	if uid, _ := ctx.Value(ContextKeyUID).(string); uid != "" {
+		channelID = pipeline.NormalizeDMChannelID(channelID, uid, channelType)
+	}
+	_, allowed = scope[channelType][channelID]
+	return true, allowed
+}
+
+// ErrChannelOutsideSelectedScope is returned when an Agent tries to read a
+// channel that the trusted application layer did not include in this request's
+// selected scope. It is typed so the runner can reject the attempt without
+// permanently poisoning the run's completeness verdict.
+type ErrChannelOutsideSelectedScope struct {
+	ChannelID   string
+	ChannelType int
+}
+
+func (e *ErrChannelOutsideSelectedScope) Error() string {
+	return "channel is outside the selected summary scope"
 }

@@ -8,6 +8,7 @@ import (
 	"log"
 	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/artifact"
@@ -97,7 +98,7 @@ func (h *AgentSummaryHandler) buildCitationsForSessionWithDB(
 		}
 
 		// Prefer cache (avoids JSON unmarshal on the hot path)
-		if cached := cache.Retrieve(ev.Handle, uid); cached != nil {
+		if cached := cache.Retrieve(ev.Handle, uid, sessionID); cached != nil {
 			for _, msg := range cached {
 				key := fmt.Sprintf("%s:%d", msg.ChannelID, msg.MessageSeq)
 				if !seenKey[key] {
@@ -322,7 +323,11 @@ func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, r
 // id and attempt-local output-truncation fact on the same row as the content;
 // legacy rows have an empty run id and use the run-level fallback above.
 func (h *AgentSummaryHandler) finalizeRunForMessage(ctx context.Context, uid, sessionID, requestID, content string, cits []model.Citation, msg model.AgentMessage) (finishgate.Verdict, []finishgate.Gap) {
-	return h.finalizeRunForDeliverable(ctx, uid, sessionID, requestID, content, cits, msg.RunID, msg.OutputTruncated)
+	runSessionID := sessionID
+	if strings.TrimSpace(msg.SpaceID) != "" {
+		runSessionID = summaryWorkspaceAgentSessionID(msg.SpaceID, sessionID, msg.ScopeVersion)
+	}
+	return h.finalizeRunForDeliverable(ctx, uid, runSessionID, requestID, content, cits, msg.RunID, msg.OutputTruncated)
 }
 
 // finalizeRunForDeliverable computes the SS-07 finish verdict

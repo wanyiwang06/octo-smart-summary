@@ -27,6 +27,11 @@ const (
 	// WorkflowIdempotencyMismatchCode identifies reuse of one key for two
 	// semantically different workflow requests.
 	WorkflowIdempotencyMismatchCode = 40009
+
+	// AgentSummaryDefaultTimeRangeDays is deliberately narrower than the
+	// legacy workflow default. The unified summary workspace promises a
+	// visible "最近 7 天" default whenever the user did not select a range.
+	AgentSummaryDefaultTimeRangeDays = 7
 )
 
 var (
@@ -88,6 +93,24 @@ type LegacyCreateSummaryWorkflowInput struct {
 	SpaceID             string
 	Title               string
 	Topic               string
+	TimeRange           *SummaryWorkflowTimeRange
+	Sources             []SummaryWorkflowSource
+	Participants        []SummaryWorkflowParticipant
+	ConfirmTimeoutHours int
+	OriginChannelID     string
+	OriginChannelType   int
+	IdempotencyKey      string
+}
+
+// AgentCreateSummaryWorkflowInput is the trusted application command used by
+// the unified summary workspace. Unlike LegacyCreateSummaryWorkflowInput it
+// has no creator override: ActorID is always the task creator. Callers must
+// already have resolved and authorised the source/participant identities.
+type AgentCreateSummaryWorkflowInput struct {
+	ActorID             string
+	SpaceID             string
+	Title               string
+	Requirement         string
 	TimeRange           *SummaryWorkflowTimeRange
 	Sources             []SummaryWorkflowSource
 	Participants        []SummaryWorkflowParticipant
@@ -182,6 +205,105 @@ func (s *SummaryWorkflowService) CreateFromLegacyHTTP(ctx context.Context, in Le
 	}
 
 	result, err := s.persist(ctx, normalized, requestHash)
+	if errors.Is(err, errSummaryWorkflowIdempotencyRace) {
+		result, found, findErr := s.findIdempotentWorkflow(ctx, normalized, requestHash)
+		if findErr != nil {
+			return zero, findErr
+		}
+		if found {
+			return result, nil
+		}
+		return zero, errors.New("summary workflow idempotency binding disappeared after conflict")
+	}
+	return result, err
+}
+
+// CreatePersonalFromAgent creates the formal single-user workflow selected by
+// the summary workspace policy. The method is intentionally separate from the
+// legacy HTTP adapter so the security invariants are compiler-visible:
+// authenticated actor == creator, a source is required, no collaborators are
+// accepted, and an idempotency key is mandatory.
+func (s *SummaryWorkflowService) CreatePersonalFromAgent(ctx context.Context, in AgentCreateSummaryWorkflowInput) (CreateSummaryWorkflowResult, error) {
+	if len(deduplicateWorkflowParticipants(in.Participants, in.ActorID)) != 0 {
+		return CreateSummaryWorkflowResult{}, NewBizError(40001, "personal workflow cannot include other participants", http.StatusBadRequest)
+	}
+	return s.createFromAgent(ctx, in, SummaryWorkflowPersonal)
+}
+
+// CreateTeamFromAgent creates a confirmed multi-user workflow. Proposal token,
+// version and scope checks live in the workspace session service immediately
+// before this method is called; this method independently enforces the
+// side-effect boundary that at least one other participant is present.
+func (s *SummaryWorkflowService) CreateTeamFromAgent(ctx context.Context, in AgentCreateSummaryWorkflowInput) (CreateSummaryWorkflowResult, error) {
+	if len(deduplicateWorkflowParticipants(in.Participants, in.ActorID)) == 0 {
+		return CreateSummaryWorkflowResult{}, NewBizError(40001, "team workflow requires at least one other participant", http.StatusBadRequest)
+	}
+	return s.createFromAgent(ctx, in, SummaryWorkflowTeam)
+}
+
+func (s *SummaryWorkflowService) createFromAgent(ctx context.Context, in AgentCreateSummaryWorkflowInput, expectedTarget SummaryWorkflowTarget) (CreateSummaryWorkflowResult, error) {
+	var zero CreateSummaryWorkflowResult
+	if s == nil || s.db == nil {
+		return zero, errors.New("summary workflow service database is required")
+	}
+	if strings.TrimSpace(in.ActorID) == "" {
+		return zero, NewBizError(40100, "actor is required", http.StatusUnauthorized)
+	}
+	if strings.TrimSpace(in.SpaceID) == "" {
+		return zero, NewBizError(40001, "space_id is required", http.StatusBadRequest)
+	}
+	if !ValidSummaryWorkflowIdempotencyKey(strings.TrimSpace(in.IdempotencyKey)) {
+		return zero, NewBizError(40005, "valid Idempotency-Key is required", http.StatusBadRequest)
+	}
+	if len(deduplicateWorkflowSources(in.Sources)) == 0 {
+		return zero, NewBizError(40001, "at least one authorised source is required", http.StatusBadRequest)
+	}
+
+	timeRange := in.TimeRange
+	if timeRange == nil {
+		end := timezone.Now()
+		start := end.Add(-AgentSummaryDefaultTimeRangeDays * 24 * time.Hour)
+		timeRange = &SummaryWorkflowTimeRange{Start: start, End: end}
+	}
+
+	normalized, err := s.normalize(LegacyCreateSummaryWorkflowInput{
+		ActorID:             in.ActorID,
+		CreatorID:           in.ActorID,
+		SpaceID:             in.SpaceID,
+		Title:               in.Title,
+		Topic:               in.Requirement,
+		TimeRange:           timeRange,
+		Sources:             in.Sources,
+		Participants:        in.Participants,
+		ConfirmTimeoutHours: in.ConfirmTimeoutHours,
+		OriginChannelID:     in.OriginChannelID,
+		OriginChannelType:   in.OriginChannelType,
+		IdempotencyKey:      in.IdempotencyKey,
+	})
+	if err != nil {
+		return zero, err
+	}
+	if normalized.target != expectedTarget {
+		return zero, NewBizError(40001, "workflow target does not match confirmed route", http.StatusBadRequest)
+	}
+
+	hashInput := normalized
+	// The default range is a server policy, not caller-owned request data. Its
+	// concrete timestamps change between retries, so omit them from the
+	// idempotency fingerprint while still persisting the first request's actual
+	// seven-day window. Explicit client ranges remain part of the hash.
+	if in.TimeRange == nil {
+		hashInput.explicitTimeRange = false
+	}
+	requestHash := canonicalSummaryWorkflowRequestHash(hashInput)
+	result, found, err := s.findIdempotentWorkflow(ctx, normalized, requestHash)
+	if err != nil {
+		return zero, err
+	}
+	if found {
+		return result, nil
+	}
+	result, err = s.persist(ctx, normalized, requestHash)
 	if errors.Is(err, errSummaryWorkflowIdempotencyRace) {
 		result, found, findErr := s.findIdempotentWorkflow(ctx, normalized, requestHash)
 		if findErr != nil {
