@@ -73,7 +73,8 @@ type chatResponse struct {
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
-		TotalTokens int `json:"total_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
 	} `json:"usage"`
 }
 
@@ -193,9 +194,10 @@ func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, 
 		truncated = true
 	}
 	return AssistantTurn{
-		Content:   msg.Content,
-		ToolCalls: msg.ToolCalls,
-		Tokens:    cr.Usage.TotalTokens,
-		Truncated: truncated,
+		Content:          msg.Content,
+		ToolCalls:        msg.ToolCalls,
+		Tokens:           cr.Usage.TotalTokens,
+		CompletionTokens: cr.Usage.CompletionTokens,
+		Truncated:        truncated,
 	}, llmfallback.Success, nil
 }

@@ -41,6 +41,16 @@ func (r *Registry) Schemas() []Tool {
 	return out
 }
 
+// Has reports whether name belongs to the registered tool vocabulary. Trace
+// logging uses this guard so a model-hallucinated tool name derived from user
+// input never reaches logs as if it were trusted metadata.
+func (r *Registry) Has(name string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.tools[name]
+	return ok
+}
+
 // Dispatch 按名分发。未知工具/handler panic 都转成错误返回，绝不中断回环。
 func (r *Registry) Dispatch(ctx context.Context, name string, args json.RawMessage) (result string, err error) {
 	r.mu.RLock()

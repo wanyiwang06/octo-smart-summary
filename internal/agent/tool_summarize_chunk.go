@@ -376,10 +376,16 @@ func SummarizeChunkTool() (Tool, Handler) {
 		// call summarizes toward the user's actual requirements. Empty when V2 is
 		// off / no run / no spec → legacy generic prompt.
 		specGuidance := loadRunSpecGuidance(ctx)
+		mapStart := time.Now()
 		summaries, err := summarizeChunksConcurrently(ctx, chunks, specGuidance, &cov)
 		if err != nil {
 			return "", err
 		}
+		// summarize_chunk is itself an LLM pipeline, so its own cost needs a
+		// breakdown in the run trace — otherwise it shows up as one opaque
+		// tool span and a slow Map is indistinguishable from a slow planner.
+		TraceFromContext(ctx).AddSubPhase(fmt.Sprintf("map(%dchunks)", len(chunks)),
+			time.Since(mapStart).Milliseconds())
 		cov.DroppedCount = cov.InputCount - cov.ProcessedCount
 		cov.Truncated = cov.DroppedCount > 0
 		recordDroppedMessages(ctx, uid, runID, cov.DroppedCount)
