@@ -32,6 +32,10 @@ const (
 	// legacy workflow default. The unified summary workspace promises a
 	// visible "最近 7 天" default whenever the user did not select a range.
 	AgentSummaryDefaultTimeRangeDays = 7
+
+	// legacySummaryDefaultTimeRangeDays preserves the pre-workbench behavior.
+	// The 90-day selectable upper bound must not silently widen this fallback.
+	legacySummaryDefaultTimeRangeDays = 31
 )
 
 var (
@@ -230,13 +234,16 @@ func (s *SummaryWorkflowService) CreatePersonalFromAgent(ctx context.Context, in
 	return s.createFromAgent(ctx, in, SummaryWorkflowPersonal)
 }
 
-// CreateTeamFromAgent creates a confirmed multi-user workflow. Proposal token,
-// version and scope checks live in the workspace session service immediately
-// before this method is called; this method independently enforces the
-// side-effect boundary that at least one other participant is present.
+// CreateTeamFromAgent creates a multi-user workflow. A shared source is
+// optional because invited participants may contribute source material from
+// their own authorised scope. The side-effect boundary still requires at
+// least one other participant and a non-empty requirement.
 func (s *SummaryWorkflowService) CreateTeamFromAgent(ctx context.Context, in AgentCreateSummaryWorkflowInput) (CreateSummaryWorkflowResult, error) {
 	if len(deduplicateWorkflowParticipants(in.Participants, in.ActorID)) == 0 {
 		return CreateSummaryWorkflowResult{}, NewBizError(40001, "team workflow requires at least one other participant", http.StatusBadRequest)
+	}
+	if strings.TrimSpace(in.Requirement) == "" {
+		return CreateSummaryWorkflowResult{}, NewBizError(40001, "team workflow requires a summary requirement", http.StatusBadRequest)
 	}
 	return s.createFromAgent(ctx, in, SummaryWorkflowTeam)
 }
@@ -255,8 +262,12 @@ func (s *SummaryWorkflowService) createFromAgent(ctx context.Context, in AgentCr
 	if !ValidSummaryWorkflowIdempotencyKey(strings.TrimSpace(in.IdempotencyKey)) {
 		return zero, NewBizError(40005, "valid Idempotency-Key is required", http.StatusBadRequest)
 	}
-	if len(deduplicateWorkflowSources(in.Sources)) == 0 {
+	sources := deduplicateWorkflowSources(in.Sources)
+	if expectedTarget == SummaryWorkflowPersonal && len(sources) == 0 {
 		return zero, NewBizError(40001, "at least one authorised source is required", http.StatusBadRequest)
+	}
+	if err := validateAgentWorkflowSources(sources); err != nil {
+		return zero, err
 	}
 
 	timeRange := in.TimeRange
@@ -273,7 +284,7 @@ func (s *SummaryWorkflowService) createFromAgent(ctx context.Context, in AgentCr
 		Title:               in.Title,
 		Topic:               in.Requirement,
 		TimeRange:           timeRange,
-		Sources:             in.Sources,
+		Sources:             sources,
 		Participants:        in.Participants,
 		ConfirmTimeoutHours: in.ConfirmTimeoutHours,
 		OriginChannelID:     in.OriginChannelID,
@@ -317,6 +328,16 @@ func (s *SummaryWorkflowService) createFromAgent(ctx context.Context, in AgentCr
 	return result, err
 }
 
+func validateAgentWorkflowSources(sources []SummaryWorkflowSource) *BizError {
+	for _, source := range sources {
+		if strings.TrimSpace(source.SourceID) == "" ||
+			source.SourceType < model.SourceGroup || source.SourceType > model.SourceDirect {
+			return NewBizError(40001, "each source requires source_id and source_type 1, 2, or 3", http.StatusBadRequest)
+		}
+	}
+	return nil
+}
+
 func (s *SummaryWorkflowService) normalize(in LegacyCreateSummaryWorkflowInput) (normalizedSummaryWorkflowInput, error) {
 	if strings.TrimSpace(in.SpaceID) == "" {
 		return normalizedSummaryWorkflowInput{}, NewBizError(40001, "space_id is required", http.StatusBadRequest)
@@ -345,7 +366,7 @@ func (s *SummaryWorkflowService) normalize(in LegacyCreateSummaryWorkflowInput) 
 		timeEnd = in.TimeRange.End
 	} else {
 		timeEnd = timezone.Now()
-		timeStart = timeEnd.Add(-time.Duration(s.maxTimeRangeDays) * 24 * time.Hour)
+		timeStart = timeEnd.Add(-legacySummaryDefaultTimeRangeDays * 24 * time.Hour)
 	}
 
 	scope := model.SnapshotScope{ChannelIDs: workflowChannelIDs(sources)}

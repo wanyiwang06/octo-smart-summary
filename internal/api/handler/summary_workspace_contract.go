@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
 const (
@@ -30,6 +32,9 @@ const (
 	workspaceSnapshotVersion          = 1
 	maxSummaryWorkspaceParticipants   = 100
 	maxSummaryWorkspaceReferencedTask = 20
+	summaryWorkspaceInputUser         = "user"
+	summaryWorkspaceInputTemplate     = "template"
+	summaryWorkspaceInputSystemIntent = "system_intent"
 )
 
 var errInvalidSummaryWorkspaceContext = errors.New("invalid summary workspace context")
@@ -223,6 +228,9 @@ func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorksp
 		if startErr != nil || endErr != nil || !end.After(start) || timeRange.Label == "" {
 			return out, fmt.Errorf("%w: invalid time_range", errInvalidSummaryWorkspaceContext)
 		}
+		if end.Sub(start) > time.Duration(pipeline.MaxTimeRangeDays)*24*time.Hour {
+			return out, fmt.Errorf("%w: time_range exceeds %d days", errInvalidSummaryWorkspaceContext, pipeline.MaxTimeRangeDays)
+		}
 		out.TimeRange = &timeRange
 	}
 
@@ -252,17 +260,23 @@ func marshalSummaryWorkspaceContext(context summaryWorkspaceContext) ([]byte, st
 	return data, hex.EncodeToString(sum[:]), nil
 }
 
-func summaryWorkspaceRequestHash(action, message string, scopeVersion int, scopeHash string) string {
+func summaryWorkspaceRequestHash(action, message string, scopeVersion int, scopeHash string, inputOrigin ...string) string {
+	origin := ""
+	if len(inputOrigin) > 0 {
+		origin = strings.TrimSpace(inputOrigin[0])
+	}
 	payload, _ := json.Marshal(struct {
 		Action       string `json:"action"`
 		Message      string `json:"message"`
 		ScopeVersion int    `json:"scope_version"`
 		ScopeHash    string `json:"scope_hash"`
+		InputOrigin  string `json:"input_origin,omitempty"`
 	}{
 		Action:       strings.TrimSpace(action),
 		Message:      strings.TrimSpace(message),
 		ScopeVersion: scopeVersion,
 		ScopeHash:    scopeHash,
+		InputOrigin:  origin,
 	})
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:])

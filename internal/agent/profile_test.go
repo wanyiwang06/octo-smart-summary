@@ -185,12 +185,12 @@ func TestGetProfile_SummaryWorkspace(t *testing.T) {
 	if !reg.IsTerminal("emit_summary_response") {
 		t.Fatal("summary_workspace registry is missing its terminal tool")
 	}
-	if got := len(reg.Schemas()); got != 9 {
-		t.Fatalf("Schemas len = %d, want 9", got)
+	if got := len(reg.Schemas()); got != 12 {
+		t.Fatalf("Schemas len = %d, want 12", got)
 	}
-	for _, forbidden := range []string{"list_channels", "narrow_channels_by_topic", "find_shared_channels"} {
-		if reg.Has(forbidden) {
-			t.Fatalf("summary_workspace must not expose cross-scope discovery tool %q", forbidden)
+	for _, discoveryTool := range []string{"list_channels", "narrow_channels_by_topic", "find_shared_channels"} {
+		if !reg.Has(discoveryTool) {
+			t.Fatalf("summary_workspace is missing guarded discovery tool %q", discoveryTool)
 		}
 	}
 

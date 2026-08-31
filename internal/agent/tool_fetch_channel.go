@@ -128,6 +128,7 @@ func FetchChannelTool() (Tool, Handler) {
 			recordFetch(false, false)
 			return "", fmt.Errorf("parse time_end: %w", err)
 		}
+		timeStart, timeEnd = ResolveAllowedTimeRange(ctx, timeStart, timeEnd)
 
 		// Security: validate channel accessibility for system-injected uid
 		options := []pipeline.ChannelQueryOption{pipeline.WithIncludeArchived(req.IncludeArchived)}

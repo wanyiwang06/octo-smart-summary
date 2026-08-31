@@ -269,6 +269,39 @@ func TestSetStatus(t *testing.T) {
 	}
 }
 
+func TestFinishRunningDoesNotOverwriteFailedRun(t *testing.T) {
+	db := newStoreTestDB(t)
+	if db == nil {
+		return
+	}
+	s := NewStore(db)
+	ctx := context.Background()
+
+	running, _, _ := s.CreateOrGetRun(ctx, "u1", "sess-running", "req-running", model.ScopePolicyOpen)
+	if err := s.SetStatus(ctx, "u1", running.RunID, model.RunStatusRunning); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+	if err := s.FinishRunning(ctx, "u1", running.RunID); err != nil {
+		t.Fatalf("FinishRunning: %v", err)
+	}
+	got, _ := s.GetByID(ctx, "u1", running.RunID)
+	if got.Status != model.RunStatusFinished {
+		t.Fatalf("running status = %q, want finished", got.Status)
+	}
+
+	failed, _, _ := s.CreateOrGetRun(ctx, "u1", "sess-failed", "req-failed", model.ScopePolicyOpen)
+	if err := s.SetStatus(ctx, "u1", failed.RunID, model.RunStatusFailed); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	if err := s.FinishRunning(ctx, "u1", failed.RunID); err != nil {
+		t.Fatalf("FinishRunning failed run: %v", err)
+	}
+	got, _ = s.GetByID(ctx, "u1", failed.RunID)
+	if got.Status != model.RunStatusFailed {
+		t.Fatalf("failed status overwritten with %q", got.Status)
+	}
+}
+
 func TestRecordChannelFetchAndDroppedMessages(t *testing.T) {
 	db := newStoreTestDB(t)
 	if db == nil {

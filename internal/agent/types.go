@@ -3,6 +3,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"sort"
+	"sync"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
@@ -146,17 +149,38 @@ func SelectedArchivedChannelIDs(ctx context.Context) []string {
 type ChannelScope struct {
 	ChannelID   string
 	ChannelType int
+	ChannelName string
+	SpaceID     string
+	IsArchived  bool
 }
 
 type contextKeyAllowedChannelScope struct{}
 
-// WithAllowedChannelScope restricts channel-reading tools to the exact set
-// already authorised by the application layer. Calling it with an empty slice
-// intentionally installs an empty allowlist; absence of the value keeps legacy
-// Agent profiles unchanged.
-func WithAllowedChannelScope(ctx context.Context, channels []ChannelScope) context.Context {
-	uid, _ := ctx.Value(ContextKeyUID).(string)
-	allowed := make(map[int]map[string]struct{})
+type mutableChannelScope struct {
+	mu            sync.RWMutex
+	allowed       map[int]map[string]ChannelScope
+	discoveryOpen bool
+}
+
+func newMutableChannelScope(channels []ChannelScope, discoveryOpen bool, uid string) *mutableChannelScope {
+	scope := &mutableChannelScope{
+		allowed:       make(map[int]map[string]ChannelScope),
+		discoveryOpen: discoveryOpen,
+	}
+	scope.add(channels, uid)
+	return scope
+}
+
+func (s *mutableChannelScope) add(channels []ChannelScope, uid string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.addLocked(channels, uid)
+}
+
+func (s *mutableChannelScope) addLocked(channels []ChannelScope, uid string) {
 	for _, channel := range channels {
 		if channel.ChannelID == "" || channel.ChannelType == 0 {
 			continue
@@ -164,28 +188,165 @@ func WithAllowedChannelScope(ctx context.Context, channels []ChannelScope) conte
 		if uid != "" {
 			channel.ChannelID = pipeline.NormalizeDMChannelID(channel.ChannelID, uid, channel.ChannelType)
 		}
-		byID := allowed[channel.ChannelType]
+		byID := s.allowed[channel.ChannelType]
 		if byID == nil {
-			byID = make(map[string]struct{})
-			allowed[channel.ChannelType] = byID
+			byID = make(map[string]ChannelScope)
+			s.allowed[channel.ChannelType] = byID
 		}
-		byID[channel.ChannelID] = struct{}{}
+		byID[channel.ChannelID] = channel
 	}
-	return context.WithValue(ctx, contextKeyAllowedChannelScope{}, allowed)
+}
+
+func (s *mutableChannelScope) replace(channels []ChannelScope, uid string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.allowed = make(map[int]map[string]ChannelScope)
+	s.addLocked(channels, uid)
+}
+
+// WithAllowedChannelScope restricts channel-reading tools to the exact set
+// already authorised by the application layer. Calling it with an empty slice
+// intentionally installs an empty allowlist; absence of the value keeps legacy
+// Agent profiles unchanged.
+func WithAllowedChannelScope(ctx context.Context, channels []ChannelScope) context.Context {
+	uid, _ := ctx.Value(ContextKeyUID).(string)
+	return context.WithValue(ctx, contextKeyAllowedChannelScope{}, newMutableChannelScope(channels, false, uid))
+}
+
+// WithDiscoverableChannelScope installs an initially-empty allowlist that may
+// be expanded only by a trusted discovery tool after it has resolved channel
+// membership. list_channels expands it only for an explicit commit_scope=true
+// all-visible-channels decision; exploratory listing remains read-only.
+func WithDiscoverableChannelScope(ctx context.Context, initial ...[]ChannelScope) context.Context {
+	uid, _ := ctx.Value(ContextKeyUID).(string)
+	var channels []ChannelScope
+	if len(initial) > 0 {
+		channels = initial[0]
+	}
+	return context.WithValue(ctx, contextKeyAllowedChannelScope{}, newMutableChannelScope(channels, true, uid))
+}
+
+// AuthorizeDiscoveredChannels adds channels returned by a trusted discovery
+// operation to an open request scope. It is a no-op for closed UI scopes.
+func AuthorizeDiscoveredChannels(ctx context.Context, channels []pipeline.ChannelInfo) bool {
+	scope, ok := ctx.Value(contextKeyAllowedChannelScope{}).(*mutableChannelScope)
+	if !ok || scope == nil || !scope.discoveryOpen {
+		return false
+	}
+	uid, _ := ctx.Value(ContextKeyUID).(string)
+	grants := make([]ChannelScope, 0, len(channels))
+	for _, channel := range channels {
+		grants = append(grants, ChannelScope{
+			ChannelID:   channel.ChannelID,
+			ChannelType: channel.ChannelType,
+			ChannelName: channel.ChannelName,
+			SpaceID:     channel.SpaceID,
+			IsArchived:  channel.IsArchived,
+		})
+	}
+	scope.replace(grants, uid)
+	return true
+}
+
+// AllowedChannelScopes returns a stable copy of the effective scope selected
+// by the UI or granted by discovery during this request.
+func AllowedChannelScopes(ctx context.Context) []ChannelScope {
+	scope, ok := ctx.Value(contextKeyAllowedChannelScope{}).(*mutableChannelScope)
+	if !ok || scope == nil {
+		return nil
+	}
+	scope.mu.RLock()
+	defer scope.mu.RUnlock()
+	channels := make([]ChannelScope, 0)
+	for _, byID := range scope.allowed {
+		for _, channel := range byID {
+			channels = append(channels, channel)
+		}
+	}
+	sort.Slice(channels, func(i, j int) bool {
+		if channels[i].ChannelType != channels[j].ChannelType {
+			return channels[i].ChannelType < channels[j].ChannelType
+		}
+		return channels[i].ChannelID < channels[j].ChannelID
+	})
+	return channels
+}
+
+// RestrictDiscoveredChannels keeps discovery results inside a closed UI scope.
+// Open discovery and legacy contexts pass through; only explicit workspace
+// selections are reduced to their allowlisted channels.
+func RestrictDiscoveredChannels(ctx context.Context, channels []pipeline.ChannelInfo) []pipeline.ChannelInfo {
+	scope, restricted := ctx.Value(contextKeyAllowedChannelScope{}).(*mutableChannelScope)
+	if !restricted || scope == nil || scope.discoveryOpen {
+		return channels
+	}
+	scope.mu.RLock()
+	defer scope.mu.RUnlock()
+	filtered := make([]pipeline.ChannelInfo, 0, len(channels))
+	uid, _ := ctx.Value(ContextKeyUID).(string)
+	for _, channel := range channels {
+		lookupID := pipeline.NormalizeDMChannelID(channel.ChannelID, uid, channel.ChannelType)
+		if _, ok := scope.allowed[channel.ChannelType][lookupID]; ok {
+			filtered = append(filtered, channel)
+		}
+	}
+	return filtered
 }
 
 // ChannelAllowedByScope reports whether a request-scoped allowlist exists and
 // whether the exact channel/type pair belongs to it.
 func ChannelAllowedByScope(ctx context.Context, channelID string, channelType int) (restricted, allowed bool) {
-	scope, restricted := ctx.Value(contextKeyAllowedChannelScope{}).(map[int]map[string]struct{})
-	if !restricted {
+	scope, restricted := ctx.Value(contextKeyAllowedChannelScope{}).(*mutableChannelScope)
+	if !restricted || scope == nil {
 		return false, false
 	}
 	if uid, _ := ctx.Value(ContextKeyUID).(string); uid != "" {
 		channelID = pipeline.NormalizeDMChannelID(channelID, uid, channelType)
 	}
-	_, allowed = scope[channelType][channelID]
+	scope.mu.RLock()
+	defer scope.mu.RUnlock()
+	_, allowed = scope.allowed[channelType][channelID]
 	return true, allowed
+}
+
+type contextKeyWorkspaceSpaceID struct{}
+
+// WithWorkspaceSpaceID scopes discovery results to the active Octo space.
+// Legacy Agent flows omit this value and retain their existing global view.
+func WithWorkspaceSpaceID(ctx context.Context, spaceID string) context.Context {
+	return context.WithValue(ctx, contextKeyWorkspaceSpaceID{}, spaceID)
+}
+
+func WorkspaceSpaceID(ctx context.Context) string {
+	spaceID, _ := ctx.Value(contextKeyWorkspaceSpaceID{}).(string)
+	return spaceID
+}
+
+type allowedTimeRange struct {
+	start time.Time
+	end   time.Time
+}
+
+type contextKeyAllowedTimeRange struct{}
+
+// WithAllowedTimeRange pins all workspace reads to the server-materialized
+// time window. Tool arguments remain in the schema for legacy profiles, but a
+// workspace caller cannot accidentally expand or shift this boundary.
+func WithAllowedTimeRange(ctx context.Context, start, end time.Time) context.Context {
+	return context.WithValue(ctx, contextKeyAllowedTimeRange{}, allowedTimeRange{start: start, end: end})
+}
+
+// ResolveAllowedTimeRange returns the trusted workspace range when present;
+// otherwise it preserves the caller-provided values.
+func ResolveAllowedTimeRange(ctx context.Context, requestedStart, requestedEnd time.Time) (time.Time, time.Time) {
+	allowed, ok := ctx.Value(contextKeyAllowedTimeRange{}).(allowedTimeRange)
+	if !ok || allowed.start.IsZero() || allowed.end.IsZero() {
+		return requestedStart, requestedEnd
+	}
+	return allowed.start, allowed.end
 }
 
 // ErrChannelOutsideSelectedScope is returned when an Agent tries to read a

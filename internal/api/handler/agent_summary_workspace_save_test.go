@@ -199,6 +199,70 @@ func TestCreateAgentSummary_WorkspaceSaveUsesPayloadAndPreservesHistory(t *testi
 	}
 }
 
+func TestCreateAgentSummary_WorkspaceSaveUsesServerEffectiveScope(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	fixture := seedWorkspaceSaveFixture(t, db, "workspace-save-effective-scope")
+	start := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	emptyScope := summaryWorkspaceContext{
+		SelectedChannels:  []summaryWorkspaceChannel{},
+		Participants:      []summaryWorkspaceParticipant{},
+		Template:          &summaryWorkspaceTemplate{TemplateID: "weekly", Label: "周报", Requirement: "总结进展"},
+		ReferencedTaskIDs: []int64{},
+	}
+	scopeJSON, _, err := marshalSummaryWorkspaceContext(emptyScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadJSON, err := json.Marshal(agent.SummaryResponsePayload{
+		ResultType:      agent.SummaryResultAgentPreview,
+		Reply:           "已按最近聊天生成预览。",
+		ExecutionTarget: "agent_preview",
+		Preview: &agent.SummaryResponsePreview{
+			Content: "# 最近聊天总结",
+			Version: fixture.Message.ArtifactVersion,
+			EffectiveScope: &agent.SummaryResponseEffectiveScope{
+				Channels:  []agent.SummaryResponseChannel{{ChannelID: "recent-group", ChannelType: model.ChannelTypeGroup, ChannelName: "最近群聊"}},
+				TimeRange: &agent.SummaryResponseTimeRange{Start: start.Format(time.RFC3339), End: end.Format(time.RFC3339), Label: "最近 7 天（默认）"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&model.AgentSummarySession{}).Where("id = ?", fixture.Session.ID).Update("scope_json", string(scopeJSON)).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&model.AgentMessage{}).Where("id = ?", fixture.Message.ID).Update("response_payload_json", string(payloadJSON)).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	r := setupAgentSummaryRouter(h)
+	w := doAgentSave(t, r, fixture.Body, map[string]string{"Idempotency-Key": "workspace-effective-key"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("workspace save want 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var task model.SummaryTask
+	if err := db.Where("creator_id = ?", "test-user").Take(&task).Error; err != nil {
+		t.Fatal(err)
+	}
+	if task.OriginChannelID != "recent-group" || task.OriginChannelType != model.OriginChannelGroup {
+		t.Fatalf("origin = %q/%d, want inferred recent group", task.OriginChannelID, task.OriginChannelType)
+	}
+	if !task.TimeRangeStart.Equal(start) || !task.TimeRangeEnd.Equal(end) {
+		t.Fatalf("time range = %s..%s, want %s..%s", task.TimeRangeStart, task.TimeRangeEnd, start, end)
+	}
+	var source model.SummarySource
+	if err := db.Where("task_id = ?", task.ID).Take(&source).Error; err != nil {
+		t.Fatal(err)
+	}
+	if source.SourceID != "recent-group" || source.SourceType != model.SourceGroup {
+		t.Fatalf("saved source = %#v", source)
+	}
+}
+
 func TestCreateAgentSummary_WorkspaceSavePreservesSelectedTimeRange(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
 	start := time.Date(2026, 8, 1, 9, 30, 0, 0, time.FixedZone("CST", 8*60*60))

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
@@ -29,11 +30,13 @@ const summaryWorkspaceTurnLease = 6 * time.Minute
 // summaryWorkspaceCoordinator owns only the unified-entry orchestration. The
 // existing chat profiles and legacy summary endpoints keep their old behavior.
 type summaryWorkspaceCoordinator struct {
-	db               *gorm.DB
-	imDB             *gorm.DB
-	store            *AgentWorkspaceStore
-	workflow         *service.SummaryWorkflowService
-	workerTriggerURL string
+	db                *gorm.DB
+	imDB              *gorm.DB
+	store             *AgentWorkspaceStore
+	workflow          *service.SummaryWorkflowService
+	workerTriggerURL  string
+	messageTableCount int
+	now               func() time.Time
 }
 
 type summaryWorkspaceResponder struct {
@@ -105,12 +108,18 @@ func (h *AgentChatHandler) ConfigureSummaryWorkspace(imDB *gorm.DB, workerTrigge
 	if h == nil || h.db == nil {
 		return
 	}
+	msgTableCount := agent.GetSummaryConfig().MsgTableCount
+	if msgTableCount <= 0 {
+		msgTableCount = 5
+	}
 	h.workspace = &summaryWorkspaceCoordinator{
-		db:               h.db,
-		imDB:             imDB,
-		store:            NewAgentWorkspaceStore(h.db),
-		workflow:         service.NewSummaryWorkflowService(h.db, imDB, pipeline.DefaultTimeRangeDays),
-		workerTriggerURL: workerTriggerURL,
+		db:                h.db,
+		imDB:              imDB,
+		store:             NewAgentWorkspaceStore(h.db),
+		workflow:          service.NewSummaryWorkflowService(h.db, imDB, pipeline.MaxTimeRangeDays),
+		workerTriggerURL:  workerTriggerURL,
+		messageTableCount: msgTableCount,
+		now:               time.Now,
 	}
 }
 
@@ -119,8 +128,9 @@ func (h *AgentChatHandler) ConfigureSummaryWorkspace(imDB *gorm.DB, workerTrigge
 func (h *AgentChatHandler) SummaryWorkspaceCapabilities(c *gin.Context) {
 	enabled := h != nil && h.workspace != nil
 	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: gin.H{
-		"enabled":          enabled,
-		"contract_version": summaryWorkspaceContractVersion,
+		"enabled":             enabled,
+		"contract_version":    summaryWorkspaceContractVersion,
+		"max_time_range_days": pipeline.MaxTimeRangeDays,
 	}})
 }
 
@@ -159,6 +169,11 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: err.Error()})
 		return
 	}
+	req.InputOrigin, err = normalizeSummaryWorkspaceInputOrigin(req.InputOrigin, contextValue, req.Message)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: err.Error()})
+		return
+	}
 	uid, spaceID := middleware.GetUserID(c), middleware.GetSpaceID(c)
 	if uid == "" || spaceID == "" {
 		c.JSON(http.StatusUnauthorized, apiResponse{Code: 40100, Message: "missing auth context"})
@@ -175,7 +190,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	begin, err := h.workspace.store.BeginTurn(c.Request.Context(), WorkspaceBeginTurnInput{
 		Key:           key,
 		RequestID:     req.RequestID,
-		RequestHash:   summaryWorkspaceRequestHash(req.Action, req.Message, req.ScopeVersion, scopeHash),
+		RequestHash:   summaryWorkspaceRequestHash(req.Action, req.Message, req.ScopeVersion, scopeHash, req.InputOrigin),
 		ScopeVersion:  req.ScopeVersion,
 		ScopeJSON:     scopeJSON,
 		ScopeHash:     scopeHash,
@@ -215,6 +230,39 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		}
 	}
 
+	intent := classifySummaryWorkspaceIntent(req.Message, begin.Snapshot.CurrentPreview != nil)
+	if begin.Snapshot.CurrentPreview != nil && hasExplicitSummaryExecutionCommand(req.Message) {
+		intent = service.SummaryIntentGenerate
+	}
+	selectedSourceExplicit := len(contextValue.SelectedChannels) > 0
+	hasRequirement := summaryWorkspaceHasRequirement(contextValue, req.Message, req.InputOrigin)
+	openScopeAgent := !selectedSourceExplicit && len(contextValue.Participants) == 0 &&
+		len(contextValue.ReferencedTaskIDs) == 0 && summaryWorkspaceUserRequirement(req.Message, req.InputOrigin) != ""
+	contextValue, inferredSource, err := h.workspace.materializeWorkspaceAgentContext(
+		c.Request.Context(), spaceID, uid, contextValue, begin.Snapshot, intent, req.InputOrigin,
+	)
+	if err != nil {
+		if errors.Is(err, errSummaryWorkspaceNoRecentChannel) {
+			reply := "所选时间范围内没有找到可总结的聊天消息，请选择一个聊天或调整时间范围。"
+			snapshot, completeErr := h.completeWorkspaceConversation(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req, workspaceResultClarification, reply)
+			if completeErr != nil {
+				failTurn("RECENT_SOURCE_PERSIST_FAILED")
+				responder.failService(completeErr, "summary workspace failed")
+				return
+			}
+			turn, turnErr := h.workspace.turnFromSnapshot(c.Request.Context(), req.SessionID, snapshot, 0, begin.Turn.RunID)
+			if turnErr != nil {
+				responder.fail(http.StatusInternalServerError, 50000, "failed to build summary workspace response", true)
+				return
+			}
+			responder.turn(turn)
+			return
+		}
+		failTurn("SOURCE_DISCOVERY_FAILED")
+		responder.fail(http.StatusInternalServerError, 50000, "查找最近聊天失败", true)
+		return
+	}
+
 	sourcesValid, err := h.workspace.validateSources(c.Request.Context(), spaceID, uid, contextValue.SelectedChannels)
 	if err != nil {
 		failTurn("SOURCE_LOOKUP_FAILED")
@@ -233,7 +281,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		responder.fail(http.StatusInternalServerError, 50000, "读取引用总结失败", true)
 		return
 	}
-	if participantsValid && len(contextValue.Participants) > 0 {
+	if participantsValid && len(contextValue.Participants) > 0 && len(contextValue.SelectedChannels) > 0 {
 		participantsValid, err = h.workspace.validateTeamScope(c.Request.Context(), uid, contextValue.SelectedChannels, contextValue.Participants)
 		if err != nil {
 			failTurn("TEAM_SCOPE_LOOKUP_FAILED")
@@ -241,27 +289,27 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 			return
 		}
 	}
-	intent := classifySummaryWorkspaceIntent(req.Message, begin.Snapshot.CurrentPreview != nil)
-	if begin.Snapshot.CurrentPreview != nil && hasExplicitSummaryExecutionCommand(req.Message) {
-		intent = service.SummaryIntentGenerate
-	}
-	explicitRunIntent := intent == service.SummaryIntentGenerate && hasExplicitSummaryRunIntent(req.Message)
-	route := deriveWorkspaceRoute(contextValue, intent, explicitRunIntent, begin.Snapshot, participantsValid, sourcesValid, referencesValid)
+	explicitRunIntent := intent == service.SummaryIntentGenerate && summaryWorkspaceExecutionAuthorized(req.InputOrigin)
+	route := deriveWorkspaceRoute(contextValue, intent, explicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent, begin.Snapshot, participantsValid, sourcesValid, referencesValid)
 
 	var snapshot WorkspaceSnapshot
 	switch route {
 	case service.SummaryRoutePersonalWorkflow:
 		snapshot, err = h.completePersonalWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req, contextValue)
+	case service.SummaryRouteTeamWorkflow:
+		snapshot, err = h.completeTeamWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req.RequestID, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin))
 	case service.SummaryRouteTeamConfirmation:
 		snapshot, err = h.completeWorkspaceProposal(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req, contextValue)
 	case service.SummaryRouteAgentPreview, service.SummaryRouteAgentRevision, service.SummaryRouteExplanation:
-		snapshot, err = h.completeWorkspaceAgentTurn(c.Request.Context(), responder, key, begin.Turn.ID, begin.Turn.Attempt, req, contextValue, begin.Snapshot, route)
+		snapshot, err = h.completeWorkspaceAgentTurn(c.Request.Context(), responder, key, begin.Turn.ID, begin.Turn.Attempt, req, contextValue, begin.Snapshot, route, openScopeAgent, inferredSource)
 	default:
 		reply := "请先选择一个你有权限的会话，再告诉我希望总结的内容。"
 		if len(contextValue.ReferencedTaskIDs) > 0 && !referencesValid {
 			reply = "部分引用总结不可用，请调整后重试。"
 		} else if len(contextValue.Participants) > 0 && !participantsValid {
 			reply = "多人总结目前仅支持一个群聊，且参与者必须都是该群有效成员。"
+		} else if len(contextValue.Participants) > 0 && !hasRequirement {
+			reply = "请选择模板或输入总结要求后再开始多人总结。"
 		} else if len(contextValue.SelectedChannels) > 0 && !sourcesValid {
 			reply = "当前会话不可访问，请重新选择会话。"
 		}
@@ -317,7 +365,7 @@ func (h *AgentChatHandler) completeWorkspaceConversation(ctx context.Context, ke
 }
 
 func (h *AgentChatHandler) completeWorkspaceProposal(ctx context.Context, key WorkspaceSessionKey, turnID int64, attempt int, req agentChatRequest, contextValue summaryWorkspaceContext) (WorkspaceSnapshot, error) {
-	requirement := summaryWorkspaceRequirement(contextValue, req.Message)
+	requirement := summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin)
 	proposal := summaryWorkspaceProposal{
 		Participants:     append([]summaryWorkspaceParticipant(nil), contextValue.Participants...),
 		Requirement:      requirement,
@@ -367,7 +415,7 @@ func (h *AgentChatHandler) completePersonalWorkspaceWorkflow(ctx context.Context
 		ActorID:           key.UserID,
 		SpaceID:           key.SpaceID,
 		Title:             summaryWorkspaceTitle(contextValue),
-		Requirement:       summaryWorkspaceRequirement(contextValue, req.Message),
+		Requirement:       summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin),
 		TimeRange:         timeRange,
 		Sources:           summaryWorkspaceSources(contextValue),
 		OriginChannelID:   originID,
@@ -415,6 +463,81 @@ func (h *AgentChatHandler) completePersonalWorkspaceWorkflow(ctx context.Context
 	})
 }
 
+// completeTeamWorkspaceWorkflow is shared by the direct workbench route and
+// the legacy proposal-confirm endpoint. The workflow service owns durable task
+// idempotency; the workspace store then folds the returned task into the exact
+// turn that initiated it. A retry after task creation but before turn folding
+// therefore reuses the task instead of inviting participants twice.
+func (h *AgentChatHandler) completeTeamWorkspaceWorkflow(
+	ctx context.Context,
+	key WorkspaceSessionKey,
+	turnID int64,
+	attempt int,
+	idempotencyKey string,
+	userMessage string,
+	scopeVersion int,
+	contextValue summaryWorkspaceContext,
+	requirement string,
+) (WorkspaceSnapshot, error) {
+	timeRange, err := workspaceWorkflowTimeRange(contextValue)
+	if err != nil {
+		return WorkspaceSnapshot{}, err
+	}
+	originID, originType := summaryWorkspaceOrigin(contextValue)
+	created, err := h.workspace.workflow.CreateTeamFromAgent(ctx, service.AgentCreateSummaryWorkflowInput{
+		ActorID:             key.UserID,
+		SpaceID:             key.SpaceID,
+		Title:               summaryWorkspaceTitle(contextValue),
+		Requirement:         strings.TrimSpace(requirement),
+		TimeRange:           timeRange,
+		Sources:             summaryWorkspaceSources(contextValue),
+		Participants:        summaryWorkspaceParticipants(contextValue, key.UserID),
+		ConfirmTimeoutHours: 24,
+		OriginChannelID:     originID,
+		OriginChannelType:   originType,
+		IdempotencyKey:      idempotencyKey,
+	})
+	if err != nil {
+		return WorkspaceSnapshot{}, err
+	}
+	if created.WorkerTrigger != nil && !created.Replayed {
+		go h.workspace.triggerWorker(*created.WorkerTrigger)
+	}
+	resultType := workspaceResultWorkflowStarted
+	reply := fmt.Sprintf("已发起 %d 人协作总结。", len(contextValue.Participants))
+	terminal := false
+	saved := false
+	if created.Task.Status == model.StatusCompleted {
+		resultType = workspaceResultWorkflowCompleted
+		reply = "团队总结已完成并自动保存。"
+		terminal = true
+		saved = true
+	}
+	payload, err := json.Marshal(agent.SummaryResponsePayload{
+		ResultType:      resultType,
+		Reply:           reply,
+		ExecutionTarget: "team_workflow",
+		Workflow: &agent.SummaryResponseWorkflow{
+			TaskID: created.Task.ID,
+			Status: strconv.Itoa(created.Task.Status),
+			Saved:  saved,
+		},
+	})
+	if err != nil {
+		return WorkspaceSnapshot{}, err
+	}
+	return h.workspace.store.CompleteTurn(ctx, WorkspaceTurnCompletion{
+		Key:             key,
+		TurnID:          turnID,
+		Attempt:         attempt,
+		Messages:        workspaceConversationMessages(userMessage, reply, scopeVersion, resultType, payload),
+		ResultType:      resultType,
+		ResponsePayload: payload,
+		ScopeVersion:    scopeVersion,
+		Workflow:        &WorkspaceWorkflowMutation{TaskID: created.Task.ID, Scope: "team", Terminal: terminal},
+	})
+}
+
 func workspacePersistAgentMessages(messages []agent.Message, resultType string, payload json.RawMessage, scopeVersion, snapshotVersion, parentMessageID int) []WorkspacePersistMessage {
 	persisted := make([]WorkspacePersistMessage, 0, len(messages))
 	lastAssistant := -1
@@ -436,7 +559,7 @@ func workspacePersistAgentMessages(messages []agent.Message, resultType string, 
 	return persisted
 }
 
-func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, responder *summaryWorkspaceResponder, key WorkspaceSessionKey, turnID int64, attempt int, req agentChatRequest, contextValue summaryWorkspaceContext, before WorkspaceSnapshot, route service.SummaryRoute) (WorkspaceSnapshot, error) {
+func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, responder *summaryWorkspaceResponder, key WorkspaceSessionKey, turnID int64, attempt int, req agentChatRequest, contextValue summaryWorkspaceContext, before WorkspaceSnapshot, route service.SummaryRoute, openScopeAgent, inferredSource bool) (WorkspaceSnapshot, error) {
 	agentSessionID := strings.TrimSpace(before.Session.AgentSessionID)
 	if agentSessionID == "" {
 		agentSessionID = summaryWorkspaceAgentSessionID(key.SpaceID, key.SessionID, req.ScopeVersion)
@@ -457,10 +580,25 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 		allowedChannels = append(allowedChannels, agent.ChannelScope{
 			ChannelID:   channel.ChatID,
 			ChannelType: toolChannelType(channel.ChatType),
+			ChannelName: channel.Name,
+			IsArchived:  channel.IsArchived,
 		})
 	}
 	ctx, system = applySelectedChannelContext(ctx, system, selected)
-	ctx = agent.WithAllowedChannelScope(ctx, allowedChannels)
+	ctx = agent.WithWorkspaceSpaceID(ctx, key.SpaceID)
+	if openScopeAgent {
+		ctx = agent.WithDiscoverableChannelScope(ctx, allowedChannels)
+	} else {
+		ctx = agent.WithAllowedChannelScope(ctx, allowedChannels)
+	}
+	if contextValue.TimeRange != nil {
+		start, startErr := time.Parse(time.RFC3339, contextValue.TimeRange.Start)
+		end, endErr := time.Parse(time.RFC3339, contextValue.TimeRange.End)
+		if startErr != nil || endErr != nil {
+			return WorkspaceSnapshot{}, errors.New("invalid effective workspace time range")
+		}
+		ctx = agent.WithAllowedTimeRange(ctx, start, end)
+	}
 	// Keep the existing V2 run/spec/evidence chain so preview saving can bind the
 	// exact assistant message to its generation request and finish-gate result.
 	workspaceRunRequest := req
@@ -500,7 +638,11 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	} else if route == service.SummaryRouteExplanation {
 		allowedResult = agent.SummaryResultExplanation
 	}
-	ctx = agent.WithAllowedSummaryResultTypes(ctx, allowedResult)
+	allowedResults := []string{allowedResult}
+	if openScopeAgent && route == service.SummaryRouteAgentPreview {
+		allowedResults = append(allowedResults, agent.SummaryResultClarification)
+	}
+	ctx = agent.WithAllowedSummaryResultTypes(ctx, allowedResults...)
 	ctx = context.WithValue(ctx, agent.ContextKeyRunOwnerID, key.UserID)
 	ctx = context.WithValue(ctx, agent.ContextKeySessionID, agentSessionID)
 
@@ -528,18 +670,29 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	if err := json.Unmarshal(result.Terminal.Payload, &payload); err != nil {
 		return WorkspaceSnapshot{}, err
 	}
-	if payload.ResultType != allowedResult {
+	if !containsString(allowedResults, payload.ResultType) {
 		return WorkspaceSnapshot{}, fmt.Errorf("unexpected terminal result %q for route %q", payload.ResultType, route)
 	}
 	parentMessageID := 0
 	snapshotVersion := 0
 	if payload.Preview != nil {
+		effectiveChannels := append([]summaryWorkspaceChannel(nil), contextValue.SelectedChannels...)
+		if openScopeAgent {
+			effectiveChannels = summaryWorkspaceChannelsFromAgentScope(agent.AllowedChannelScopes(ctx))
+		}
+		if len(effectiveChannels) == 0 && len(contextValue.ReferencedTaskIDs) == 0 {
+			return WorkspaceSnapshot{}, errors.New("summary workspace preview has no authorised source")
+		}
 		nextVersion := before.Session.ArtifactVersion + 1
 		if nextVersion <= 0 {
 			nextVersion = 1
 		}
 		payload.Preview.Version = nextVersion
 		payload.Preview.Assumptions = appendUniqueStrings(payload.Preview.Assumptions, summaryWorkspaceAssumptions(contextValue)...)
+		if inferredSource && len(effectiveChannels) == 1 {
+			payload.Preview.Assumptions = appendUniqueStrings(payload.Preview.Assumptions, "未指定聊天，使用最近活跃聊天「"+effectiveChannels[0].Name+"」")
+		}
+		payload.Preview.EffectiveScope = summaryWorkspaceEffectiveScopePayload(contextValue, effectiveChannels)
 		snapshotVersion = workspaceSnapshotVersion
 		if route == service.SummaryRouteAgentRevision {
 			if before.CurrentPreview == nil {
@@ -555,11 +708,12 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	if err != nil {
 		return WorkspaceSnapshot{}, err
 	}
-	return h.workspace.store.CompleteTurn(ctx, WorkspaceTurnCompletion{
+	resolvedRunID := firstNonEmpty(runID, beginRunID(messages))
+	snapshot, err := h.workspace.store.CompleteTurn(ctx, WorkspaceTurnCompletion{
 		Key:             key,
 		TurnID:          turnID,
 		Attempt:         attempt,
-		RunID:           firstNonEmpty(runID, beginRunID(messages)),
+		RunID:           resolvedRunID,
 		Messages:        workspacePersistAgentMessages(messages, payload.ResultType, canonicalPayload, req.ScopeVersion, snapshotVersion, parentMessageID),
 		ResultType:      payload.ResultType,
 		ResponsePayload: canonicalPayload,
@@ -567,6 +721,15 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 		SnapshotVersion: snapshotVersion,
 		ParentMessageID: int64(parentMessageID),
 	})
+	if err != nil {
+		return WorkspaceSnapshot{}, err
+	}
+	if resolvedRunID != "" && h.runStore != nil {
+		if err := h.runStore.FinishRunning(context.WithoutCancel(ctx), key.UserID, resolvedRunID); err != nil {
+			log.Printf("[summary-workspace] finish Agent run failed session=%s run=%s: %v", key.SessionID, resolvedRunID, err)
+		}
+	}
+	return snapshot, nil
 }
 
 func appendUniqueStrings(values []string, additions ...string) []string {
@@ -715,8 +878,8 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取引用总结失败"})
 		return
 	}
-	teamScopeValid := false
-	if participantsValid {
+	teamScopeValid := participantsValid && len(contextValue.SelectedChannels) == 0
+	if participantsValid && len(contextValue.SelectedChannels) > 0 {
 		teamScopeValid, err = h.workspace.validateTeamScope(c.Request.Context(), uid, contextValue.SelectedChannels, contextValue.Participants)
 		if err != nil {
 			failTurn("TEAM_SCOPE_LOOKUP_FAILED")
@@ -724,7 +887,7 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 			return
 		}
 	}
-	if !sourcesValid || !participantsValid || !referencesValid || !teamScopeValid {
+	if (len(contextValue.SelectedChannels) > 0 && !sourcesValid) || !participantsValid || !referencesValid || !teamScopeValid {
 		failTurn("CONFIRM_SCOPE_INVALID")
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "多人总结仅支持一个群聊，且参与者必须都是该群有效成员"})
 		return
@@ -741,66 +904,12 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取协作提案失败"})
 		return
 	}
-	timeRange, err := workspaceWorkflowTimeRange(contextValue)
-	if err != nil {
-		failTurn("TIME_RANGE_INVALID")
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "time_range 非法"})
-		return
-	}
-	originID, originType := summaryWorkspaceOrigin(contextValue)
-	created, err := h.workspace.workflow.CreateTeamFromAgent(c.Request.Context(), service.AgentCreateSummaryWorkflowInput{
-		ActorID:             uid,
-		SpaceID:             spaceID,
-		Title:               summaryWorkspaceTitle(contextValue),
-		Requirement:         proposal.Requirement,
-		TimeRange:           timeRange,
-		Sources:             summaryWorkspaceSources(contextValue),
-		Participants:        summaryWorkspaceParticipants(contextValue, uid),
-		ConfirmTimeoutHours: 24,
-		OriginChannelID:     originID,
-		OriginChannelType:   originType,
-		IdempotencyKey:      idempotencyKey,
-	})
+	snapshot, err := h.completeTeamWorkspaceWorkflow(
+		c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt,
+		idempotencyKey, "确认并发起协作", req.ScopeVersion, contextValue, proposal.Requirement,
+	)
 	if err != nil {
 		failTurn("WORKFLOW_CREATE_FAILED")
-		writeWorkspaceServiceError(c, err)
-		return
-	}
-	if created.WorkerTrigger != nil && !created.Replayed {
-		go h.workspace.triggerWorker(*created.WorkerTrigger)
-	}
-	resultType := workspaceResultWorkflowStarted
-	reply := fmt.Sprintf("已发起 %d 人协作总结。", len(contextValue.Participants))
-	terminal := false
-	saved := false
-	if created.Task.Status == model.StatusCompleted {
-		resultType = workspaceResultWorkflowCompleted
-		reply = "团队总结已完成并自动保存。"
-		terminal = true
-		saved = true
-	}
-	payload, _ := json.Marshal(agent.SummaryResponsePayload{
-		ResultType:      resultType,
-		Reply:           reply,
-		ExecutionTarget: "team_workflow",
-		Workflow: &agent.SummaryResponseWorkflow{
-			TaskID: created.Task.ID,
-			Status: strconv.Itoa(created.Task.Status),
-			Saved:  saved,
-		},
-	})
-	snapshot, err := h.workspace.store.CompleteTurn(c.Request.Context(), WorkspaceTurnCompletion{
-		Key:             key,
-		TurnID:          begin.Turn.ID,
-		Attempt:         begin.Turn.Attempt,
-		Messages:        workspaceConversationMessages("确认并发起协作", reply, req.ScopeVersion, resultType, payload),
-		ResultType:      resultType,
-		ResponsePayload: payload,
-		ScopeVersion:    req.ScopeVersion,
-		Workflow:        &WorkspaceWorkflowMutation{TaskID: created.Task.ID, Scope: "team", Terminal: terminal},
-	})
-	if err != nil {
-		failTurn("CONFIRM_PERSIST_FAILED")
 		if errors.Is(err, ErrWorkspaceScopeConflict) {
 			c.JSON(http.StatusConflict, apiResponse{Code: 40901, Message: "协作确认状态已变化，请刷新"})
 		} else if errors.Is(err, ErrWorkspaceTurnLeaseLost) {
@@ -952,27 +1061,30 @@ func hasExplicitSummaryRunIntent(message string) bool {
 		"prepare a team summary", "run the summary", "summarize")
 }
 
+func hasExplicitWorkspaceRunIntent(message string, template *summaryWorkspaceTemplate) bool {
+	if template == nil {
+		return hasExplicitSummaryRunIntent(message)
+	}
+
+	normalizedMessage := strings.TrimSpace(message)
+	normalizedRequirement := strings.TrimSpace(template.Requirement)
+	if normalizedRequirement != "" && normalizedMessage == normalizedRequirement {
+		return true
+	}
+	return hasExplicitSummaryExecutionCommand(message)
+}
+
+var summaryWorkspaceExecutionCommands = []string{
+	"开始总结", "直接生成总结", "立即生成总结", "发起总结", "发起多人总结", "准备多人总结任务",
+	"请根据当前选择生成总结", "请根据当前选择准备多人总结任务",
+	"start summary", "run the summary", "generate summary now",
+	"generate a summary from the current selection", "prepare a team summary task from the current selection",
+	"please generate a summary from the current selection", "please prepare a team summary task from the current selection",
+}
+
 func hasExplicitSummaryExecutionCommand(message string) bool {
-	message = strings.ToLower(strings.TrimSpace(message))
-	commands := []string{
-		"开始总结", "直接生成总结", "立即生成总结", "发起总结", "发起多人总结", "准备多人总结任务",
-		"请根据当前选择生成总结", "请根据当前选择准备多人总结任务",
-		"start summary", "run the summary", "generate summary now",
-		"generate a summary from the current selection", "prepare a team summary task from the current selection",
-		"please generate a summary from the current selection", "please prepare a team summary task from the current selection",
-	}
-	for _, command := range commands {
-		if message == command {
-			return true
-		}
-		if strings.HasPrefix(message, command) {
-			remainder := strings.TrimPrefix(message, command)
-			if remainder != "" && strings.ContainsRune(" ：:，,。.!！\n\t", []rune(remainder)[0]) {
-				return true
-			}
-		}
-	}
-	return false
+	_, matched := summaryWorkspaceExecutionCommandRemainder(message)
+	return matched
 }
 
 func isSummaryWorkspaceGeneratedExecutionMessage(message string) bool {
@@ -1003,22 +1115,24 @@ func containsAny(value string, needles ...string) bool {
 	return false
 }
 
-func deriveWorkspaceRoute(context summaryWorkspaceContext, intent service.SummaryIntent, hasExplicitRunIntent bool, state WorkspaceSnapshot, participantsValid, sourcesValid, referencesValid bool) service.SummaryRoute {
+func deriveWorkspaceRoute(context summaryWorkspaceContext, intent service.SummaryIntent, hasExplicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent bool, state WorkspaceSnapshot, participantsValid, sourcesValid, referencesValid bool) service.SummaryRoute {
 	hasPreview := state.CurrentPreview != nil
 	return service.DeriveSummaryRoute(service.SummaryRouteInput{
 		Action:                     service.SummaryActionChat,
 		Intent:                     intent,
 		HasExplicitRunIntent:       hasExplicitRunIntent,
+		HasSelectedSource:          selectedSourceExplicit,
 		HasValidSource:             sourcesValid,
 		HasSelectedTemplate:        context.Template != nil,
+		HasRequirement:             hasRequirement,
 		HasOtherParticipants:       len(context.Participants) > 0,
 		ParticipantsValid:          participantsValid,
 		HasCurrentPreview:          hasPreview,
 		PreviewScopeMatches:        hasPreview && state.CurrentPreview.ScopeVersion == state.Session.ScopeVersion,
 		HasTeamProposal:            state.Session.PendingProposalStatus == "pending",
 		TeamProposalScopeMatches:   state.Session.PendingProposalStatus == "pending" && state.Session.PendingProposalScopeVersion == state.Session.ScopeVersion,
-		HasEnoughContextForPreview: referencesValid && (sourcesValid || len(context.ReferencedTaskIDs) > 0),
-		HasHardMissingData:         !referencesValid || (!sourcesValid && len(context.ReferencedTaskIDs) == 0),
+		HasEnoughContextForPreview: referencesValid && (sourcesValid || len(context.ReferencedTaskIDs) > 0 || openScopeAgent),
+		HasHardMissingData:         !referencesValid,
 	})
 }
 
@@ -1050,23 +1164,76 @@ func canonicalizeSummaryWorkspaceContextForActor(contextValue summaryWorkspaceCo
 	return contextValue
 }
 
-func summaryWorkspaceRequirement(context summaryWorkspaceContext, message string) string {
+var errSummaryWorkspaceNoRecentChannel = errors.New("no recent authorised channel")
+
+func normalizeSummaryWorkspaceInputOrigin(raw string, contextValue summaryWorkspaceContext, message string) (string, error) {
+	origin := strings.ToLower(strings.TrimSpace(raw))
+	if origin == "" {
+		if contextValue.Template != nil && strings.TrimSpace(message) == strings.TrimSpace(contextValue.Template.Requirement) {
+			return summaryWorkspaceInputTemplate, nil
+		}
+		if isSummaryWorkspaceGeneratedExecutionMessage(message) {
+			return summaryWorkspaceInputSystemIntent, nil
+		}
+		return summaryWorkspaceInputUser, nil
+	}
+	switch origin {
+	case summaryWorkspaceInputUser, summaryWorkspaceInputTemplate, summaryWorkspaceInputSystemIntent:
+		return origin, nil
+	default:
+		return "", fmt.Errorf("input_origin 必须为 user、template 或 system_intent")
+	}
+}
+
+func summaryWorkspaceExecutionAuthorized(inputOrigin string) bool {
+	switch inputOrigin {
+	case summaryWorkspaceInputUser, summaryWorkspaceInputTemplate, summaryWorkspaceInputSystemIntent:
+		return true
+	default:
+		return false
+	}
+}
+
+func summaryWorkspaceUserRequirement(message, inputOrigin string) string {
+	if inputOrigin != summaryWorkspaceInputUser {
+		return ""
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return ""
+	}
+	if remainder, matched := summaryWorkspaceExecutionCommandRemainder(message); matched {
+		return remainder
+	}
+	return message
+}
+
+func summaryWorkspaceHasRequirement(contextValue summaryWorkspaceContext, message, inputOrigin string) bool {
+	return contextValue.Template != nil || summaryWorkspaceUserRequirement(message, inputOrigin) != ""
+}
+
+func summaryWorkspaceExecutionRequirement(contextValue summaryWorkspaceContext, message, inputOrigin string) string {
 	parts := make([]string, 0, 2)
-	if context.Template != nil && strings.TrimSpace(context.Template.Requirement) != "" {
-		parts = append(parts, strings.TrimSpace(context.Template.Requirement))
+	if contextValue.Template != nil && strings.TrimSpace(contextValue.Template.Requirement) != "" {
+		parts = append(parts, strings.TrimSpace(contextValue.Template.Requirement))
 	}
-	if strings.TrimSpace(message) != "" && !isSummaryWorkspaceGeneratedExecutionMessage(message) {
-		parts = append(parts, strings.TrimSpace(message))
-	}
-	if len(parts) == 0 {
-		return "请总结关键结论、进展、风险和行动项"
+	if requirement := summaryWorkspaceUserRequirement(message, inputOrigin); requirement != "" {
+		parts = append(parts, requirement)
 	}
 	return strings.Join(parts, "\n\n")
 }
 
+func summaryWorkspaceRequirement(context summaryWorkspaceContext, message string) string {
+	origin, _ := normalizeSummaryWorkspaceInputOrigin("", context, message)
+	if requirement := summaryWorkspaceExecutionRequirement(context, message, origin); requirement != "" {
+		return requirement
+	}
+	return "请按“概览、关键进展与结论、风险与未决问题、行动项”组织总结；仅在消息中有依据时填写负责人和截止时间"
+}
+
 func summaryWorkspaceAssumptions(context summaryWorkspaceContext) []string {
 	assumptions := make([]string, 0, 3)
-	if context.TimeRange == nil {
+	if context.TimeRange == nil || context.TimeRange.Label == "最近 7 天（默认）" {
 		assumptions = append(assumptions, "时间范围使用最近 7 天")
 	}
 	if context.Template == nil {
@@ -1076,6 +1243,281 @@ func summaryWorkspaceAssumptions(context summaryWorkspaceContext) []string {
 		assumptions = append(assumptions, "重点覆盖结论、进展、风险和行动项")
 	}
 	return assumptions
+}
+
+func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
+	ctx context.Context,
+	spaceID, actorID string,
+	contextValue summaryWorkspaceContext,
+	before WorkspaceSnapshot,
+	intent service.SummaryIntent,
+	inputOrigin string,
+) (summaryWorkspaceContext, bool, error) {
+	effective, err := hydrateSummaryWorkspaceContextFromPreview(contextValue, before.CurrentPreview, actorID)
+	if err != nil {
+		return contextValue, false, err
+	}
+	contextValue = effective
+
+	now := time.Now()
+	if w != nil && w.now != nil {
+		now = w.now()
+	}
+	needsRecentFallback := intent == service.SummaryIntentGenerate &&
+		len(contextValue.SelectedChannels) == 0 &&
+		len(contextValue.Participants) == 0 &&
+		len(contextValue.ReferencedTaskIDs) == 0 &&
+		contextValue.Template != nil &&
+		(inputOrigin == summaryWorkspaceInputTemplate || inputOrigin == summaryWorkspaceInputSystemIntent)
+	if needsRecentFallback {
+		contextValue = materializeSummaryWorkspaceDefaultTimeRange(contextValue, now)
+		start, end, rangeErr := parseSummaryWorkspaceTimeRange(contextValue.TimeRange)
+		if rangeErr != nil {
+			return contextValue, false, rangeErr
+		}
+		channel, findErr := w.findMostRecentAuthorizedChannel(ctx, spaceID, actorID, start, end)
+		if findErr != nil {
+			return contextValue, false, findErr
+		}
+		contextValue.SelectedChannels = []summaryWorkspaceChannel{channel}
+		return contextValue, true, nil
+	}
+
+	if len(contextValue.Participants) == 0 {
+		contextValue = materializeSummaryWorkspaceDefaultTimeRange(contextValue, now)
+	}
+	return contextValue, false, nil
+}
+
+func materializeSummaryWorkspaceDefaultTimeRange(contextValue summaryWorkspaceContext, now time.Time) summaryWorkspaceContext {
+	if contextValue.TimeRange != nil {
+		return contextValue
+	}
+	end := now.Truncate(time.Second)
+	start := end.Add(-time.Duration(service.AgentSummaryDefaultTimeRangeDays) * 24 * time.Hour)
+	contextValue.TimeRange = &summaryWorkspaceTimeRange{
+		Start: start.Format(time.RFC3339),
+		End:   end.Format(time.RFC3339),
+		Label: "最近 7 天（默认）",
+	}
+	return contextValue
+}
+
+func parseSummaryWorkspaceTimeRange(timeRange *summaryWorkspaceTimeRange) (time.Time, time.Time, error) {
+	if timeRange == nil {
+		return time.Time{}, time.Time{}, errors.New("workspace time range is required")
+	}
+	start, err := time.Parse(time.RFC3339, timeRange.Start)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	end, err := time.Parse(time.RFC3339, timeRange.End)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	return start, end, nil
+}
+
+func hydrateSummaryWorkspaceContextFromPreview(contextValue summaryWorkspaceContext, preview *model.AgentMessage, actorID string) (summaryWorkspaceContext, error) {
+	if preview == nil || preview.ResponsePayload == nil || strings.TrimSpace(*preview.ResponsePayload) == "" {
+		return contextValue, nil
+	}
+	var payload agent.SummaryResponsePayload
+	if err := json.Unmarshal([]byte(*preview.ResponsePayload), &payload); err != nil {
+		return contextValue, fmt.Errorf("decode preview effective scope: %w", err)
+	}
+	if payload.Preview == nil || payload.Preview.EffectiveScope == nil {
+		return contextValue, nil
+	}
+	effective := payload.Preview.EffectiveScope
+	if len(contextValue.SelectedChannels) == 0 && len(effective.Channels) > 0 {
+		channels := make([]summaryWorkspaceChannel, 0, len(effective.Channels))
+		for _, channel := range effective.Channels {
+			chatType := summaryWorkspaceChatType(channel.ChannelType)
+			if chatType == "" || strings.TrimSpace(channel.ChannelID) == "" {
+				return contextValue, errors.New("preview effective scope contains an invalid channel")
+			}
+			name := strings.TrimSpace(channel.ChannelName)
+			if name == "" {
+				name = channel.ChannelID
+			}
+			channels = append(channels, summaryWorkspaceChannel{
+				ChatID: channel.ChannelID, ChatType: chatType, Name: name, IsArchived: channel.IsArchived,
+			})
+		}
+		contextValue.SelectedChannels = channels
+	}
+	if contextValue.TimeRange == nil && effective.TimeRange != nil {
+		contextValue.TimeRange = &summaryWorkspaceTimeRange{
+			Start: effective.TimeRange.Start,
+			End:   effective.TimeRange.End,
+			Label: effective.TimeRange.Label,
+		}
+	}
+	normalized, err := normalizeSummaryWorkspaceContext(contextValue)
+	if err != nil {
+		return contextValue, err
+	}
+	return canonicalizeSummaryWorkspaceContextForActor(normalized, actorID), nil
+}
+
+func summaryWorkspaceEffectiveScopePayload(contextValue summaryWorkspaceContext, channels []summaryWorkspaceChannel) *agent.SummaryResponseEffectiveScope {
+	effective := &agent.SummaryResponseEffectiveScope{
+		Channels: make([]agent.SummaryResponseChannel, 0, len(channels)),
+	}
+	for _, channel := range channels {
+		effective.Channels = append(effective.Channels, agent.SummaryResponseChannel{
+			ChannelID: channel.ChatID, ChannelType: toolChannelType(channel.ChatType), ChannelName: channel.Name, IsArchived: channel.IsArchived,
+		})
+	}
+	if contextValue.TimeRange != nil {
+		effective.TimeRange = &agent.SummaryResponseTimeRange{
+			Start: contextValue.TimeRange.Start, End: contextValue.TimeRange.End, Label: contextValue.TimeRange.Label,
+		}
+	}
+	return effective
+}
+
+func summaryWorkspaceChannelsFromAgentScope(channels []agent.ChannelScope) []summaryWorkspaceChannel {
+	result := make([]summaryWorkspaceChannel, 0, len(channels))
+	for _, channel := range channels {
+		chatType := summaryWorkspaceChatType(channel.ChannelType)
+		if chatType == "" || strings.TrimSpace(channel.ChannelID) == "" {
+			continue
+		}
+		name := strings.TrimSpace(channel.ChannelName)
+		if name == "" {
+			name = channel.ChannelID
+		}
+		result = append(result, summaryWorkspaceChannel{
+			ChatID: channel.ChannelID, ChatType: chatType, Name: name, IsArchived: channel.IsArchived,
+		})
+	}
+	return result
+}
+
+func summaryWorkspaceChatType(channelType int) string {
+	switch channelType {
+	case model.ChannelTypeGroup:
+		return "group"
+	case model.ChannelTypeThread:
+		return "thread"
+	case model.ChannelTypeDM:
+		return "direct"
+	default:
+		return ""
+	}
+}
+
+func (w *summaryWorkspaceCoordinator) findMostRecentAuthorizedChannel(ctx context.Context, spaceID, actorID string, start, end time.Time) (summaryWorkspaceChannel, error) {
+	if w == nil || w.imDB == nil {
+		return summaryWorkspaceChannel{}, errors.New("IM database not available")
+	}
+	channels, err := pipeline.GetUserChannels(ctx, actorID, w.imDB)
+	if err != nil {
+		return summaryWorkspaceChannel{}, err
+	}
+	discoveryCtx := agent.WithWorkspaceSpaceID(ctx, spaceID)
+	channels, err = agent.FilterChannelsForWorkspace(discoveryCtx, actorID, w.imDB, channels)
+	if err != nil {
+		return summaryWorkspaceChannel{}, err
+	}
+	if len(channels) == 0 {
+		return summaryWorkspaceChannel{}, errSummaryWorkspaceNoRecentChannel
+	}
+
+	tableCount := w.messageTableCount
+	if tableCount <= 0 {
+		tableCount = 5
+	}
+	type recentCandidate struct {
+		info      pipeline.ChannelInfo
+		timestamp int64
+	}
+	byKey := make(map[string]pipeline.ChannelInfo, len(channels))
+	buckets := make(map[string][]pipeline.ChannelInfo)
+	for _, channel := range channels {
+		channel.ChannelID = pipeline.NormalizeDMChannelID(channel.ChannelID, actorID, channel.ChannelType)
+		key := fmt.Sprintf("%d:%s", channel.ChannelType, channel.ChannelID)
+		byKey[key] = channel
+		table := pipeline.MessageTable(channel.ChannelID, tableCount)
+		buckets[table] = append(buckets[table], channel)
+	}
+	var latest *recentCandidate
+	for table, candidates := range buckets {
+		ids := make([]string, 0, len(candidates))
+		types := make([]int, 0, 3)
+		seenIDs := make(map[string]struct{}, len(candidates))
+		seenTypes := make(map[int]struct{}, 3)
+		for _, candidate := range candidates {
+			if _, ok := seenIDs[candidate.ChannelID]; !ok {
+				seenIDs[candidate.ChannelID] = struct{}{}
+				ids = append(ids, candidate.ChannelID)
+			}
+			if _, ok := seenTypes[candidate.ChannelType]; !ok {
+				seenTypes[candidate.ChannelType] = struct{}{}
+				types = append(types, candidate.ChannelType)
+			}
+		}
+		var rows []struct {
+			ChannelID       string `gorm:"column:channel_id"`
+			ChannelType     int    `gorm:"column:channel_type"`
+			LatestTimestamp int64  `gorm:"column:latest_timestamp"`
+		}
+		query := fmt.Sprintf("SELECT channel_id, channel_type, MAX(`timestamp`) AS latest_timestamp FROM `%s` WHERE channel_id IN ? AND channel_type IN ? AND `timestamp` BETWEEN ? AND ? AND is_deleted = 0 GROUP BY channel_id, channel_type", table)
+		if err := w.imDB.WithContext(ctx).Raw(query, ids, types, start.Unix(), end.Unix()).Scan(&rows).Error; err != nil {
+			return summaryWorkspaceChannel{}, fmt.Errorf("query recent messages from %s: %w", table, err)
+		}
+		for _, row := range rows {
+			info, ok := byKey[fmt.Sprintf("%d:%s", row.ChannelType, row.ChannelID)]
+			if !ok || row.LatestTimestamp <= 0 {
+				continue
+			}
+			candidate := recentCandidate{info: info, timestamp: row.LatestTimestamp}
+			if latest == nil || candidate.timestamp > latest.timestamp ||
+				(candidate.timestamp == latest.timestamp && candidate.info.ChannelID < latest.info.ChannelID) {
+				latest = &candidate
+			}
+		}
+	}
+	if latest == nil {
+		return summaryWorkspaceChannel{}, errSummaryWorkspaceNoRecentChannel
+	}
+	return summaryWorkspaceChannel{
+		ChatID: latest.info.ChannelID, ChatType: summaryWorkspaceChatType(latest.info.ChannelType),
+		Name: latest.info.ChannelName, IsArchived: latest.info.IsArchived,
+	}, nil
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func summaryWorkspaceExecutionCommandRemainder(message string) (string, bool) {
+	trimmed := strings.TrimSpace(message)
+	lower := strings.ToLower(trimmed)
+	for _, command := range summaryWorkspaceExecutionCommands {
+		if lower == command {
+			return "", true
+		}
+		if !strings.HasPrefix(lower, command) {
+			continue
+		}
+		remainder := strings.TrimSpace(trimmed[len(command):])
+		if remainder == "" {
+			return "", true
+		}
+		first, _ := utf8.DecodeRuneInString(remainder)
+		if strings.ContainsRune("：:，,。.!！\n\t", first) {
+			return strings.TrimSpace(strings.TrimLeft(remainder, " ：:，,。.!！\n\t")), true
+		}
+	}
+	return "", false
 }
 
 func buildSummaryWorkspaceGuidance(context summaryWorkspaceContext, route service.SummaryRoute, currentPreview *summaryWorkspacePreview) string {

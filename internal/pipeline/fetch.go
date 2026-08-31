@@ -22,9 +22,13 @@ var (
 	// Default: 100000. Set via config.Config.MaxSafetyLimit.
 	MaxSafetyLimit = 100000
 
-	// DefaultTimeRangeDays is the default/max time range in days.
-	// Default: 31. Set via config.Config.DefaultTimeRangeDays.
+	// DefaultTimeRangeDays preserves the legacy fallback when no time range is
+	// supplied. It is intentionally separate from the selectable upper bound.
 	DefaultTimeRangeDays = 31
+
+	// MaxTimeRangeDays is the largest time range accepted by summary entry
+	// points and the fetch pipeline.
+	MaxTimeRangeDays = 90
 
 	// EnableIntentShortcut controls whether to enable short-circuit detection.
 	// Default: true. Set via config.Config.EnableIntentShortcut.
@@ -67,6 +71,7 @@ type LLMCallFn func(ctx context.Context, prompt string) (string, error)
 type channelQuery struct {
 	selectedThreadIDs []string
 	includeArchived   bool
+	spaceID           string
 }
 
 // ChannelQueryOption configures GetUserChannels discovery.
@@ -86,6 +91,13 @@ func WithSelectedThreads(ids []string) ChannelQueryOption {
 // Active threads only, so auto/background summaries stay archived-free.
 func WithIncludeArchived(v bool) ChannelQueryOption {
 	return func(q *channelQuery) { q.includeArchived = v }
+}
+
+// WithSpaceID constrains channel discovery to one Space. Groups and threads
+// are filtered by their parent group's space_id. DMs do not carry a space_id,
+// so they are retained only when the peer is an active member of this Space.
+func WithSpaceID(spaceID string) ChannelQueryOption {
+	return func(q *channelQuery) { q.spaceID = strings.TrimSpace(spaceID) }
 }
 
 // GetUserChannels discovers all channels (group + DM + thread) for a user. (Layer 1)
@@ -118,6 +130,12 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, opts ...Cha
 		SpaceID     string `gorm:"column:space_id"`
 	}
 	var groups []groupRow
+	groupSpaceCond := ""
+	groupArgs := []interface{}{uid}
+	if q.spaceID != "" {
+		groupSpaceCond = " AND g.space_id = ?"
+		groupArgs = append(groupArgs, q.spaceID)
+	}
 	err := imDB.WithContext(ctx).Raw(`
 		SELECT g.group_no AS channel_id,
 		       2 AS channel_type,
@@ -128,8 +146,9 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, opts ...Cha
 		WHERE gm.uid = ?
 		  AND gm.is_deleted = 0
 		  AND g.status = 1
+		  `+groupSpaceCond+`
 		ORDER BY g.updated_at DESC
-	`, uid).Scan(&groups).Error
+	`, groupArgs...).Scan(&groups).Error
 	if err != nil {
 		return nil, fmt.Errorf("query groups: %w", err)
 	}
@@ -158,8 +177,39 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, opts ...Cha
 	if err != nil {
 		log.Printf("[pipeline] query DM channels error: %v", err)
 	}
+	activeSpacePeers := make(map[string]bool)
+	if q.spaceID != "" && len(dms) > 0 {
+		peerSet := make(map[string]struct{}, len(dms))
+		for _, d := range dms {
+			if peerUID := strings.TrimSpace(getPeerUID(d.ChannelID, uid)); peerUID != "" {
+				peerSet[peerUID] = struct{}{}
+			}
+		}
+		peers := make([]string, 0, len(peerSet))
+		for peerUID := range peerSet {
+			peers = append(peers, peerUID)
+		}
+		if len(peers) > 0 {
+			var rows []struct {
+				UID string `gorm:"column:uid"`
+			}
+			if err := imDB.WithContext(ctx).
+				Table("space_member").
+				Select("uid").
+				Where("space_id = ? AND status = 1 AND uid IN ?", q.spaceID, peers).
+				Scan(&rows).Error; err != nil {
+				return nil, fmt.Errorf("query active DM peers in space %s: %w", q.spaceID, err)
+			}
+			for _, row := range rows {
+				activeSpacePeers[row.UID] = true
+			}
+		}
+	}
 	for _, d := range dms {
 		peerUID := getPeerUID(d.ChannelID, uid)
+		if q.spaceID != "" && !activeSpacePeers[peerUID] {
+			continue
+		}
 		normalized := NormalizeDMChannelID(d.ChannelID, uid, 1)
 		channels = append(channels, ChannelInfo{
 			ChannelID:   normalized,
@@ -191,6 +241,11 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, opts ...Cha
 		threadStatusCond = "(t.status = 1 OR (t.status = 2 AND CONCAT(t.group_no, '____', t.short_id) IN ?))"
 		threadArgs = append(threadArgs, q.selectedThreadIDs)
 	}
+	threadSpaceCond := ""
+	if q.spaceID != "" {
+		threadSpaceCond = " AND g.space_id = ?"
+		threadArgs = append(threadArgs, q.spaceID)
+	}
 	threadQuery := `
 		SELECT CONCAT(t.group_no, '____', t.short_id) AS channel_id,
 		       5 AS channel_type,
@@ -207,6 +262,7 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, opts ...Cha
 			  AND gm.is_deleted = 0
 		)
 		  AND ` + threadStatusCond + `
+		  ` + threadSpaceCond + `
 		  AND g.status = 1
 		ORDER BY t.updated_at DESC
 	`
@@ -858,7 +914,7 @@ func FilterMessagesByRelevance(messages []Message, topic string, participantUIDs
 //
 // Returns messages, intent result (for target person filtering), and error.
 func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, octoClient octoSearchClient, messageFetchBackend string, toolCallFn LLMToolCallFn, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int, octoSearchPollSec int, channelScopeOpts *ChannelScopeOptions, reportStage func(string)) ([]Message, *IntentResult, error) {
-	maxDays := DefaultTimeRangeDays
+	maxDays := MaxTimeRangeDays
 	if timeEnd.Sub(timeStart) > time.Duration(maxDays)*24*time.Hour {
 		return nil, nil, fmt.Errorf("时间范围不能超过 %d 天", maxDays)
 	}
@@ -880,7 +936,11 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	// Layer 1: channel discovery (needed before intent recognition for memberMap)
 	l1Start := time.Now()
 	selectedThreads := selectedThreadChannelIDs(specifiedSources)
-	userChannels, err := GetUserChannels(ctx, creatorUID, imDB, WithSelectedThreads(selectedThreads))
+	channelQueryOpts := []ChannelQueryOption{WithSelectedThreads(selectedThreads)}
+	if channelScopeOpts != nil && strings.TrimSpace(channelScopeOpts.SpaceID) != "" {
+		channelQueryOpts = append(channelQueryOpts, WithSpaceID(channelScopeOpts.SpaceID))
+	}
+	userChannels, err := GetUserChannels(ctx, creatorUID, imDB, channelQueryOpts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("channel discovery: %w", err)
 	}
@@ -889,7 +949,7 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 
 	// Layer 1.5: intersect with participant channels
 	l15Start := time.Now()
-	userChannels, err = IntersectParticipantChannels(ctx, userChannels, participantUIDs, imDB, WithSelectedThreads(selectedThreads))
+	userChannels, err = IntersectParticipantChannels(ctx, userChannels, participantUIDs, imDB, channelQueryOpts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("intersect participant channels: %w", err)
 	}

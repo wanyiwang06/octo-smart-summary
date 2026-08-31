@@ -254,7 +254,12 @@ func (h *AgentChatHandler) buildRegistryWithUID(uid, sessionID string, toolNames
 // 若空数组或字段缺,当轮 chat 无引用材料(等同普通 chat)。
 // 见 CHAT-REFERENCE-BASED-DESIGN-v1。
 type agentChatRequest struct {
-	Message           string                  `json:"message"`
+	Message string `json:"message"`
+	// InputOrigin distinguishes user-authored requirements from text inserted by
+	// the workbench UI. The distinction is part of routing and idempotency: a
+	// template body is useful configuration, while a generated "start" command
+	// must never be mistaken for the team's actual summary requirement.
+	InputOrigin       string                  `json:"input_origin,omitempty"`
 	SessionID         string                  `json:"session_id"`
 	Profile           string                  `json:"profile,omitempty"`
 	Action            string                  `json:"action,omitempty"`

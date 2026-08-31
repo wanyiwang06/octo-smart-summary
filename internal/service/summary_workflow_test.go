@@ -69,6 +69,20 @@ func TestSummaryWorkflowCreatePersonal(t *testing.T) {
 	}
 }
 
+func TestLegacyWorkflowDefaultRangeRemains31DaysWhenMaximumIs90Days(t *testing.T) {
+	_, db := newSummaryWorkflowTestService(t)
+	svc := NewSummaryWorkflowService(db, nil, 90)
+
+	got, err := svc.CreateFromLegacyHTTP(context.Background(), baseSummaryWorkflowInput())
+	if err != nil {
+		t.Fatalf("CreateFromLegacyHTTP() error: %v", err)
+	}
+	want := time.Duration(legacySummaryDefaultTimeRangeDays) * 24 * time.Hour
+	if duration := got.Task.TimeRangeEnd.Sub(got.Task.TimeRangeStart); duration < want-time.Second || duration > want+time.Second {
+		t.Fatalf("legacy default range = %s, want %s even when maximum is 90 days", duration, want)
+	}
+}
+
 func TestSummaryWorkflowCreateTeamDeduplicatesParticipants(t *testing.T) {
 	svc, db := newSummaryWorkflowTestService(t)
 	in := baseSummaryWorkflowInput()
@@ -339,13 +353,68 @@ func TestAgentWorkflowRejectsWrongTargetMissingSourceOrKey(t *testing.T) {
 	missingSource := baseAgentWorkflowInput()
 	missingSource.Sources = nil
 	if _, err := svc.CreatePersonalFromAgent(context.Background(), missingSource); err == nil {
-		t.Fatal("agent workflow accepted no source")
+		t.Fatal("personal agent workflow accepted no source")
+	}
+
+	teamMissingRequirement := baseAgentWorkflowInput()
+	teamMissingRequirement.Requirement = "  "
+	teamMissingRequirement.Participants = []SummaryWorkflowParticipant{{UserID: "p1"}}
+	if _, err := svc.CreateTeamFromAgent(context.Background(), teamMissingRequirement); err == nil {
+		t.Fatal("team workflow accepted no requirement")
+	}
+
+	invalidSource := baseAgentWorkflowInput()
+	invalidSource.Sources = []SummaryWorkflowSource{{SourceType: model.SourceGroup}}
+	if _, err := svc.CreatePersonalFromAgent(context.Background(), invalidSource); err == nil {
+		t.Fatal("personal agent workflow accepted an invalid source")
+	}
+
+	invalidTeamSource := baseAgentWorkflowInput()
+	invalidTeamSource.Sources = []SummaryWorkflowSource{{SourceType: 99, SourceID: "group-1"}}
+	invalidTeamSource.Participants = []SummaryWorkflowParticipant{{UserID: "p1"}}
+	if _, err := svc.CreateTeamFromAgent(context.Background(), invalidTeamSource); err == nil {
+		t.Fatal("team agent workflow accepted an invalid selected source")
 	}
 
 	missingKey := baseAgentWorkflowInput()
 	missingKey.IdempotencyKey = ""
 	if _, err := svc.CreatePersonalFromAgent(context.Background(), missingKey); err == nil {
 		t.Fatal("agent workflow accepted no idempotency key")
+	}
+}
+
+func TestAgentTeamWorkflowAllowsNoExplicitSourceWithRequirement(t *testing.T) {
+	svc, db := newSummaryWorkflowTestService(t)
+	in := baseAgentWorkflowInput()
+	in.IdempotencyKey = "agent-team-source-free-001"
+	in.Sources = nil
+	in.Participants = []SummaryWorkflowParticipant{{UserID: "p1", UserName: "P1"}}
+
+	got, err := svc.CreateTeamFromAgent(context.Background(), in)
+	if err != nil {
+		t.Fatalf("CreateTeamFromAgent() error: %v", err)
+	}
+	if got.Target != SummaryWorkflowTeam || !got.Inferred {
+		t.Fatalf("result = %#v, want inferred team workflow", got)
+	}
+	if got.Task.Topic != in.Requirement {
+		t.Fatalf("topic = %q, want %q", got.Task.Topic, in.Requirement)
+	}
+
+	var sourceCount int64
+	if err := db.Model(&model.SummarySource{}).Where("task_id = ?", got.Task.ID).Count(&sourceCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if sourceCount != 0 {
+		t.Fatalf("source count = %d, want 0", sourceCount)
+	}
+
+	var participantCount int64
+	if err := db.Model(&model.SummaryParticipant{}).Where("task_id = ?", got.Task.ID).Count(&participantCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if participantCount != 2 {
+		t.Fatalf("participant count = %d, want creator + collaborator", participantCount)
 	}
 }
 

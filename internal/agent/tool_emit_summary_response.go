@@ -53,10 +53,33 @@ type SummaryResponseWorkflow struct {
 }
 
 type SummaryResponsePreview struct {
-	Content         string   `json:"content"`
-	Version         int      `json:"version"`
-	ParentMessageID int64    `json:"parent_message_id,omitempty"`
-	Assumptions     []string `json:"assumptions,omitempty"`
+	Content         string                         `json:"content"`
+	Version         int                            `json:"version"`
+	ParentMessageID int64                          `json:"parent_message_id,omitempty"`
+	Assumptions     []string                       `json:"assumptions,omitempty"`
+	EffectiveScope  *SummaryResponseEffectiveScope `json:"effective_scope,omitempty"`
+}
+
+// SummaryResponseEffectiveScope is server-authored lineage for an Agent
+// preview. It records an inferred channel/time window without mutating the UI
+// scope hash. The terminal tool schema intentionally does not expose these
+// fields to the model; the workspace handler stamps them after validation.
+type SummaryResponseEffectiveScope struct {
+	Channels  []SummaryResponseChannel  `json:"channels,omitempty"`
+	TimeRange *SummaryResponseTimeRange `json:"time_range,omitempty"`
+}
+
+type SummaryResponseChannel struct {
+	ChannelID   string `json:"channel_id"`
+	ChannelType int    `json:"channel_type"`
+	ChannelName string `json:"channel_name,omitempty"`
+	IsArchived  bool   `json:"is_archived,omitempty"`
+}
+
+type SummaryResponseTimeRange struct {
+	Start string `json:"start"`
+	End   string `json:"end"`
+	Label string `json:"label,omitempty"`
 }
 
 type allowedSummaryResultTypesContextKey struct{}
@@ -205,6 +228,9 @@ func validateSummaryResponseShape(payload SummaryResponsePayload) error {
 	hasWorkflow := payload.Workflow != nil
 	hasPreview := payload.Preview != nil
 	hasConfirmation := payload.Confirmation != nil
+	if payload.Preview != nil && payload.Preview.EffectiveScope != nil {
+		return fmt.Errorf("preview.effective_scope is reserved for the server")
+	}
 
 	switch payload.ResultType {
 	case SummaryResultAgentPreview, SummaryResultAgentRevision:

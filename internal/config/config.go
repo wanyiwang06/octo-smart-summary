@@ -165,7 +165,7 @@ type Config struct {
 
 	// Hardcoded limits (now configurable)
 	MaxSafetyLimit       int // Max messages per channel before safety truncation, default 100000
-	DefaultTimeRangeDays int // Default time range in days when not specified, default 31
+	DefaultTimeRangeDays int // Legacy default time range when not specified, default 31
 
 	// Token calculation config
 	SkipMapReduceThreshold int    // Skip Map-Reduce threshold (tokens), env SKIP_MAP_REDUCE_THRESHOLD

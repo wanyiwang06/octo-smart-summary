@@ -340,3 +340,54 @@ func TestSelectedArchivedChannelsBridge(t *testing.T) {
 		t.Fatalf("non-member selected ID bypassed access: result=%s err=%v", secretResult, secretErr)
 	}
 }
+
+func TestListChannelsCommitScopeControlsOpenScopeAuthorization(t *testing.T) {
+	db := setupAgentImDB(t)
+	db.Exec(`INSERT INTO "group" (group_no, name, space_id, status, creator) VALUES ('channel-A', 'Group A', 'test-space', 1, 'user-1'), ('channel-B', 'Group B', 'test-space', 1, 'user-2')`)
+	db.Exec(`INSERT INTO group_member (group_no, uid, is_deleted, role) VALUES ('channel-A', 'user-1', 0, 0), ('channel-B', 'user-2', 0, 0)`)
+
+	SetSummaryDeps(nil, db, nil, config.Config{})
+	defer SetSummaryDeps(nil, nil, nil, config.Config{})
+
+	_, list := ListChannelsTool()
+	base := context.WithValue(context.Background(), ContextKeyUID, "user-1")
+
+	exploratory := WithDiscoverableChannelScope(base)
+	result, err := list(exploratory, json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("exploratory list_channels: %v", err)
+	}
+	if !strings.Contains(result, `"scope_committed":false`) {
+		t.Fatalf("exploratory result did not report an uncommitted scope: %s", result)
+	}
+	if restricted, allowed := ChannelAllowedByScope(exploratory, "channel-A", 2); !restricted || allowed {
+		t.Fatalf("exploratory list unexpectedly granted channel-A: (%v,%v)", restricted, allowed)
+	}
+
+	committed := WithDiscoverableChannelScope(base)
+	result, err = list(committed, json.RawMessage(`{"commit_scope":true}`))
+	if err != nil {
+		t.Fatalf("committed list_channels: %v", err)
+	}
+	if !strings.Contains(result, `"scope_committed":true`) {
+		t.Fatalf("committed result did not report the scope grant: %s", result)
+	}
+	if restricted, allowed := ChannelAllowedByScope(committed, "channel-A", 2); !restricted || !allowed {
+		t.Fatalf("visible channel-A was not granted: (%v,%v)", restricted, allowed)
+	}
+	if restricted, allowed := ChannelAllowedByScope(committed, "channel-B", 2); !restricted || allowed {
+		t.Fatalf("inaccessible channel-B was granted: (%v,%v)", restricted, allowed)
+	}
+
+	closed := WithAllowedChannelScope(base, []ChannelScope{{ChannelID: "channel-A", ChannelType: 2}})
+	result, err = list(closed, json.RawMessage(`{"commit_scope":true}`))
+	if err != nil {
+		t.Fatalf("closed-scope list_channels: %v", err)
+	}
+	if !strings.Contains(result, `"scope_committed":false`) {
+		t.Fatalf("closed scope incorrectly reported expansion: %s", result)
+	}
+	if restricted, allowed := ChannelAllowedByScope(closed, "channel-B", 2); !restricted || allowed {
+		t.Fatalf("closed scope expanded to channel-B: (%v,%v)", restricted, allowed)
+	}
+}

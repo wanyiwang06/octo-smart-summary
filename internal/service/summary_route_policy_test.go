@@ -13,15 +13,17 @@ func TestDeriveSummaryRoute(t *testing.T) {
 			in: SummaryRouteInput{
 				Intent:               SummaryIntentGenerate,
 				HasExplicitRunIntent: true,
+				HasSelectedSource:    true,
 				HasValidSource:       true,
 				HasSelectedTemplate:  true,
 			},
 			want: SummaryRoutePersonalWorkflow,
 		},
 		{
-			name: "template context without explicit run intent stays in agent preview",
+			name: "inferred source never creates a personal workflow directly",
 			in: SummaryRouteInput{
 				Intent:                     SummaryIntentGenerate,
+				HasExplicitRunIntent:       true,
 				HasValidSource:             true,
 				HasSelectedTemplate:        true,
 				HasEnoughContextForPreview: true,
@@ -29,14 +31,90 @@ func TestDeriveSummaryRoute(t *testing.T) {
 			want: SummaryRouteAgentPreview,
 		},
 		{
-			name: "participants take the team confirmation route without template",
+			name: "template context without explicit run intent stays in agent preview",
+			in: SummaryRouteInput{
+				Intent:                     SummaryIntentGenerate,
+				HasSelectedSource:          true,
+				HasValidSource:             true,
+				HasSelectedTemplate:        true,
+				HasEnoughContextForPreview: true,
+			},
+			want: SummaryRouteAgentPreview,
+		},
+		{
+			name: "participants and source without requirement cannot start",
 			in: SummaryRouteInput{
 				Intent:               SummaryIntentGenerate,
+				HasSelectedSource:    true,
 				HasValidSource:       true,
 				HasOtherParticipants: true,
 				ParticipantsValid:    true,
 			},
-			want: SummaryRouteTeamConfirmation,
+			want: SummaryRouteClarification,
+		},
+		{
+			name: "participants alone without requirement cannot start",
+			in: SummaryRouteInput{
+				Intent:               SummaryIntentGenerate,
+				HasOtherParticipants: true,
+				ParticipantsValid:    true,
+			},
+			want: SummaryRouteClarification,
+		},
+		{
+			name: "participants and user requirement start source free team workflow",
+			in: SummaryRouteInput{
+				Intent:               SummaryIntentGenerate,
+				HasRequirement:       true,
+				HasOtherParticipants: true,
+				ParticipantsValid:    true,
+			},
+			want: SummaryRouteTeamWorkflow,
+		},
+		{
+			name: "participants and template start source free team workflow",
+			in: SummaryRouteInput{
+				Intent:               SummaryIntentGenerate,
+				HasSelectedTemplate:  true,
+				HasOtherParticipants: true,
+				ParticipantsValid:    true,
+			},
+			want: SummaryRouteTeamWorkflow,
+		},
+		{
+			name: "selected source participants and requirement start team workflow directly",
+			in: SummaryRouteInput{
+				Intent:               SummaryIntentGenerate,
+				HasSelectedSource:    true,
+				HasValidSource:       true,
+				HasRequirement:       true,
+				HasOtherParticipants: true,
+				ParticipantsValid:    true,
+			},
+			want: SummaryRouteTeamWorkflow,
+		},
+		{
+			name: "selected source participants and template start team workflow directly",
+			in: SummaryRouteInput{
+				Intent:               SummaryIntentGenerate,
+				HasSelectedSource:    true,
+				HasValidSource:       true,
+				HasSelectedTemplate:  true,
+				HasOtherParticipants: true,
+				ParticipantsValid:    true,
+			},
+			want: SummaryRouteTeamWorkflow,
+		},
+		{
+			name: "an invalid selected source blocks source free team fallback",
+			in: SummaryRouteInput{
+				Intent:               SummaryIntentGenerate,
+				HasSelectedSource:    true,
+				HasRequirement:       true,
+				HasOtherParticipants: true,
+				ParticipantsValid:    true,
+			},
+			want: SummaryRouteClarification,
 		},
 		{
 			name: "invalid participant blocks side effects",
@@ -53,6 +131,15 @@ func TestDeriveSummaryRoute(t *testing.T) {
 				Intent:                     SummaryIntentGenerate,
 				HasEnoughContextForPreview: true,
 				ParticipantsValid:          true,
+			},
+			want: SummaryRouteAgentPreview,
+		},
+		{
+			name: "template only can preview after recent source discovery",
+			in: SummaryRouteInput{
+				Intent:                     SummaryIntentGenerate,
+				HasSelectedTemplate:        true,
+				HasEnoughContextForPreview: true,
 			},
 			want: SummaryRouteAgentPreview,
 		},
@@ -98,7 +185,7 @@ func TestDeriveSummaryRoute(t *testing.T) {
 			name: "confirmed current team proposal creates workflow",
 			in: SummaryRouteInput{
 				Action:                   SummaryActionConfirmWorkflow,
-				HasValidSource:           true,
+				HasRequirement:           true,
 				HasOtherParticipants:     true,
 				ParticipantsValid:        true,
 				HasTeamProposal:          true,
@@ -110,7 +197,9 @@ func TestDeriveSummaryRoute(t *testing.T) {
 			name: "stale team proposal cannot create workflow",
 			in: SummaryRouteInput{
 				Action:               SummaryActionConfirmWorkflow,
+				HasSelectedSource:    true,
 				HasValidSource:       true,
+				HasRequirement:       true,
 				HasOtherParticipants: true,
 				ParticipantsValid:    true,
 				HasTeamProposal:      true,
@@ -139,6 +228,7 @@ func TestDeriveSummaryRoute(t *testing.T) {
 			in: SummaryRouteInput{
 				Intent:                     SummaryIntentGenerate,
 				HasExplicitRunIntent:       true,
+				HasSelectedSource:          true,
 				HasValidSource:             true,
 				HasSelectedTemplate:        true,
 				ParticipantsValid:          true,

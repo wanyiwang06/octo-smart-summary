@@ -196,6 +196,10 @@ func loadWorkspacePreviewForSave(
 	if err != nil {
 		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: workspace scope is invalid", errWorkspacePreviewSaveStale)
 	}
+	normalizedScope, err = hydrateSummaryWorkspaceContextFromPreview(normalizedScope, &message, userID)
+	if err != nil {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: preview effective scope is invalid", errWorkspacePreviewSaveStale)
+	}
 
 	return workspacePreviewSaveCandidate{
 		Session: session,

@@ -101,6 +101,8 @@ func PeekChannelTool() (Tool, Handler) {
 				timeEnd = t.Unix()
 			}
 		}
+		resolvedStart, resolvedEnd := ResolveAllowedTimeRange(ctx, time.Unix(timeStart, 0), time.Unix(timeEnd, 0))
+		timeStart, timeEnd = resolvedStart.Unix(), resolvedEnd.Unix()
 
 		summaryDB, imDB, _, cfg := GetSummaryDeps()
 

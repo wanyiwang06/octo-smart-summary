@@ -43,8 +43,10 @@ type SummaryRouteInput struct {
 	Action                     SummaryAction
 	Intent                     SummaryIntent
 	HasExplicitRunIntent       bool
+	HasSelectedSource          bool
 	HasValidSource             bool
 	HasSelectedTemplate        bool
+	HasRequirement             bool
 	HasOtherParticipants       bool
 	ParticipantsValid          bool
 	HasCurrentPreview          bool
@@ -62,7 +64,9 @@ func DeriveSummaryRoute(in SummaryRouteInput) SummaryRoute {
 	switch in.Action {
 	case SummaryActionConfirmWorkflow:
 		if in.HasHardMissingData || !in.HasOtherParticipants || !in.ParticipantsValid ||
-			!in.HasValidSource || !in.HasTeamProposal || !in.TeamProposalScopeMatches {
+			(in.HasSelectedSource && !in.HasValidSource) ||
+			(!in.HasSelectedTemplate && !in.HasRequirement) ||
+			!in.HasTeamProposal || !in.TeamProposalScopeMatches {
 			return SummaryRouteClarification
 		}
 		return SummaryRouteTeamWorkflow
@@ -82,7 +86,8 @@ func DeriveSummaryRoute(in SummaryRouteInput) SummaryRoute {
 	if in.Intent == SummaryIntentExplain {
 		return SummaryRouteExplanation
 	}
-	if in.HasHardMissingData || (in.HasOtherParticipants && !in.ParticipantsValid) {
+	if in.HasHardMissingData || (in.HasSelectedSource && !in.HasValidSource) ||
+		(in.HasOtherParticipants && !in.ParticipantsValid) {
 		return SummaryRouteClarification
 	}
 
@@ -100,12 +105,17 @@ func DeriveSummaryRoute(in SummaryRouteInput) SummaryRoute {
 		return SummaryRouteClarification
 	case SummaryIntentGenerate:
 		if in.HasOtherParticipants {
-			if !in.HasValidSource {
+			// A team workflow can collect source material from its invited
+			// participants, so an explicitly selected chat is optional. The
+			// user must still provide an actual requirement, either directly
+			// or through a selected template. Any selected source has already
+			// passed the validity guard above.
+			if !in.HasSelectedTemplate && !in.HasRequirement {
 				return SummaryRouteClarification
 			}
-			return SummaryRouteTeamConfirmation
+			return SummaryRouteTeamWorkflow
 		}
-		if in.HasExplicitRunIntent && in.HasValidSource && in.HasSelectedTemplate {
+		if in.HasExplicitRunIntent && in.HasSelectedSource && in.HasValidSource && in.HasSelectedTemplate {
 			return SummaryRoutePersonalWorkflow
 		}
 		if in.HasEnoughContextForPreview {

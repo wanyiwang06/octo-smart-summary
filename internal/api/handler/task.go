@@ -56,7 +56,7 @@ func NewTaskHandler(db, imDB *gorm.DB, workerTriggerURL string) *TaskHandler {
 		workerTriggerURL:    workerTriggerURL,
 		customTemplateLimit: defaultCustomTemplateLimit,
 		attentionCache:      newAttentionCache(),
-		summaryWorkflow:     service.NewSummaryWorkflowService(db, imDB, pipeline.DefaultTimeRangeDays),
+		summaryWorkflow:     service.NewSummaryWorkflowService(db, imDB, pipeline.MaxTimeRangeDays),
 	}
 }
 
@@ -395,7 +395,7 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 
 	workflow := h.summaryWorkflow
 	if workflow == nil {
-		workflow = service.NewSummaryWorkflowService(h.db, h.imDB, pipeline.DefaultTimeRangeDays)
+		workflow = service.NewSummaryWorkflowService(h.db, h.imDB, pipeline.MaxTimeRangeDays)
 	}
 	created, err := workflow.CreateFromLegacyHTTP(c.Request.Context(), workflowInput)
 	if err != nil {

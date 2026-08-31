@@ -29,9 +29,9 @@ func channelIDsOf(channels []pipeline.ChannelInfo) []string {
 // and every such run reported COMPLETE — including one that narrowed to 12
 // channels and fetched 2. The narrowing tools (narrow_channels_by_topic /
 // find_shared_channels) are the only place that knows what "everything in scope"
-// meant. It is deliberately NOT called from list_channels: that returns the whole
-// visible surface, not scope, and recording it made the gate flag every unfetched
-// visible channel as an in-scope gap on nearly every run.
+// meant. list_channels calls it only when commit_scope=true explicitly declares
+// that the whole visible surface is the requested scope; ordinary exploratory
+// listing remains excluded so topic-based runs do not gain false coverage gaps.
 //
 // Best-effort and V2-gated, exactly like the coverage recording in fetch_channel:
 // this is observability for the verdict, never a reason to fail a tool call. The

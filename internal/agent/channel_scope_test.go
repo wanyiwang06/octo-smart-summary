@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
@@ -33,6 +34,68 @@ func TestAllowedChannelScopeIsOptInAndExact(t *testing.T) {
 	empty := WithAllowedChannelScope(context.Background(), nil)
 	if restricted, allowed := ChannelAllowedByScope(empty, "group-1", 2); !restricted || allowed {
 		t.Fatalf("empty explicit scope = (%v, %v), want (true, false)", restricted, allowed)
+	}
+}
+
+func TestDiscoverableChannelScopeStartsClosedAndGrantsConfirmedChannels(t *testing.T) {
+	ctx := context.WithValue(context.Background(), ContextKeyUID, "user-1")
+	ctx = WithDiscoverableChannelScope(ctx)
+	if restricted, allowed := ChannelAllowedByScope(ctx, "group-1", model.ChannelTypeGroup); !restricted || allowed {
+		t.Fatalf("open discovery must still start with a deny-all read scope, got (%v,%v)", restricted, allowed)
+	}
+
+	// This models an all-chat narrowing result: returning the full candidate set
+	// is still an explicit, trusted scope decision and must authorize every item.
+	all := []pipeline.ChannelInfo{
+		{ChannelID: "group-1", ChannelType: model.ChannelTypeGroup, ChannelName: "项目群"},
+		{ChannelID: "group-2", ChannelType: model.ChannelTypeGroup, ChannelName: "产品群"},
+	}
+	if !AuthorizeDiscoveredChannels(ctx, all) {
+		t.Fatal("discoverable scope rejected trusted discovery result")
+	}
+	for _, channel := range all {
+		if restricted, allowed := ChannelAllowedByScope(ctx, channel.ChannelID, channel.ChannelType); !restricted || !allowed {
+			t.Fatalf("discovered channel %s = (%v,%v), want (true,true)", channel.ChannelID, restricted, allowed)
+		}
+	}
+	if got := AllowedChannelScopes(ctx); len(got) != 2 {
+		t.Fatalf("effective discovered scope = %#v, want 2 channels", got)
+	}
+}
+
+func TestClosedChannelScopeCannotBeExpandedByDiscovery(t *testing.T) {
+	ctx := context.WithValue(context.Background(), ContextKeyUID, "user-1")
+	ctx = WithAllowedChannelScope(ctx, []ChannelScope{{ChannelID: "group-1", ChannelType: model.ChannelTypeGroup}})
+	if AuthorizeDiscoveredChannels(ctx, []pipeline.ChannelInfo{{ChannelID: "group-2", ChannelType: model.ChannelTypeGroup}}) {
+		t.Fatal("closed UI scope must reject discovery grants")
+	}
+	visible := RestrictDiscoveredChannels(ctx, []pipeline.ChannelInfo{
+		{ChannelID: "group-1", ChannelType: model.ChannelTypeGroup},
+		{ChannelID: "group-2", ChannelType: model.ChannelTypeGroup},
+	})
+	if len(visible) != 1 || visible[0].ChannelID != "group-1" {
+		t.Fatalf("closed-scope discovery leaked channels: %#v", visible)
+	}
+}
+
+func TestClosedDiscoveryFilterCanonicalizesDMIDs(t *testing.T) {
+	ctx := context.WithValue(context.Background(), ContextKeyUID, "self-user")
+	ctx = WithAllowedChannelScope(ctx, []ChannelScope{{ChannelID: "peer-user", ChannelType: model.ChannelTypeDM}})
+	visible := RestrictDiscoveredChannels(ctx, []pipeline.ChannelInfo{{
+		ChannelID: "self-user@peer-user", ChannelType: model.ChannelTypeDM,
+	}})
+	if len(visible) != 1 {
+		t.Fatalf("logical/canonical DM comparison dropped selected channel: %#v", visible)
+	}
+}
+
+func TestAllowedTimeRangeOverridesModelArguments(t *testing.T) {
+	trustedStart := time.Date(2026, 8, 21, 8, 0, 0, 0, time.UTC)
+	trustedEnd := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
+	ctx := WithAllowedTimeRange(context.Background(), trustedStart, trustedEnd)
+	gotStart, gotEnd := ResolveAllowedTimeRange(ctx, time.Time{}, time.Now())
+	if !gotStart.Equal(trustedStart) || !gotEnd.Equal(trustedEnd) {
+		t.Fatalf("resolved range = %s..%s, want %s..%s", gotStart, gotEnd, trustedStart, trustedEnd)
 	}
 }
 

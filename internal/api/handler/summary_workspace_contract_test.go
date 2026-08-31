@@ -1,13 +1,46 @@
 package handler
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/gin-gonic/gin"
 )
+
+func TestSummaryWorkspaceCapabilitiesAdvertisesTimeRangeLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	handler := &AgentChatHandler{workspace: &summaryWorkspaceCoordinator{}}
+
+	handler.SummaryWorkspaceCapabilities(context)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var payload struct {
+		Data struct {
+			Enabled          bool   `json:"enabled"`
+			ContractVersion  string `json:"contract_version"`
+			MaxTimeRangeDays int    `json:"max_time_range_days"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode capabilities: %v", err)
+	}
+	if !payload.Data.Enabled || payload.Data.ContractVersion != summaryWorkspaceContractVersion {
+		t.Fatalf("unexpected capabilities: %#v", payload.Data)
+	}
+	if payload.Data.MaxTimeRangeDays != 90 {
+		t.Fatalf("max_time_range_days = %d, want 90", payload.Data.MaxTimeRangeDays)
+	}
+}
 
 func TestNormalizeSummaryWorkspaceContext(t *testing.T) {
 	got, err := normalizeSummaryWorkspaceContext(summaryWorkspaceContext{
@@ -48,6 +81,19 @@ func TestNormalizeSummaryWorkspaceContextRejectsInvalidRange(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected invalid time range")
+	}
+}
+
+func TestNormalizeSummaryWorkspaceContextRejectsRangeOverNinetyDays(t *testing.T) {
+	_, err := normalizeSummaryWorkspaceContext(summaryWorkspaceContext{
+		TimeRange: &summaryWorkspaceTimeRange{
+			Start: "2026-05-01T00:00:00Z",
+			End:   "2026-08-01T00:00:01Z",
+			Label: "超过 90 天",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected over-limit time range to be rejected")
 	}
 }
 
@@ -128,6 +174,23 @@ func TestHasExplicitSummaryRunIntent(t *testing.T) {
 	}
 }
 
+func TestTemplateAutofillOnlyRunsWorkflowBeforeUserEdits(t *testing.T) {
+	template := &summaryWorkspaceTemplate{
+		TemplateID:  "weekly",
+		Label:       "周报",
+		Requirement: "总结项目进展，按进展、风险和下一步整理",
+	}
+	if !hasExplicitWorkspaceRunIntent(template.Requirement, template) {
+		t.Fatal("unchanged template requirement must authorize the configured workflow")
+	}
+	if hasExplicitWorkspaceRunIntent(template.Requirement+"，只看研发团队", template) {
+		t.Fatal("edited template requirement must return to Agent preview")
+	}
+	if !hasExplicitWorkspaceRunIntent("直接生成总结：只看研发团队", template) {
+		t.Fatal("an explicit execution command must still authorize the workflow")
+	}
+}
+
 func TestExplicitExecutionCommandOverridesExistingPreviewWithoutHijackingRevision(t *testing.T) {
 	if !hasExplicitSummaryExecutionCommand("开始总结") ||
 		!hasExplicitSummaryExecutionCommand("发起多人总结：按风险排序") ||
@@ -154,11 +217,40 @@ func TestSummaryWorkspaceRequirementOmitsGeneratedExecutionMessage(t *testing.T)
 	if got := summaryWorkspaceRequirement(summaryWorkspaceContext{Template: template}, "请根据当前选择生成总结"); got != template.Requirement {
 		t.Fatalf("template requirement = %q, want %q", got, template.Requirement)
 	}
-	if got := summaryWorkspaceRequirement(summaryWorkspaceContext{}, "Prepare a team summary task from the current selection"); got != "请总结关键结论、进展、风险和行动项" {
+	if got := summaryWorkspaceRequirement(summaryWorkspaceContext{}, "Prepare a team summary task from the current selection"); got != "请按“概览、关键进展与结论、风险与未决问题、行动项”组织总结；仅在消息中有依据时填写负责人和截止时间" {
 		t.Fatalf("default team requirement = %q", got)
 	}
 	if got := summaryWorkspaceRequirement(summaryWorkspaceContext{Template: template}, "重点关注延期风险"); got != template.Requirement+"\n\n重点关注延期风险" {
 		t.Fatalf("custom requirement = %q", got)
+	}
+}
+
+func TestSummaryWorkspaceRequirementSeparatesInputOrigin(t *testing.T) {
+	template := &summaryWorkspaceTemplate{TemplateID: "weekly", Label: "周报", Requirement: "按周报结构输出"}
+	if got := summaryWorkspaceExecutionRequirement(summaryWorkspaceContext{Template: template}, template.Requirement, summaryWorkspaceInputTemplate); got != template.Requirement {
+		t.Fatalf("template autofill duplicated requirement: %q", got)
+	}
+	if got := summaryWorkspaceExecutionRequirement(summaryWorkspaceContext{}, "开始总结", summaryWorkspaceInputUser); got != "" {
+		t.Fatalf("pure execution command became requirement: %q", got)
+	}
+	if got := summaryWorkspaceExecutionRequirement(summaryWorkspaceContext{}, "开始总结：重点关注延期风险", summaryWorkspaceInputUser); got != "重点关注延期风险" {
+		t.Fatalf("command remainder = %q", got)
+	}
+	if got := summaryWorkspaceExecutionRequirement(summaryWorkspaceContext{Template: template}, "额外关注客户反馈", summaryWorkspaceInputUser); got != template.Requirement+"\n\n额外关注客户反馈" {
+		t.Fatalf("template + user requirement = %q", got)
+	}
+}
+
+func TestNormalizeSummaryWorkspaceInputOriginCompatibility(t *testing.T) {
+	template := &summaryWorkspaceTemplate{TemplateID: "weekly", Label: "周报", Requirement: "按周报结构输出"}
+	if got, err := normalizeSummaryWorkspaceInputOrigin("", summaryWorkspaceContext{Template: template}, template.Requirement); err != nil || got != summaryWorkspaceInputTemplate {
+		t.Fatalf("legacy template origin = %q err=%v", got, err)
+	}
+	if got, err := normalizeSummaryWorkspaceInputOrigin("", summaryWorkspaceContext{}, "请根据当前选择生成总结"); err != nil || got != summaryWorkspaceInputSystemIntent {
+		t.Fatalf("legacy generated origin = %q err=%v", got, err)
+	}
+	if _, err := normalizeSummaryWorkspaceInputOrigin("model", summaryWorkspaceContext{}, "总结"); err == nil {
+		t.Fatal("invalid input origin accepted")
 	}
 }
 
@@ -200,5 +292,45 @@ func TestSummaryWorkspaceRequestHashIncludesScopeVersion(t *testing.T) {
 	v2 := summaryWorkspaceRequestHash("chat", "请总结", 2, "same-scope")
 	if v1 == v2 {
 		t.Fatal("request hash must change when scope_version changes")
+	}
+}
+
+func TestSummaryWorkspaceRequestHashIncludesInputOrigin(t *testing.T) {
+	user := summaryWorkspaceRequestHash("chat", "同一段文本", 1, "same-scope", summaryWorkspaceInputUser)
+	template := summaryWorkspaceRequestHash("chat", "同一段文本", 1, "same-scope", summaryWorkspaceInputTemplate)
+	if user == template {
+		t.Fatal("request hash must distinguish input_origin")
+	}
+}
+
+func TestDeriveWorkspaceRouteFinalMatrix(t *testing.T) {
+	channel := summaryWorkspaceChannel{ChatID: "g1", ChatType: "group", Name: "项目群"}
+	template := &summaryWorkspaceTemplate{TemplateID: "weekly", Label: "周报", Requirement: "总结进展"}
+	participant := summaryWorkspaceParticipant{UserID: "u2"}
+	tests := []struct {
+		name                   string
+		context                summaryWorkspaceContext
+		selectedSourceExplicit bool
+		hasRequirement         bool
+		openScopeAgent         bool
+		sourcesValid           bool
+		want                   service.SummaryRoute
+	}{
+		{name: "C only previews", context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}}, selectedSourceExplicit: true, sourcesValid: true, want: service.SummaryRouteAgentPreview},
+		{name: "T only inferred C previews", context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}, Template: template}, hasRequirement: true, sourcesValid: true, want: service.SummaryRouteAgentPreview},
+		{name: "C plus T runs personal workflow", context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}, Template: template}, selectedSourceExplicit: true, hasRequirement: true, sourcesValid: true, want: service.SummaryRoutePersonalWorkflow},
+		{name: "P only clarifies", context: summaryWorkspaceContext{Participants: []summaryWorkspaceParticipant{participant}}, want: service.SummaryRouteClarification},
+		{name: "C plus P without requirement clarifies", context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}, Participants: []summaryWorkspaceParticipant{participant}}, selectedSourceExplicit: true, sourcesValid: true, want: service.SummaryRouteClarification},
+		{name: "P plus T starts team workflow", context: summaryWorkspaceContext{Participants: []summaryWorkspaceParticipant{participant}, Template: template}, hasRequirement: true, want: service.SummaryRouteTeamWorkflow},
+		{name: "C plus P plus T starts team workflow", context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}, Participants: []summaryWorkspaceParticipant{participant}, Template: template}, selectedSourceExplicit: true, hasRequirement: true, sourcesValid: true, want: service.SummaryRouteTeamWorkflow},
+		{name: "U only enters open-scope agent", context: summaryWorkspaceContext{}, hasRequirement: true, openScopeAgent: true, want: service.SummaryRouteAgentPreview},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deriveWorkspaceRoute(tt.context, service.SummaryIntentGenerate, true, tt.selectedSourceExplicit, tt.hasRequirement, tt.openScopeAgent, WorkspaceSnapshot{}, true, tt.sourcesValid, true)
+			if got != tt.want {
+				t.Fatalf("route = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

@@ -13,9 +13,13 @@ import (
 	"gorm.io/gorm"
 )
 
-// ChannelScopeOptions controls Layer 1.7 behavior.
+// ChannelScopeOptions controls Layer 1 discovery and Layer 1.7 behavior.
 type ChannelScopeOptions struct {
 	Enabled bool
+	// SpaceID constrains Layer 1 discovery to the task's current Space. Groups
+	// and threads must belong to this Space; DM peers must be active members of
+	// it. Empty preserves the legacy unscoped discovery behavior.
+	SpaceID string
 }
 
 // ChannelScopeRule represents a single channel scope constraint rule.
@@ -72,13 +76,13 @@ var resolveChannelScopeTool = service.Tool{
 								"description": "主题中提到的频道对应的 channel_id。只能从候选频道列表中选取，不得编造。支持模糊匹配（如'dev相关的群'可选取所有名称含dev的频道）。无频道名时为空数组或省略",
 							},
 							"channel_type": map[string]interface{}{
-								"type":  "array",
-								"items": map[string]interface{}{"type": "string", "enum": []string{"group", "dm", "thread"}},
+								"type":        "array",
+								"items":       map[string]interface{}{"type": "string", "enum": []string{"group", "dm", "thread"}},
 								"description": "限定频道类型。'私聊'/'DM'→[\"dm\"]；'群'/'群组'→[\"group\"]；'群聊和私聊'→[\"group\",\"dm\"]；无限定时为空数组或省略",
 							},
 							"ownership": map[string]interface{}{
-								"type":  "array",
-								"items": map[string]interface{}{"type": "string", "enum": []string{"creator", "admin", "member"}},
+								"type":        "array",
+								"items":       map[string]interface{}{"type": "string", "enum": []string{"creator", "admin", "member"}},
 								"description": "限定频道所有权角色。'我建的群'→[\"creator\"]；'我管理的群'→[\"creator\",\"admin\"]；'我参与但不管理的群'→[\"member\"]；无限定时为空数组或省略",
 							},
 						},

@@ -90,6 +90,7 @@ var profiles = map[string]Profile{
 		PromptFile: "summary_workspace",
 		Tools: []string{
 			"get_current_time", "extract_time_range",
+			"list_channels", "narrow_channels_by_topic", "find_shared_channels",
 			"peek_channel", "fetch_channel", "search_messages",
 			"filter_relevant", "summarize_chunk", "merge_summaries",
 			"emit_summary_response",

@@ -721,11 +721,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	}
 
 	// Fetch messages via personal pipeline (Layer 0-5)
-	var channelScopeOpts *pipeline.ChannelScopeOptions
-	if p.cfg.ChannelScopeEnabled {
-		channelScopeOpts = &pipeline.ChannelScopeOptions{
-			Enabled: true,
-		}
+	channelScopeOpts := &pipeline.ChannelScopeOptions{
+		Enabled: p.cfg.ChannelScopeEnabled,
+		SpaceID: task.SpaceID,
 	}
 
 	fetchStart := time.Now()
