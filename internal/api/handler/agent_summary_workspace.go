@@ -21,6 +21,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -116,10 +117,10 @@ func (h *AgentChatHandler) ConfigureSummaryWorkspace(imDB *gorm.DB, workerTrigge
 		db:                h.db,
 		imDB:              imDB,
 		store:             NewAgentWorkspaceStore(h.db),
-		workflow:          service.NewSummaryWorkflowService(h.db, imDB, pipeline.MaxTimeRangeDays),
+		workflow:          service.NewSummaryWorkflowService(h.db, imDB, pipeline.DefaultTimeRangeDays, pipeline.MaxTimeRangeDays),
 		workerTriggerURL:  workerTriggerURL,
 		messageTableCount: msgTableCount,
-		now:               time.Now,
+		now:               timezone.Now,
 	}
 }
 
@@ -425,8 +426,12 @@ func (h *AgentChatHandler) completePersonalWorkspaceWorkflow(ctx context.Context
 	if err != nil {
 		return WorkspaceSnapshot{}, err
 	}
-	if created.WorkerTrigger != nil && !created.Replayed {
-		go h.workspace.triggerWorker(*created.WorkerTrigger)
+	if created.WorkerTrigger != nil {
+		go func(trigger model.WorkerTriggerRequest) {
+			if triggerErr := h.workspace.triggerWorker(trigger); triggerErr != nil {
+				log.Printf("[summary-workspace] worker trigger failed task=%d: %v", trigger.TaskID, triggerErr)
+			}
+		}(*created.WorkerTrigger)
 	}
 	resultType := workspaceResultWorkflowStarted
 	reply := "已开始生成总结，完成后会自动保存。"
@@ -500,8 +505,12 @@ func (h *AgentChatHandler) completeTeamWorkspaceWorkflow(
 	if err != nil {
 		return WorkspaceSnapshot{}, err
 	}
-	if created.WorkerTrigger != nil && !created.Replayed {
-		go h.workspace.triggerWorker(*created.WorkerTrigger)
+	if created.WorkerTrigger != nil {
+		go func(trigger model.WorkerTriggerRequest) {
+			if triggerErr := h.workspace.triggerWorker(trigger); triggerErr != nil {
+				log.Printf("[summary-workspace] worker trigger failed task=%d: %v", trigger.TaskID, triggerErr)
+			}
+		}(*created.WorkerTrigger)
 	}
 	resultType := workspaceResultWorkflowStarted
 	reply := fmt.Sprintf("已发起 %d 人协作总结。", len(contextValue.Participants))
@@ -790,6 +799,7 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "proposal_version 非法"})
 		return
 	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxAgentChatRequestBodySize)
 	var req summaryWorkspaceConfirmRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
@@ -860,6 +870,19 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 	failTurn := func(code string) {
 		_ = h.workspace.store.FailTurn(context.Background(), WorkspaceTurnFailure{Key: key, TurnID: begin.Turn.ID, Attempt: begin.Turn.Attempt, ErrorCode: code})
 	}
+	var persistedContext summaryWorkspaceContext
+	if strings.TrimSpace(begin.Session.ScopeJSON) == "" || json.Unmarshal([]byte(begin.Session.ScopeJSON), &persistedContext) != nil {
+		failTurn("PROPOSAL_SCOPE_DECODE_FAILED")
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取协作范围失败"})
+		return
+	}
+	persistedContext, err = normalizeSummaryWorkspaceContext(persistedContext)
+	if err != nil {
+		failTurn("PROPOSAL_SCOPE_INVALID")
+		c.JSON(http.StatusConflict, apiResponse{Code: 40901, Message: "协作范围已失效，请重新生成提案"})
+		return
+	}
+	contextValue = canonicalizeSummaryWorkspaceContextForActor(persistedContext, uid)
 	sourcesValid, err := h.workspace.validateSources(c.Request.Context(), spaceID, uid, contextValue.SelectedChannels)
 	if err != nil {
 		failTurn("SOURCE_LOOKUP_FAILED")
@@ -904,9 +927,16 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取协作提案失败"})
 		return
 	}
+	if !sameSummaryWorkspaceParticipants(proposal.Participants, contextValue.Participants) {
+		failTurn("PROPOSAL_SCOPE_MISMATCH")
+		c.JSON(http.StatusConflict, apiResponse{Code: 40901, Message: "协作参与者已变化，请重新生成提案"})
+		return
+	}
+	contextValue.Participants = append([]summaryWorkspaceParticipant(nil), proposal.Participants...)
+	workflowIdempotencyKey := workspaceMutationRequestID("workflow", fmt.Sprintf("%s:%d", req.ProposalToken, proposalVersion))
 	snapshot, err := h.completeTeamWorkspaceWorkflow(
 		c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt,
-		idempotencyKey, "确认并发起协作", req.ScopeVersion, contextValue, proposal.Requirement,
+		workflowIdempotencyKey, "确认并发起协作", req.ScopeVersion, contextValue, proposal.Requirement,
 	)
 	if err != nil {
 		failTurn("WORKFLOW_CREATE_FAILED")
@@ -927,6 +957,22 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: turn})
 }
 
+func sameSummaryWorkspaceParticipants(left, right []summaryWorkspaceParticipant) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	ids := make(map[string]struct{}, len(left))
+	for _, participant := range left {
+		ids[participant.UserID] = struct{}{}
+	}
+	for _, participant := range right {
+		if _, ok := ids[participant.UserID]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func (h *AgentChatHandler) handleSummaryWorkspaceHistory(c *gin.Context, sessionID, userID string) bool {
 	if h == nil || h.workspace == nil || h.workspace.store == nil {
 		return false
@@ -941,13 +987,17 @@ func (h *AgentChatHandler) handleSummaryWorkspaceHistory(c *gin.Context, session
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "agent chat history failed"})
 		return true
 	}
-	if snapshot.Session.WorkflowTaskID > 0 && snapshot.Session.WorkflowTerminalMessageID == 0 {
+	if snapshot.Session.WorkflowTaskID > 0 {
 		var task model.SummaryTask
 		taskErr := h.workspace.db.WithContext(c.Request.Context()).Unscoped().
 			Where("id = ? AND space_id = ? AND creator_id = ?", snapshot.Session.WorkflowTaskID, key.SpaceID, key.UserID).
 			Take(&task).Error
 		resultType, reply, terminal, clearWorkflow := workspaceWorkflowTerminalState(task, taskErr)
 		if terminal {
+			messageID := int64(0)
+			if clearWorkflow {
+				messageID = snapshot.Session.WorkflowTerminalMessageID
+			}
 			snapshot, err = h.workspace.store.ReconcileWorkflow(c.Request.Context(), WorkspaceWorkflowReconcile{
 				Key:           key,
 				TaskID:        snapshot.Session.WorkflowTaskID,
@@ -955,6 +1005,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceHistory(c *gin.Context, session
 				ResultType:    resultType,
 				Reply:         reply,
 				ClearWorkflow: clearWorkflow,
+				MessageID:     messageID,
 			})
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to refresh workflow status"})
@@ -1259,7 +1310,7 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 	}
 	contextValue = effective
 
-	now := time.Now()
+	now := timezone.Now()
 	if w != nil && w.now != nil {
 		now = w.now()
 	}
@@ -1822,21 +1873,25 @@ func writeSummaryWorkspaceSSEError(sink *sseSink, code int, message string, tran
 	sink.write("error", data)
 }
 
-func (w *summaryWorkspaceCoordinator) triggerWorker(req model.WorkerTriggerRequest) {
+func (w *summaryWorkspaceCoordinator) triggerWorker(req model.WorkerTriggerRequest) error {
 	if w == nil || w.workerTriggerURL == "" {
-		return
+		return errors.New("worker trigger URL is not configured")
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		log.Printf("[summary-workspace] marshal worker trigger: %v", err)
-		return
+		return err
 	}
 	resp, err := triggerClient.Post(w.workerTriggerURL, "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Printf("[summary-workspace] worker trigger POST failed: %v", err)
-		return
+		return err
 	}
-	_ = resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("worker trigger returned HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func parseWorkspaceProposalVersion(value string) (int, error) {

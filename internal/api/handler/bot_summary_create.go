@@ -269,8 +269,8 @@ func validateBotSummaryRequest(req createBotSummaryReq) error {
 	if !req.TimeRange.Start.Before(req.TimeRange.End) {
 		return errors.New("time_range.start must be before time_range.end")
 	}
-	if req.TimeRange.End.Sub(req.TimeRange.Start) > time.Duration(pipeline.MaxTimeRangeDays)*24*time.Hour {
-		return fmt.Errorf("time range cannot exceed %d days", pipeline.MaxTimeRangeDays)
+	if req.TimeRange.End.Sub(req.TimeRange.Start) > time.Duration(pipeline.DefaultTimeRangeDays)*24*time.Hour {
+		return fmt.Errorf("time range cannot exceed %d days", pipeline.DefaultTimeRangeDays)
 	}
 	if req.OriginChannelID == "" && req.OriginChannelType != 0 {
 		return errors.New("origin_channel_id is required when origin_channel_type is set")

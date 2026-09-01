@@ -12,6 +12,7 @@ import (
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -23,6 +24,12 @@ var (
 	ErrWorkspacePreviewStale    = errors.New("summary workspace preview is stale")
 	ErrWorkspaceTurnLeaseLost   = errors.New("summary workspace turn lease was lost")
 )
+
+const summaryWorkspaceRetention = 30 * 24 * time.Hour
+
+func summaryWorkspaceExpiresAt(now time.Time) time.Time {
+	return now.Add(summaryWorkspaceRetention)
+}
 
 type WorkspaceSessionKey struct {
 	SpaceID   string
@@ -155,7 +162,7 @@ func (s *AgentWorkspaceStore) BeginTurn(ctx context.Context, in WorkspaceBeginTu
 	if lease <= 0 {
 		lease = summaryWorkspaceTurnLease
 	}
-	now := time.Now()
+	now := timezone.Now()
 	leaseUntil := now.Add(lease)
 	result := WorkspaceBeginTurnResult{}
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -231,6 +238,7 @@ func (s *AgentWorkspaceStore) BeginTurn(ctx context.Context, in WorkspaceBeginTu
 				"workflow_scope_version":         0,
 				"workflow_started_message_id":    0,
 				"workflow_terminal_message_id":   0,
+				"expires_at":                     summaryWorkspaceExpiresAt(now),
 				"updated_at":                     now,
 			}
 			if err := tx.Model(&model.AgentSummarySession{}).Where("id = ?", session.ID).Updates(updates).Error; err != nil {
@@ -252,7 +260,7 @@ func (s *AgentWorkspaceStore) BeginTurn(ctx context.Context, in WorkspaceBeginTu
 				return err
 			}
 			if err := tx.Model(&model.AgentSummarySession{}).Where("id = ?", session.ID).
-				Updates(map[string]interface{}{"active_turn_id": existing.ID, "state": "running", "updated_at": now}).Error; err != nil {
+				Updates(map[string]interface{}{"active_turn_id": existing.ID, "state": "running", "expires_at": summaryWorkspaceExpiresAt(now), "updated_at": now}).Error; err != nil {
 				return err
 			}
 			snapshot, snapErr := loadWorkspaceSnapshotTx(tx, in.Key)
@@ -281,7 +289,7 @@ func (s *AgentWorkspaceStore) BeginTurn(ctx context.Context, in WorkspaceBeginTu
 			return err
 		}
 		if err := tx.Model(&model.AgentSummarySession{}).Where("id = ?", session.ID).
-			Updates(map[string]interface{}{"active_turn_id": turn.ID, "state": "running", "updated_at": now}).Error; err != nil {
+			Updates(map[string]interface{}{"active_turn_id": turn.ID, "state": "running", "expires_at": summaryWorkspaceExpiresAt(now), "updated_at": now}).Error; err != nil {
 			return err
 		}
 		snapshot, err := loadWorkspaceSnapshotTx(tx, in.Key)
@@ -327,6 +335,7 @@ func lockOrCreateWorkspaceSession(tx *gorm.DB, in WorkspaceBeginTurnInput, now t
 		ScopeVersion:    in.ScopeVersion,
 		ScopeJSON:       string(in.ScopeJSON),
 		ScopeHash:       in.ScopeHash,
+		ExpiresAt:       func() *time.Time { expires := summaryWorkspaceExpiresAt(now); return &expires }(),
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
@@ -404,11 +413,12 @@ func (s *AgentWorkspaceStore) CompleteTurn(ctx context.Context, in WorkspaceTurn
 			return err
 		}
 		responseMessageID := rows[finalIndex].ID
-		now := time.Now()
+		now := timezone.Now()
 		updates := map[string]interface{}{
 			"state":          in.ResultType,
 			"state_version":  gorm.Expr("state_version + 1"),
 			"active_turn_id": 0,
+			"expires_at":     summaryWorkspaceExpiresAt(now),
 			"updated_at":     now,
 		}
 		if in.ResultType == workspaceResultAgentPreview || in.ResultType == workspaceResultAgentRevision {
@@ -514,7 +524,7 @@ func workspaceMessageRow(key WorkspaceSessionKey, turnID int64, item WorkspacePe
 		ScopeVersion:    item.ScopeVersion,
 		SnapshotVersion: item.SnapshotVersion,
 		ParentMessageID: item.ParentMessageID,
-		CreatedAt:       time.Now(),
+		CreatedAt:       timezone.Now(),
 	}
 	if len(item.Message.ToolCalls) > 0 {
 		data, err := json.Marshal(item.Message.ToolCalls)
@@ -535,7 +545,7 @@ func (s *AgentWorkspaceStore) FailTurn(ctx context.Context, in WorkspaceTurnFail
 	if s == nil || s.db == nil {
 		return errors.New("workspace database is required")
 	}
-	now := time.Now()
+	now := timezone.Now()
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var session model.AgentSummarySession
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -557,7 +567,7 @@ func (s *AgentWorkspaceStore) FailTurn(ctx context.Context, in WorkspaceTurnFail
 			return err
 		}
 		return tx.Model(&model.AgentSummarySession{}).Where("id = ? AND active_turn_id = ?", session.ID, turn.ID).
-			Updates(map[string]interface{}{"active_turn_id": 0, "state": "error", "updated_at": now}).Error
+			Updates(map[string]interface{}{"active_turn_id": 0, "state": "error", "expires_at": summaryWorkspaceExpiresAt(now), "updated_at": now}).Error
 	})
 }
 
@@ -575,8 +585,11 @@ func loadWorkspaceSnapshotTx(db *gorm.DB, key WorkspaceSessionKey) (WorkspaceSna
 		return snapshot, err
 	}
 	if err := db.Where("space_id = ? AND user_id = ? AND session_id = ?", key.SpaceID, key.UserID, key.SessionID).
-		Order("id ASC").Find(&snapshot.Messages).Error; err != nil {
+		Order("id DESC").Limit(maxHistoryRows).Find(&snapshot.Messages).Error; err != nil {
 		return snapshot, err
+	}
+	for left, right := 0, len(snapshot.Messages)-1; left < right; left, right = left+1, right-1 {
+		snapshot.Messages[left], snapshot.Messages[right] = snapshot.Messages[right], snapshot.Messages[left]
 	}
 	if snapshot.Session.LatestPreviewMessageID > 0 {
 		var preview model.AgentMessage
@@ -647,7 +660,7 @@ func (s *AgentWorkspaceStore) BeginProposalConfirmation(ctx context.Context, in 
 	if lease <= 0 {
 		lease = summaryWorkspaceTurnLease
 	}
-	now := time.Now()
+	now := timezone.Now()
 	leaseUntil := now.Add(lease)
 	result := WorkspaceBeginTurnResult{}
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -725,7 +738,7 @@ func (s *AgentWorkspaceStore) BeginProposalConfirmation(ctx context.Context, in 
 				return err
 			}
 			if err := tx.Model(&model.AgentSummarySession{}).Where("id = ?", session.ID).
-				Updates(map[string]interface{}{"active_turn_id": existing.ID, "state": "running", "updated_at": now}).Error; err != nil {
+				Updates(map[string]interface{}{"active_turn_id": existing.ID, "state": "running", "expires_at": summaryWorkspaceExpiresAt(now), "updated_at": now}).Error; err != nil {
 				return err
 			}
 			snapshot, snapErr := loadWorkspaceSnapshotTx(tx, in.Begin.Key)
@@ -754,7 +767,7 @@ func (s *AgentWorkspaceStore) BeginProposalConfirmation(ctx context.Context, in 
 			return err
 		}
 		if err := tx.Model(&model.AgentSummarySession{}).Where("id = ?", session.ID).
-			Updates(map[string]interface{}{"active_turn_id": turn.ID, "state": "running", "updated_at": now}).Error; err != nil {
+			Updates(map[string]interface{}{"active_turn_id": turn.ID, "state": "running", "expires_at": summaryWorkspaceExpiresAt(now), "updated_at": now}).Error; err != nil {
 			return err
 		}
 		snapshot, snapErr := loadWorkspaceSnapshotTx(tx, in.Begin.Key)
@@ -797,7 +810,7 @@ func (s *AgentWorkspaceStore) ReconcileWorkflow(ctx context.Context, in Workspac
 			Take(&session).Error; err != nil {
 			return err
 		}
-		if session.WorkflowTerminalMessageID > 0 {
+		if session.WorkflowTerminalMessageID > 0 && !in.ClearWorkflow {
 			var err error
 			snapshot, err = loadWorkspaceSnapshotTx(tx, in.Key)
 			return err
@@ -838,18 +851,20 @@ func (s *AgentWorkspaceStore) ReconcileWorkflow(ctx context.Context, in Workspac
 				ResultType:      in.ResultType,
 				ResponsePayload: &payloadString,
 				ScopeVersion:    in.ScopeVersion,
-				CreatedAt:       time.Now(),
+				CreatedAt:       timezone.Now(),
 			}
 			if err := tx.Create(&message).Error; err != nil {
 				return err
 			}
 			messageID = message.ID
 		}
+		now := timezone.Now()
 		updates := map[string]interface{}{
 			"state":                        in.ResultType,
 			"state_version":                gorm.Expr("state_version + 1"),
 			"workflow_terminal_message_id": messageID,
-			"updated_at":                   time.Now(),
+			"expires_at":                   summaryWorkspaceExpiresAt(now),
+			"updated_at":                   now,
 		}
 		if in.ClearWorkflow {
 			updates["workflow_task_id"] = 0
@@ -899,10 +914,12 @@ func (s *AgentWorkspaceStore) MarkPreviewSaved(ctx context.Context, in Workspace
 		if err := tx.Model(&model.AgentMessage{}).Where("id = ?", message.ID).Update("saved_task_id", in.TaskID).Error; err != nil {
 			return err
 		}
+		now := timezone.Now()
 		if err := tx.Model(&model.AgentSummarySession{}).Where("id = ?", session.ID).Updates(map[string]interface{}{
 			"latest_preview_saved_task_id": in.TaskID,
 			"state_version":                gorm.Expr("state_version + 1"),
-			"updated_at":                   time.Now(),
+			"expires_at":                   summaryWorkspaceExpiresAt(now),
+			"updated_at":                   now,
 		}).Error; err != nil {
 			return err
 		}

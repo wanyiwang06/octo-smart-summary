@@ -32,6 +32,9 @@ const (
 	workspaceSnapshotVersion          = 1
 	maxSummaryWorkspaceParticipants   = 100
 	maxSummaryWorkspaceReferencedTask = 20
+	maxSummaryWorkspaceIDLength       = 256
+	maxSummaryWorkspaceLabelLength    = 256
+	maxSummaryWorkspaceRequirement    = 8192
 	summaryWorkspaceInputUser         = "user"
 	summaryWorkspaceInputTemplate     = "template"
 	summaryWorkspaceInputSystemIntent = "system_intent"
@@ -174,13 +177,13 @@ func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorksp
 		channel.ChatID = strings.TrimSpace(channel.ChatID)
 		channel.ChatType = strings.ToLower(strings.TrimSpace(channel.ChatType))
 		channel.Name = strings.TrimSpace(channel.Name)
-		if channel.ChatID == "" || channel.Name == "" {
+		if channel.ChatID == "" || channel.Name == "" || len([]rune(channel.ChatID)) > maxSummaryWorkspaceIDLength || len([]rune(channel.Name)) > maxSummaryWorkspaceLabelLength {
 			return out, fmt.Errorf("%w: selected channel id and name are required", errInvalidSummaryWorkspaceContext)
 		}
 		switch channel.ChatType {
 		case "group", "direct", "thread":
 		default:
-			return out, fmt.Errorf("%w: invalid chat_type %q", errInvalidSummaryWorkspaceContext, channel.ChatType)
+			return out, fmt.Errorf("%w: invalid chat_type", errInvalidSummaryWorkspaceContext)
 		}
 		key := channel.ChatType + ":" + channel.ChatID
 		if _, exists := seenChannels[key]; exists {
@@ -197,7 +200,7 @@ func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorksp
 	for _, participant := range in.Participants {
 		participant.UserID = strings.TrimSpace(participant.UserID)
 		participant.UserName = strings.TrimSpace(participant.UserName)
-		if participant.UserID == "" {
+		if participant.UserID == "" || len([]rune(participant.UserID)) > maxSummaryWorkspaceIDLength || len([]rune(participant.UserName)) > maxSummaryWorkspaceLabelLength {
 			return out, fmt.Errorf("%w: participant user_id is required", errInvalidSummaryWorkspaceContext)
 		}
 		if _, exists := seenParticipants[participant.UserID]; exists {
@@ -212,7 +215,10 @@ func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorksp
 		template.TemplateID = strings.TrimSpace(template.TemplateID)
 		template.Label = strings.TrimSpace(template.Label)
 		template.Requirement = strings.TrimSpace(template.Requirement)
-		if template.TemplateID == "" || template.Label == "" || template.Requirement == "" || template.Version < 0 {
+		if template.TemplateID == "" || template.Label == "" || template.Requirement == "" || template.Version < 0 ||
+			len([]rune(template.TemplateID)) > maxSummaryWorkspaceIDLength ||
+			len([]rune(template.Label)) > maxSummaryWorkspaceLabelLength ||
+			len([]rune(template.Requirement)) > maxSummaryWorkspaceRequirement {
 			return out, fmt.Errorf("%w: invalid template", errInvalidSummaryWorkspaceContext)
 		}
 		out.Template = &template
@@ -225,7 +231,7 @@ func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorksp
 		timeRange.Label = strings.TrimSpace(timeRange.Label)
 		start, startErr := time.Parse(time.RFC3339, timeRange.Start)
 		end, endErr := time.Parse(time.RFC3339, timeRange.End)
-		if startErr != nil || endErr != nil || !end.After(start) || timeRange.Label == "" {
+		if startErr != nil || endErr != nil || !end.After(start) || timeRange.Label == "" || len([]rune(timeRange.Label)) > maxSummaryWorkspaceLabelLength {
 			return out, fmt.Errorf("%w: invalid time_range", errInvalidSummaryWorkspaceContext)
 		}
 		if end.Sub(start) > time.Duration(pipeline.MaxTimeRangeDays)*24*time.Hour {

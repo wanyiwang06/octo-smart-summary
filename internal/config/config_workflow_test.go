@@ -11,6 +11,7 @@ func TestLoad_WorkflowConfigs(t *testing.T) {
 		t.Setenv("ENABLE_INTENT_SHORTCUT", "")
 		t.Setenv("MAX_SAFETY_LIMIT", "")
 		t.Setenv("DEFAULT_TIME_RANGE_DAYS", "")
+		t.Setenv("MAX_TIME_RANGE_DAYS", "")
 		t.Setenv("SKIP_MAP_REDUCE_THRESHOLD", "")
 		t.Setenv("TOKENIZER_HTTP_TIMEOUT", "")
 		t.Setenv("MESSAGE_FETCH_BACKEND", "")
@@ -33,6 +34,9 @@ func TestLoad_WorkflowConfigs(t *testing.T) {
 		if cfg.DefaultTimeRangeDays != 31 {
 			t.Errorf("DefaultTimeRangeDays = %d, want 31", cfg.DefaultTimeRangeDays)
 		}
+		if cfg.MaxTimeRangeDays != 90 {
+			t.Errorf("MaxTimeRangeDays = %d, want 90", cfg.MaxTimeRangeDays)
+		}
 		if cfg.SkipMapReduceThreshold != 0 {
 			t.Errorf("SkipMapReduceThreshold = %d, want 0 (uses fallback)", cfg.SkipMapReduceThreshold)
 		}
@@ -46,6 +50,7 @@ func TestLoad_WorkflowConfigs(t *testing.T) {
 		t.Setenv("ENABLE_INTENT_SHORTCUT", "false")
 		t.Setenv("MAX_SAFETY_LIMIT", "50000")
 		t.Setenv("DEFAULT_TIME_RANGE_DAYS", "14")
+		t.Setenv("MAX_TIME_RANGE_DAYS", "60")
 		t.Setenv("SKIP_MAP_REDUCE_THRESHOLD", "150000")
 		t.Setenv("TOKENIZER_HTTP_TIMEOUT", "20")
 		t.Setenv("MESSAGE_FETCH_BACKEND", "mysql")
@@ -67,6 +72,9 @@ func TestLoad_WorkflowConfigs(t *testing.T) {
 		}
 		if cfg.DefaultTimeRangeDays != 14 {
 			t.Errorf("DefaultTimeRangeDays = %d, want 14", cfg.DefaultTimeRangeDays)
+		}
+		if cfg.MaxTimeRangeDays != 60 {
+			t.Errorf("MaxTimeRangeDays = %d, want 60", cfg.MaxTimeRangeDays)
 		}
 		if cfg.SkipMapReduceThreshold != 150000 {
 			t.Errorf("SkipMapReduceThreshold = %d, want 150000", cfg.SkipMapReduceThreshold)

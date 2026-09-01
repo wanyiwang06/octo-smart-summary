@@ -321,8 +321,8 @@ func TestDeriveWorkspaceRouteFinalMatrix(t *testing.T) {
 		{name: "C plus T runs personal workflow", context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}, Template: template}, selectedSourceExplicit: true, hasRequirement: true, sourcesValid: true, want: service.SummaryRoutePersonalWorkflow},
 		{name: "P only clarifies", context: summaryWorkspaceContext{Participants: []summaryWorkspaceParticipant{participant}}, want: service.SummaryRouteClarification},
 		{name: "C plus P without requirement clarifies", context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}, Participants: []summaryWorkspaceParticipant{participant}}, selectedSourceExplicit: true, sourcesValid: true, want: service.SummaryRouteClarification},
-		{name: "P plus T starts team workflow", context: summaryWorkspaceContext{Participants: []summaryWorkspaceParticipant{participant}, Template: template}, hasRequirement: true, want: service.SummaryRouteTeamWorkflow},
-		{name: "C plus P plus T starts team workflow", context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}, Participants: []summaryWorkspaceParticipant{participant}, Template: template}, selectedSourceExplicit: true, hasRequirement: true, sourcesValid: true, want: service.SummaryRouteTeamWorkflow},
+		{name: "P plus T requires team confirmation", context: summaryWorkspaceContext{Participants: []summaryWorkspaceParticipant{participant}, Template: template}, hasRequirement: true, want: service.SummaryRouteTeamConfirmation},
+		{name: "C plus P plus T requires team confirmation", context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}, Participants: []summaryWorkspaceParticipant{participant}, Template: template}, selectedSourceExplicit: true, hasRequirement: true, sourcesValid: true, want: service.SummaryRouteTeamConfirmation},
 		{name: "U only enters open-scope agent", context: summaryWorkspaceContext{}, hasRequirement: true, openScopeAgent: true, want: service.SummaryRouteAgentPreview},
 	}
 	for _, tt := range tests {

@@ -29,7 +29,7 @@ func newSummaryWorkflowTestService(t *testing.T) (*SummaryWorkflowService, *gorm
 	); err != nil {
 		t.Fatalf("migrate sqlite: %v", err)
 	}
-	return NewSummaryWorkflowService(db, nil, 31), db
+	return NewSummaryWorkflowService(db, nil, 31, 31), db
 }
 
 func baseSummaryWorkflowInput() LegacyCreateSummaryWorkflowInput {
@@ -71,7 +71,7 @@ func TestSummaryWorkflowCreatePersonal(t *testing.T) {
 
 func TestLegacyWorkflowDefaultRangeRemains31DaysWhenMaximumIs90Days(t *testing.T) {
 	_, db := newSummaryWorkflowTestService(t)
-	svc := NewSummaryWorkflowService(db, nil, 90)
+	svc := NewSummaryWorkflowService(db, nil, 31, 90)
 
 	got, err := svc.CreateFromLegacyHTTP(context.Background(), baseSummaryWorkflowInput())
 	if err != nil {
@@ -80,6 +80,36 @@ func TestLegacyWorkflowDefaultRangeRemains31DaysWhenMaximumIs90Days(t *testing.T
 	want := time.Duration(legacySummaryDefaultTimeRangeDays) * 24 * time.Hour
 	if duration := got.Task.TimeRangeEnd.Sub(got.Task.TimeRangeStart); duration < want-time.Second || duration > want+time.Second {
 		t.Fatalf("legacy default range = %s, want %s even when maximum is 90 days", duration, want)
+	}
+}
+
+func TestLegacyWorkflowDefaultRangeUsesConfiguredValue(t *testing.T) {
+	_, db := newSummaryWorkflowTestService(t)
+	svc := NewSummaryWorkflowService(db, nil, 14, 90)
+
+	got, err := svc.CreateFromLegacyHTTP(context.Background(), baseSummaryWorkflowInput())
+	if err != nil {
+		t.Fatalf("CreateFromLegacyHTTP() error: %v", err)
+	}
+	want := 14 * 24 * time.Hour
+	if duration := got.Task.TimeRangeEnd.Sub(got.Task.TimeRangeStart); duration < want-time.Second || duration > want+time.Second {
+		t.Fatalf("legacy default range = %s, want configured %s", duration, want)
+	}
+}
+
+func TestLegacyWorkflowRejectsRangeBeyondConfiguredMaximum(t *testing.T) {
+	_, db := newSummaryWorkflowTestService(t)
+	svc := NewSummaryWorkflowService(db, nil, 31, 31)
+	in := baseSummaryWorkflowInput()
+	in.TimeRange = &SummaryWorkflowTimeRange{
+		Start: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 7, 31, 0, 0, 0, 0, time.UTC),
+	}
+
+	_, err := svc.CreateFromLegacyHTTP(context.Background(), in)
+	var bizErr *BizError
+	if !errors.As(err, &bizErr) || bizErr.Code != 40002 {
+		t.Fatalf("CreateFromLegacyHTTP() error = %v, want code 40002", err)
 	}
 }
 
@@ -165,8 +195,8 @@ func TestSummaryWorkflowIdempotencyReplayAndMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay Create() error: %v", err)
 	}
-	if !second.Replayed || second.Task.ID != first.Task.ID || second.WorkerTrigger != nil {
-		t.Fatalf("replay = %#v, want same task and no worker trigger", second)
+	if !second.Replayed || second.Task.ID != first.Task.ID || second.WorkerTrigger == nil {
+		t.Fatalf("replay = %#v, want same task and a recoverable pending worker trigger", second)
 	}
 
 	var taskCount int64
@@ -326,7 +356,7 @@ func TestAgentPersonalWorkflowRequiresSafeBoundary(t *testing.T) {
 	}
 
 	replay, err := svc.CreatePersonalFromAgent(context.Background(), in)
-	if err != nil || !replay.Replayed || replay.Task.ID != got.Task.ID || replay.WorkerTrigger != nil {
+	if err != nil || !replay.Replayed || replay.Task.ID != got.Task.ID || replay.WorkerTrigger == nil {
 		t.Fatalf("replay = %#v, err=%v", replay, err)
 	}
 	var count int64
@@ -374,6 +404,12 @@ func TestAgentWorkflowRejectsWrongTargetMissingSourceOrKey(t *testing.T) {
 	invalidTeamSource.Participants = []SummaryWorkflowParticipant{{UserID: "p1"}}
 	if _, err := svc.CreateTeamFromAgent(context.Background(), invalidTeamSource); err == nil {
 		t.Fatal("team agent workflow accepted an invalid selected source")
+	}
+
+	emptyTeamParticipant := baseAgentWorkflowInput()
+	emptyTeamParticipant.Participants = []SummaryWorkflowParticipant{{UserID: ""}}
+	if _, err := svc.CreateTeamFromAgent(context.Background(), emptyTeamParticipant); err == nil {
+		t.Fatal("team agent workflow accepted an empty participant id")
 	}
 
 	missingKey := baseAgentWorkflowInput()

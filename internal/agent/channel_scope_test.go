@@ -63,6 +63,19 @@ func TestDiscoverableChannelScopeStartsClosedAndGrantsConfirmedChannels(t *testi
 	}
 }
 
+func TestDiscoverableChannelScopeUnionsMultipleDiscoveryResults(t *testing.T) {
+	ctx := context.WithValue(context.Background(), ContextKeyUID, "user-1")
+	ctx = WithDiscoverableChannelScope(ctx)
+	AuthorizeDiscoveredChannels(ctx, []pipeline.ChannelInfo{{ChannelID: "group-1", ChannelType: model.ChannelTypeGroup}})
+	AuthorizeDiscoveredChannels(ctx, []pipeline.ChannelInfo{{ChannelID: "group-2", ChannelType: model.ChannelTypeGroup}})
+
+	for _, channelID := range []string{"group-1", "group-2"} {
+		if restricted, allowed := ChannelAllowedByScope(ctx, channelID, model.ChannelTypeGroup); !restricted || !allowed {
+			t.Fatalf("channel %s = (%v,%v), want retained union grant", channelID, restricted, allowed)
+		}
+	}
+}
+
 func TestClosedChannelScopeCannotBeExpandedByDiscovery(t *testing.T) {
 	ctx := context.WithValue(context.Background(), ContextKeyUID, "user-1")
 	ctx = WithAllowedChannelScope(ctx, []ChannelScope{{ChannelID: "group-1", ChannelType: model.ChannelTypeGroup}})

@@ -38,6 +38,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"github.com/gin-gonic/gin"
 
 	"gorm.io/gorm"
@@ -265,6 +266,7 @@ func markWorkspacePreviewSaved(
 		return fmt.Errorf("%w: preview save marker changed", errWorkspacePreviewSaveStale)
 	}
 
+	now := timezone.Now()
 	sessionUpdate := tx.Model(&model.AgentSummarySession{}).
 		Where(
 			"space_id = ? AND user_id = ? AND session_id = ? AND scope_version = ? AND artifact_version = ? AND latest_preview_message_id = ? AND latest_preview_saved_task_id = 0",
@@ -273,7 +275,8 @@ func markWorkspacePreviewSaved(
 		Updates(map[string]interface{}{
 			"latest_preview_saved_task_id": taskID,
 			"state_version":                gorm.Expr("state_version + 1"),
-			"updated_at":                   time.Now(),
+			"expires_at":                   summaryWorkspaceExpiresAt(now),
+			"updated_at":                   now,
 		})
 	if sessionUpdate.Error != nil {
 		return fmt.Errorf("mark workspace session saved: %w", sessionUpdate.Error)

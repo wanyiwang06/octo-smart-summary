@@ -197,16 +197,6 @@ func (s *mutableChannelScope) addLocked(channels []ChannelScope, uid string) {
 	}
 }
 
-func (s *mutableChannelScope) replace(channels []ChannelScope, uid string) {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.allowed = make(map[int]map[string]ChannelScope)
-	s.addLocked(channels, uid)
-}
-
 // WithAllowedChannelScope restricts channel-reading tools to the exact set
 // already authorised by the application layer. Calling it with an empty slice
 // intentionally installs an empty allowlist; absence of the value keeps legacy
@@ -247,7 +237,7 @@ func AuthorizeDiscoveredChannels(ctx context.Context, channels []pipeline.Channe
 			IsArchived:  channel.IsArchived,
 		})
 	}
-	scope.replace(grants, uid)
+	scope.add(grants, uid)
 	return true
 }
 

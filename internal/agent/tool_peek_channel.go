@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
@@ -108,6 +109,9 @@ func PeekChannelTool() (Tool, Handler) {
 
 		// Security: validate channel accessibility for system-injected uid
 		options := []pipeline.ChannelQueryOption{pipeline.WithIncludeArchived(req.IncludeArchived)}
+		if spaceID := strings.TrimSpace(WorkspaceSpaceID(ctx)); spaceID != "" {
+			options = append(options, pipeline.WithSpaceID(spaceID))
+		}
 		if !req.IncludeArchived {
 			options = append(options, pipeline.WithSelectedThreads(SelectedArchivedChannelIDs(ctx)))
 		}

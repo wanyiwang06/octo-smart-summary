@@ -75,7 +75,10 @@ func resolveChatProfile(reqProfile string, hasChannels, hasReferences bool) (pro
 }
 
 // maxMessageLen 是单条用户 message 的最大字符数（rune），超长直接 400，避免超长入参打爆上游。
-const maxMessageLen = 8192
+const (
+	maxMessageLen               = 8192
+	maxAgentChatRequestBodySize = 512 << 10
+)
 
 // sessionIDPattern 约束前端生成的 session_id：仅字母数字下划线连字符、1..128 长。
 // 既防注入/异常键，也与 DB varchar(128) 对齐。
@@ -585,6 +588,7 @@ func (h *AgentChatHandler) maybePersistSummaryRun(ctx context.Context, uid strin
 // AppendMessages 全程无锁，若同 session 并发进入会读到相同历史各自续写，产生分叉历史；
 // 锁 / 版本号方案留后续，本轮不实现。
 func (h *AgentChatHandler) Chat(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxAgentChatRequestBodySize)
 	var req agentChatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})
@@ -882,6 +886,7 @@ func (s *sseSink) write(event string, payload []byte) {
 // Context timeout: 300s (longer than Chat's 120s for map-reduce workloads).
 // Database persistence: same as Chat (AppendMessages only on success, no progress events stored).
 func (h *AgentChatHandler) ChatStream(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxAgentChatRequestBodySize)
 	var req agentChatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "invalid request body"})

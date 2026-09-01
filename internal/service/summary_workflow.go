@@ -33,8 +33,8 @@ const (
 	// visible "最近 7 天" default whenever the user did not select a range.
 	AgentSummaryDefaultTimeRangeDays = 7
 
-	// legacySummaryDefaultTimeRangeDays preserves the pre-workbench behavior.
-	// The 90-day selectable upper bound must not silently widen this fallback.
+	// legacySummaryDefaultTimeRangeDays is used only when the caller does not
+	// provide the configured legacy default.
 	legacySummaryDefaultTimeRangeDays = 31
 )
 
@@ -139,15 +139,24 @@ type CreateSummaryWorkflowResult struct {
 // traditional endpoint uses now and policy-gated Agent adapters can reuse
 // later.
 type SummaryWorkflowService struct {
-	db               *gorm.DB
-	imDB             *gorm.DB
-	maxTimeRangeDays int
+	db                   *gorm.DB
+	imDB                 *gorm.DB
+	defaultTimeRangeDays int
+	maxTimeRangeDays     int
 }
 
 // NewSummaryWorkflowService creates the application service. maxTimeRangeDays
 // is supplied by the caller to avoid a service -> pipeline import cycle.
-func NewSummaryWorkflowService(db, imDB *gorm.DB, maxTimeRangeDays int) *SummaryWorkflowService {
-	return &SummaryWorkflowService{db: db, imDB: imDB, maxTimeRangeDays: maxTimeRangeDays}
+func NewSummaryWorkflowService(db, imDB *gorm.DB, defaultTimeRangeDays, maxTimeRangeDays int) *SummaryWorkflowService {
+	if defaultTimeRangeDays <= 0 {
+		defaultTimeRangeDays = legacySummaryDefaultTimeRangeDays
+	}
+	return &SummaryWorkflowService{
+		db:                   db,
+		imDB:                 imDB,
+		defaultTimeRangeDays: defaultTimeRangeDays,
+		maxTimeRangeDays:     maxTimeRangeDays,
+	}
 }
 
 // ValidSummaryWorkflowIdempotencyKey reports whether a non-empty key is safe
@@ -239,6 +248,9 @@ func (s *SummaryWorkflowService) CreatePersonalFromAgent(ctx context.Context, in
 // their own authorised scope. The side-effect boundary still requires at
 // least one other participant and a non-empty requirement.
 func (s *SummaryWorkflowService) CreateTeamFromAgent(ctx context.Context, in AgentCreateSummaryWorkflowInput) (CreateSummaryWorkflowResult, error) {
+	if err := validateAgentWorkflowParticipants(in.Participants); err != nil {
+		return CreateSummaryWorkflowResult{}, err
+	}
 	if len(deduplicateWorkflowParticipants(in.Participants, in.ActorID)) == 0 {
 		return CreateSummaryWorkflowResult{}, NewBizError(40001, "team workflow requires at least one other participant", http.StatusBadRequest)
 	}
@@ -246,6 +258,15 @@ func (s *SummaryWorkflowService) CreateTeamFromAgent(ctx context.Context, in Age
 		return CreateSummaryWorkflowResult{}, NewBizError(40001, "team workflow requires a summary requirement", http.StatusBadRequest)
 	}
 	return s.createFromAgent(ctx, in, SummaryWorkflowTeam)
+}
+
+func validateAgentWorkflowParticipants(participants []SummaryWorkflowParticipant) *BizError {
+	for _, participant := range participants {
+		if strings.TrimSpace(participant.UserID) == "" {
+			return NewBizError(40001, "each participant requires user_id", http.StatusBadRequest)
+		}
+	}
+	return nil
 }
 
 func (s *SummaryWorkflowService) createFromAgent(ctx context.Context, in AgentCreateSummaryWorkflowInput, expectedTarget SummaryWorkflowTarget) (CreateSummaryWorkflowResult, error) {
@@ -366,7 +387,7 @@ func (s *SummaryWorkflowService) normalize(in LegacyCreateSummaryWorkflowInput) 
 		timeEnd = in.TimeRange.End
 	} else {
 		timeEnd = timezone.Now()
-		timeStart = timeEnd.Add(-legacySummaryDefaultTimeRangeDays * 24 * time.Hour)
+		timeStart = timeEnd.Add(-time.Duration(s.defaultTimeRangeDays) * 24 * time.Hour)
 	}
 
 	scope := model.SnapshotScope{ChannelIDs: workflowChannelIDs(sources)}
@@ -589,6 +610,28 @@ func (s *SummaryWorkflowService) findIdempotentWorkflow(ctx context.Context, in 
 		Target:   in.target,
 		Inferred: in.inferred,
 		Replayed: true,
+	}
+	if task.Status == model.StatusPending || task.Status == model.StatusProcessing || task.Status == model.StatusWaitingConfirm {
+		var creator model.SummaryParticipant
+		if err := s.db.WithContext(ctx).
+			Where("task_id = ? AND user_id = ?", task.ID, in.creatorID).
+			Take(&creator).Error; err != nil {
+			return CreateSummaryWorkflowResult{}, false, fmt.Errorf("load idempotent summary creator %d: %w", task.ID, err)
+		}
+		var personal model.PersonalResult
+		if err := s.db.WithContext(ctx).
+			Where("task_id = ? AND participant_ref_id = ?", task.ID, creator.ID).
+			Take(&personal).Error; err != nil {
+			return CreateSummaryWorkflowResult{}, false, fmt.Errorf("load idempotent personal result %d: %w", task.ID, err)
+		}
+		if personal.WorkerStatus == model.PersonalStatusPending {
+			result.CreatorParticipantID = creator.ID
+			result.WorkerTrigger = &model.WorkerTriggerRequest{
+				Type:             "personal_summary",
+				TaskID:           task.ID,
+				ParticipantRefID: creator.ID,
+			}
+		}
 	}
 	return result, true, nil
 }

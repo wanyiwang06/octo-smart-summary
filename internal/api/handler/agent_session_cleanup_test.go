@@ -26,6 +26,13 @@ func newCleanupTestDB(t *testing.T) (*gorm.DB, bool) {
 		&model.AgentMessage{},
 		&model.AgentMessageEvidence{},
 		&model.AgentSummarySession{},
+		&model.AgentSummaryTurn{},
+		&model.AgentSummaryRun{},
+		&model.AgentSummarySpec{},
+		&model.AgentEvidenceArtifact{},
+		&model.AgentCitationManifest{},
+		&model.SummaryWorkflowIdempotency{},
+		&model.SummaryTask{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -405,6 +412,84 @@ func TestRunOnce_workspaceEvidenceProtectionScopedByOwner(t *testing.T) {
 	if got := countEvidence(t, db, "user-2", internalSessionID); got != 0 {
 		t.Errorf("another user's unreferenced expired evidence should be cleaned, got %d rows", got)
 	}
+}
+
+func TestRunOnce_expiredWorkspaceSessionAndEvidenceCleaned(t *testing.T) {
+	db, skip := newCleanupTestDB(t)
+	if skip {
+		return
+	}
+
+	seedWorkspaceSession(t, db, "space-1", "user-1", "workspace-expired")
+	var session model.AgentSummarySession
+	if err := db.Where("space_id = ? AND user_id = ? AND session_id = ?", "space-1", "user-1", "workspace-expired").Take(&session).Error; err != nil {
+		t.Fatalf("load workspace session: %v", err)
+	}
+	expiredAt := time.Now().Add(-time.Hour)
+	if err := db.Model(&session).Updates(map[string]interface{}{"expires_at": expiredAt, "updated_at": time.Now().Add(-summaryWorkspaceRetention - time.Hour)}).Error; err != nil {
+		t.Fatalf("expire workspace session: %v", err)
+	}
+	seedMsgInSpace(t, db, "space-1", "workspace-expired", "user-1", "assistant", time.Now().Add(-48*time.Hour))
+	seedEvidence(t, db, "user-1", session.AgentSessionID, "msg_workspace_expired", time.Now().Add(-48*time.Hour))
+	if err := db.Create(&model.AgentSummaryTurn{
+		SpaceID: "space-1", UserID: "user-1", SessionID: "workspace-expired", RequestID: "req-1",
+		RequestHash: "hash", ScopeVersion: 1, Status: "completed", CreatedAt: expiredAt, UpdatedAt: expiredAt,
+	}).Error; err != nil {
+		t.Fatalf("seed workspace turn: %v", err)
+	}
+
+	runOnce(db)
+
+	for name, value := range map[string]int64{
+		"sessions": countModelRows(t, db, &model.AgentSummarySession{}, "session_id = ?", "workspace-expired"),
+		"turns":    countModelRows(t, db, &model.AgentSummaryTurn{}, "session_id = ?", "workspace-expired"),
+		"messages": countMsgsInSpace(t, db, "space-1", "user-1", "workspace-expired"),
+		"evidence": countEvidence(t, db, "user-1", session.AgentSessionID),
+	} {
+		if value != 0 {
+			t.Errorf("expired workspace %s = %d, want 0", name, value)
+		}
+	}
+}
+
+func TestRunOnce_activeWorkspaceSessionPreserved(t *testing.T) {
+	db, skip := newCleanupTestDB(t)
+	if skip {
+		return
+	}
+
+	seedWorkspaceSession(t, db, "space-1", "user-1", "workspace-active")
+	var session model.AgentSummarySession
+	if err := db.Where("space_id = ? AND user_id = ? AND session_id = ?", "space-1", "user-1", "workspace-active").Take(&session).Error; err != nil {
+		t.Fatalf("load workspace session: %v", err)
+	}
+	future := time.Now().Add(time.Hour)
+	if err := db.Model(&session).Update("expires_at", future).Error; err != nil {
+		t.Fatalf("extend workspace session: %v", err)
+	}
+	seedMsgInSpace(t, db, "space-1", "workspace-active", "user-1", "assistant", time.Now().Add(-48*time.Hour))
+	seedEvidence(t, db, "user-1", session.AgentSessionID, "msg_workspace_active", time.Now().Add(-48*time.Hour))
+
+	runOnce(db)
+
+	if got := countModelRows(t, db, &model.AgentSummarySession{}, "session_id = ?", "workspace-active"); got != 1 {
+		t.Errorf("active workspace sessions = %d, want 1", got)
+	}
+	if got := countMsgsInSpace(t, db, "space-1", "user-1", "workspace-active"); got != 1 {
+		t.Errorf("active workspace messages = %d, want 1", got)
+	}
+	if got := countEvidence(t, db, "user-1", session.AgentSessionID); got != 1 {
+		t.Errorf("active workspace evidence = %d, want 1", got)
+	}
+}
+
+func countModelRows(t *testing.T, db *gorm.DB, modelValue interface{}, query string, args ...interface{}) int64 {
+	t.Helper()
+	var count int64
+	if err := db.Model(modelValue).Where(query, args...).Count(&count).Error; err != nil {
+		t.Fatalf("count model rows: %v", err)
+	}
+	return count
 }
 
 // TestRunOnce_evidenceOwnerScoped verifies the (user_id, session_id) predicate

@@ -81,14 +81,14 @@ func DeriveSummaryRoute(in SummaryRouteInput) SummaryRoute {
 		return SummaryRouteClarification
 	}
 
-	// Explanation is read-only and must remain available even if the current
-	// execution scope is incomplete or stale.
-	if in.Intent == SummaryIntentExplain {
-		return SummaryRouteExplanation
-	}
 	if in.HasHardMissingData || (in.HasSelectedSource && !in.HasValidSource) ||
 		(in.HasOtherParticipants && !in.ParticipantsValid) {
 		return SummaryRouteClarification
+	}
+	// Explanation is read-only, but it can still invoke content-reading tools.
+	// Never let it bypass source, participant, or reference validation.
+	if in.Intent == SummaryIntentExplain {
+		return SummaryRouteExplanation
 	}
 
 	switch in.Intent {
@@ -113,7 +113,7 @@ func DeriveSummaryRoute(in SummaryRouteInput) SummaryRoute {
 			if !in.HasSelectedTemplate && !in.HasRequirement {
 				return SummaryRouteClarification
 			}
-			return SummaryRouteTeamWorkflow
+			return SummaryRouteTeamConfirmation
 		}
 		if in.HasExplicitRunIntent && in.HasSelectedSource && in.HasValidSource && in.HasSelectedTemplate {
 			return SummaryRoutePersonalWorkflow

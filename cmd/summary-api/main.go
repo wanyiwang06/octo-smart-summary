@@ -38,6 +38,9 @@ func main() {
 	if cfg.DefaultTimeRangeDays > 0 {
 		pipeline.DefaultTimeRangeDays = cfg.DefaultTimeRangeDays
 	}
+	if cfg.MaxTimeRangeDays > 0 {
+		pipeline.MaxTimeRangeDays = cfg.MaxTimeRangeDays
+	}
 	// EnableIntentShortcut defaults to true, so we always apply it
 	pipeline.EnableIntentShortcut = cfg.EnableIntentShortcut
 

@@ -166,6 +166,7 @@ type Config struct {
 	// Hardcoded limits (now configurable)
 	MaxSafetyLimit       int // Max messages per channel before safety truncation, default 100000
 	DefaultTimeRangeDays int // Legacy default time range when not specified, default 31
+	MaxTimeRangeDays     int // Maximum selectable/fetchable summary range, default 90
 
 	// Token calculation config
 	SkipMapReduceThreshold int    // Skip Map-Reduce threshold (tokens), env SKIP_MAP_REDUCE_THRESHOLD
@@ -263,6 +264,7 @@ func Load() *Config {
 
 		MaxSafetyLimit:       envInt("MAX_SAFETY_LIMIT", 100000),
 		DefaultTimeRangeDays: envInt("DEFAULT_TIME_RANGE_DAYS", 31),
+		MaxTimeRangeDays:     envInt("MAX_TIME_RANGE_DAYS", 90),
 
 		SkipMapReduceThreshold: envInt("SKIP_MAP_REDUCE_THRESHOLD", 0),
 		KimiAPIKey:             envStr("KIMI_API_KEY", ""),

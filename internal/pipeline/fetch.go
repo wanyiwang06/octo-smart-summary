@@ -443,6 +443,30 @@ func ApplySourceConstraints(userChannels []ChannelInfo, specifiedSources []map[s
 	return result
 }
 
+func validateExplicitSourceCoverage(userChannels []ChannelInfo, specifiedSources []map[string]interface{}, selfUID string) error {
+	if len(specifiedSources) == 0 {
+		return nil
+	}
+	requested := make(map[string]struct{}, len(specifiedSources))
+	for _, source := range specifiedSources {
+		id, _ := source["source_id"].(string)
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		requested[NormalizeDMChannelID(id, selfUID, mapFrontendSourceType(sourceType(source)))] = struct{}{}
+	}
+	available := make(map[string]struct{}, len(userChannels))
+	for _, channel := range userChannels {
+		available[channel.ChannelID] = struct{}{}
+	}
+	for id := range requested {
+		if _, ok := available[id]; !ok {
+			return fmt.Errorf("explicit summary source is unavailable in the current space")
+		}
+	}
+	return nil
+}
+
 // Deprecated: use ResolveChannelScope instead.
 // NarrowByTopic uses LLM to filter channels relevant to the topic. (Layer 3)
 //
@@ -952,6 +976,9 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	userChannels, err = IntersectParticipantChannels(ctx, userChannels, participantUIDs, imDB, channelQueryOpts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("intersect participant channels: %w", err)
+	}
+	if err := validateExplicitSourceCoverage(userChannels, specifiedSources, creatorUID); err != nil {
+		return nil, nil, err
 	}
 	log.Printf("[pipeline-personal] Layer 1.5 (participant intersect) took %dms (%d channels)",
 		time.Since(l15Start).Milliseconds(), len(userChannels))

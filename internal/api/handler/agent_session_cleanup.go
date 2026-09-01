@@ -2,10 +2,13 @@ package handler
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"gorm.io/gorm"
 )
 
@@ -34,6 +37,9 @@ const (
 	cleanupSlowThreshold = 1 * time.Second
 	// cleanupJitter 首次执行前等一段随机时间,避免多实例撞车 & 冷启动瞬间打 DB
 	cleanupInitialDelay = 30 * time.Second
+	// workspaceCleanupBatchSize bounds each cleanup transaction so a large
+	// backlog does not hold locks across the entire workspace history table.
+	workspaceCleanupBatchSize = 200
 )
 
 // StartAgentSessionCleanup 启动 24h 定时清理 goroutine。
@@ -85,8 +91,9 @@ func StartAgentSessionCleanup(ctx context.Context, db *gorm.DB) {
 // summarize_chunk. Evidence expiry uses its own last-activity timestamp, while
 // durable workspace references below prevent premature collection.
 func runOnce(db *gorm.DB) {
-	cutoff := time.Now().Add(-cleanupAge)
-	start := time.Now()
+	now := timezone.Now()
+	cutoff := now.Add(-cleanupAge)
+	start := timezone.Now()
 
 	// 只在 Legacy 消息(space_id = '')中按 (user_id, session_id) 聚合
 	// MAX(created_at),定位两键都过期的 tuple。workspace 消息由持久化 session
@@ -128,6 +135,18 @@ func runOnce(db *gorm.DB) {
 			elapsed, result.RowsAffected, cutoff.Format(time.RFC3339))
 	}
 
+	workspaceStart := timezone.Now()
+	workspaceCount, workspaceErr := cleanupExpiredSummaryWorkspaces(db, now)
+	workspaceElapsed := time.Since(workspaceStart)
+	if workspaceErr != nil {
+		log.Printf("[agent-cleanup] ERROR workspace cleanup failed after %s: %v", workspaceElapsed, workspaceErr)
+	} else if workspaceCount > 0 {
+		log.Printf("[agent-cleanup] cleaned %d expired workspace sessions in %s", workspaceCount, workspaceElapsed)
+	}
+	if workspaceElapsed > cleanupSlowThreshold {
+		log.Printf("[agent-cleanup] SLOW workspace cleanup took %s (sessions=%d)", workspaceElapsed, workspaceCount)
+	}
+
 	// #161 P2 (yujiawei): symmetric evidence cleanup. Delete evidence rows
 	// for (user_id, session_id) tuples whose evidence itself is older than
 	// cleanupAge. Keying off evidence.created_at (not agent_message) is
@@ -138,7 +157,7 @@ func runOnce(db *gorm.DB) {
 	// agent_session_id. Preserve every (user_id, agent_session_id) tuple referenced
 	// by agent_summary_session; workspace retirement must remove that session
 	// before this Legacy cleanup may collect its evidence.
-	evStart := time.Now()
+	evStart := timezone.Now()
 	evResult := db.Exec(`
 		DELETE FROM agent_message_evidence
 		WHERE (user_id, session_id) IN (
@@ -169,6 +188,112 @@ func runOnce(db *gorm.DB) {
 		log.Printf("[agent-cleanup] SLOW evidence delete took %s (rows=%d, cutoff=%s) — consider indexing agent_message_evidence(session_id, created_at)",
 			evElapsed, evResult.RowsAffected, cutoff.Format(time.RFC3339))
 	}
+}
+
+// cleanupExpiredSummaryWorkspaces retires inactive workspace state after the
+// 30-day sliding retention window maintained by AgentWorkspaceStore. Rows
+// created before expires_at was populated fall back to updated_at so rollout
+// does not leave permanent NULL tombstones.
+func cleanupExpiredSummaryWorkspaces(db *gorm.DB, now time.Time) (int64, error) {
+	if db == nil {
+		return 0, fmt.Errorf("workspace cleanup database is required")
+	}
+	legacyCutoff := now.Add(-summaryWorkspaceRetention)
+	var cleaned int64
+	for {
+		var sessions []model.AgentSummarySession
+		if err := db.Where("expires_at <= ? OR (expires_at IS NULL AND updated_at <= ?)", now, legacyCutoff).
+			Order("id ASC").Limit(workspaceCleanupBatchSize).Find(&sessions).Error; err != nil {
+			return cleaned, fmt.Errorf("load expired workspace sessions: %w", err)
+		}
+		if len(sessions) == 0 {
+			break
+		}
+		if err := db.Transaction(func(tx *gorm.DB) error {
+			for _, session := range sessions {
+				if err := deleteWorkspaceSessionState(tx, session); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return cleaned, err
+		}
+		cleaned += int64(len(sessions))
+		if len(sessions) < workspaceCleanupBatchSize {
+			break
+		}
+	}
+
+	// Idempotency bindings only need to outlive their live task. Retire old
+	// orphan/tombstone rows after the same window while preserving bindings for
+	// summaries that still exist.
+	if err := db.Exec(`
+		DELETE FROM summary_workflow_idempotency
+		WHERE created_at <= ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM summary_task
+			WHERE summary_task.id = summary_workflow_idempotency.task_id
+			  AND summary_task.deleted_at IS NULL
+		  )
+	`, legacyCutoff).Error; err != nil {
+		return cleaned, fmt.Errorf("clean workflow idempotency tombstones: %w", err)
+	}
+	return cleaned, nil
+}
+
+func deleteWorkspaceSessionState(tx *gorm.DB, session model.AgentSummarySession) error {
+	var runIDs []string
+	if err := tx.Model(&model.AgentMessage{}).
+		Where("space_id = ? AND user_id = ? AND session_id = ? AND run_id <> ''", session.SpaceID, session.UserID, session.SessionID).
+		Distinct().Pluck("run_id", &runIDs).Error; err != nil {
+		return fmt.Errorf("load workspace run ids for session %d: %w", session.ID, err)
+	}
+
+	evidenceSessions := make([]string, 0, len(runIDs)+1)
+	if strings.TrimSpace(session.AgentSessionID) != "" {
+		evidenceSessions = append(evidenceSessions, session.AgentSessionID)
+	}
+	if len(runIDs) > 0 {
+		var runs []model.AgentSummaryRun
+		if err := tx.Select("run_id", "session_id").Where("user_id = ? AND run_id IN ?", session.UserID, runIDs).Find(&runs).Error; err != nil {
+			return fmt.Errorf("load workspace runs for session %d: %w", session.ID, err)
+		}
+		for _, run := range runs {
+			if strings.TrimSpace(run.SessionID) != "" {
+				evidenceSessions = append(evidenceSessions, run.SessionID)
+			}
+		}
+		if err := tx.Where("run_id IN ?", runIDs).Delete(&model.AgentCitationManifest{}).Error; err != nil {
+			return fmt.Errorf("delete workspace citation manifests for session %d: %w", session.ID, err)
+		}
+		if err := tx.Where("run_id IN ?", runIDs).Delete(&model.AgentEvidenceArtifact{}).Error; err != nil {
+			return fmt.Errorf("delete workspace evidence artifacts for session %d: %w", session.ID, err)
+		}
+		if err := tx.Where("run_id IN ?", runIDs).Delete(&model.AgentSummarySpec{}).Error; err != nil {
+			return fmt.Errorf("delete workspace specs for session %d: %w", session.ID, err)
+		}
+		if err := tx.Where("user_id = ? AND run_id IN ?", session.UserID, runIDs).Delete(&model.AgentSummaryRun{}).Error; err != nil {
+			return fmt.Errorf("delete workspace runs for session %d: %w", session.ID, err)
+		}
+	}
+	if len(evidenceSessions) > 0 {
+		if err := tx.Where("user_id = ? AND session_id IN ?", session.UserID, evidenceSessions).Delete(&model.AgentMessageEvidence{}).Error; err != nil {
+			return fmt.Errorf("delete workspace evidence for session %d: %w", session.ID, err)
+		}
+	}
+	if err := tx.Where("space_id = ? AND user_id = ? AND session_id = ?", session.SpaceID, session.UserID, session.SessionID).
+		Delete(&model.AgentMessage{}).Error; err != nil {
+		return fmt.Errorf("delete workspace messages for session %d: %w", session.ID, err)
+	}
+	if err := tx.Where("space_id = ? AND user_id = ? AND session_id = ?", session.SpaceID, session.UserID, session.SessionID).
+		Delete(&model.AgentSummaryTurn{}).Error; err != nil {
+		return fmt.Errorf("delete workspace turns for session %d: %w", session.ID, err)
+	}
+	if err := tx.Where("id = ?", session.ID).Delete(&model.AgentSummarySession{}).Error; err != nil {
+		return fmt.Errorf("delete workspace session %d: %w", session.ID, err)
+	}
+	return nil
 }
 
 // 兜底类型检查:确保 AgentMessage 表名不变时这段代码还生效

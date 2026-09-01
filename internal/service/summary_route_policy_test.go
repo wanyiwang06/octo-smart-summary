@@ -69,7 +69,7 @@ func TestDeriveSummaryRoute(t *testing.T) {
 				HasOtherParticipants: true,
 				ParticipantsValid:    true,
 			},
-			want: SummaryRouteTeamWorkflow,
+			want: SummaryRouteTeamConfirmation,
 		},
 		{
 			name: "participants and template start source free team workflow",
@@ -79,10 +79,10 @@ func TestDeriveSummaryRoute(t *testing.T) {
 				HasOtherParticipants: true,
 				ParticipantsValid:    true,
 			},
-			want: SummaryRouteTeamWorkflow,
+			want: SummaryRouteTeamConfirmation,
 		},
 		{
-			name: "selected source participants and requirement start team workflow directly",
+			name: "selected source participants and requirement require confirmation",
 			in: SummaryRouteInput{
 				Intent:               SummaryIntentGenerate,
 				HasSelectedSource:    true,
@@ -91,10 +91,10 @@ func TestDeriveSummaryRoute(t *testing.T) {
 				HasOtherParticipants: true,
 				ParticipantsValid:    true,
 			},
-			want: SummaryRouteTeamWorkflow,
+			want: SummaryRouteTeamConfirmation,
 		},
 		{
-			name: "selected source participants and template start team workflow directly",
+			name: "selected source participants and template require confirmation",
 			in: SummaryRouteInput{
 				Intent:               SummaryIntentGenerate,
 				HasSelectedSource:    true,
@@ -103,7 +103,7 @@ func TestDeriveSummaryRoute(t *testing.T) {
 				HasOtherParticipants: true,
 				ParticipantsValid:    true,
 			},
-			want: SummaryRouteTeamWorkflow,
+			want: SummaryRouteTeamConfirmation,
 		},
 		{
 			name: "an invalid selected source blocks source free team fallback",
@@ -171,13 +171,22 @@ func TestDeriveSummaryRoute(t *testing.T) {
 			want: SummaryRouteClarification,
 		},
 		{
-			name: "explanation remains available with incomplete execution scope",
+			name: "explanation cannot bypass invalid execution scope",
 			in: SummaryRouteInput{
 				Intent:               SummaryIntentExplain,
 				HasValidSource:       true,
 				HasSelectedTemplate:  true,
 				HasOtherParticipants: true,
 				HasHardMissingData:   true,
+			},
+			want: SummaryRouteClarification,
+		},
+		{
+			name: "explanation remains available with valid execution scope",
+			in: SummaryRouteInput{
+				Intent:            SummaryIntentExplain,
+				HasSelectedSource: true,
+				HasValidSource:    true,
 			},
 			want: SummaryRouteExplanation,
 		},

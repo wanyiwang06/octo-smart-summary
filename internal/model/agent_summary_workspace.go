@@ -49,15 +49,15 @@ func (AgentSummarySession) TableName() string { return "agent_summary_session" }
 // request. Request IDs use binary collation in the SQL migration.
 type AgentSummaryTurn struct {
 	ID             int64      `gorm:"primaryKey;autoIncrement" json:"id"`
-	SpaceID        string     `gorm:"column:space_id;type:varchar(64);not null;uniqueIndex:uk_agent_summary_turn_request,priority:1" json:"space_id"`
-	UserID         string     `gorm:"column:user_id;type:varchar(64);not null;uniqueIndex:uk_agent_summary_turn_request,priority:2" json:"user_id"`
-	SessionID      string     `gorm:"column:session_id;type:varchar(128);not null;uniqueIndex:uk_agent_summary_turn_request,priority:3;index:idx_agent_summary_turn_session" json:"session_id"`
+	SpaceID        string     `gorm:"column:space_id;type:varchar(64);not null;uniqueIndex:uk_agent_summary_turn_request,priority:1;index:idx_agent_summary_turn_owner_session,priority:1" json:"space_id"`
+	UserID         string     `gorm:"column:user_id;type:varchar(64);not null;uniqueIndex:uk_agent_summary_turn_request,priority:2;index:idx_agent_summary_turn_owner_session,priority:2" json:"user_id"`
+	SessionID      string     `gorm:"column:session_id;type:varchar(128);not null;uniqueIndex:uk_agent_summary_turn_request,priority:3;index:idx_agent_summary_turn_owner_session,priority:3" json:"session_id"`
 	RequestID      string     `gorm:"column:request_id;type:varchar(128);not null;uniqueIndex:uk_agent_summary_turn_request,priority:4" json:"request_id"`
 	RequestHash    string     `gorm:"column:request_hash;type:char(64);not null" json:"-"`
 	ScopeVersion   int        `gorm:"column:scope_version;not null" json:"scope_version"`
-	Status         string     `gorm:"column:status;type:varchar(16);not null;index:idx_agent_summary_turn_lease,priority:1" json:"status"`
+	Status         string     `gorm:"column:status;type:varchar(16);not null;index:idx_agent_summary_turn_owner_session,priority:4" json:"status"`
 	Attempt        int        `gorm:"column:attempt;not null;default:1" json:"attempt"`
-	LeaseExpiresAt *time.Time `gorm:"column:lease_expires_at;index:idx_agent_summary_turn_lease,priority:2" json:"lease_expires_at,omitempty"`
+	LeaseExpiresAt *time.Time `gorm:"column:lease_expires_at" json:"lease_expires_at,omitempty"`
 	RunID          string     `gorm:"column:run_id;type:varchar(64);not null;default:''" json:"run_id,omitempty"`
 
 	ResponseMessageID int64   `gorm:"column:response_message_id;not null;default:0" json:"response_message_id"`
