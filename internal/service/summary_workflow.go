@@ -205,30 +205,7 @@ func (s *SummaryWorkflowService) CreateFromLegacyHTTP(ctx context.Context, in Le
 	if err != nil {
 		return zero, err
 	}
-	requestHash := canonicalSummaryWorkflowRequestHash(normalized)
-
-	if normalized.idempotencyKey != "" {
-		result, found, err := s.findIdempotentWorkflow(ctx, normalized, requestHash)
-		if err != nil {
-			return zero, err
-		}
-		if found {
-			return result, nil
-		}
-	}
-
-	result, err := s.persist(ctx, normalized, requestHash)
-	if errors.Is(err, errSummaryWorkflowIdempotencyRace) {
-		result, found, findErr := s.findIdempotentWorkflow(ctx, normalized, requestHash)
-		if findErr != nil {
-			return zero, findErr
-		}
-		if found {
-			return result, nil
-		}
-		return zero, errors.New("summary workflow idempotency binding disappeared after conflict")
-	}
-	return result, err
+	return s.persistIdempotently(ctx, normalized, canonicalSummaryWorkflowRequestHash(normalized))
 }
 
 // CreatePersonalFromAgent creates the formal single-user workflow selected by
@@ -327,17 +304,20 @@ func (s *SummaryWorkflowService) createFromAgent(ctx context.Context, in AgentCr
 	if in.TimeRange == nil {
 		hashInput.explicitTimeRange = false
 	}
-	requestHash := canonicalSummaryWorkflowRequestHash(hashInput)
-	result, found, err := s.findIdempotentWorkflow(ctx, normalized, requestHash)
-	if err != nil {
-		return zero, err
+	return s.persistIdempotently(ctx, normalized, canonicalSummaryWorkflowRequestHash(hashInput))
+}
+
+func (s *SummaryWorkflowService) persistIdempotently(ctx context.Context, in normalizedSummaryWorkflowInput, requestHash string) (CreateSummaryWorkflowResult, error) {
+	var zero CreateSummaryWorkflowResult
+	if in.idempotencyKey != "" {
+		result, found, err := s.findIdempotentWorkflow(ctx, in, requestHash)
+		if err != nil || found {
+			return result, err
+		}
 	}
-	if found {
-		return result, nil
-	}
-	result, err = s.persist(ctx, normalized, requestHash)
+	result, err := s.persist(ctx, in, requestHash)
 	if errors.Is(err, errSummaryWorkflowIdempotencyRace) {
-		result, found, findErr := s.findIdempotentWorkflow(ctx, normalized, requestHash)
+		result, found, findErr := s.findIdempotentWorkflow(ctx, in, requestHash)
 		if findErr != nil {
 			return zero, findErr
 		}

@@ -59,8 +59,8 @@ func TestAgentWorkspaceStoreLoadHistoryUsesCurrentScopeOnly(t *testing.T) {
 	}
 	first := beginWorkspaceTurnForTest(t, store, key, "request-scope-1", 1, scope1)
 	firstAgentSessionID := summaryWorkspaceAgentSessionID(key.SpaceID, key.SessionID, 1)
-	if first.Session.AgentSessionID != firstAgentSessionID {
-		t.Fatalf("scope 1 agent_session_id = %q, want %q", first.Session.AgentSessionID, firstAgentSessionID)
+	if first.Snapshot.Session.AgentSessionID != firstAgentSessionID {
+		t.Fatalf("scope 1 agent_session_id = %q, want %q", first.Snapshot.Session.AgentSessionID, firstAgentSessionID)
 	}
 	if _, err := store.CompleteTurn(context.Background(), WorkspaceTurnCompletion{
 		Key:          key,
@@ -80,8 +80,8 @@ func TestAgentWorkspaceStoreLoadHistoryUsesCurrentScopeOnly(t *testing.T) {
 	}
 	second := beginWorkspaceTurnForTest(t, store, key, "request-scope-2", 2, scope2)
 	secondAgentSessionID := summaryWorkspaceAgentSessionID(key.SpaceID, key.SessionID, 2)
-	if second.Session.AgentSessionID != secondAgentSessionID || secondAgentSessionID == firstAgentSessionID {
-		t.Fatalf("scope 2 agent_session_id = %q, want rotated %q", second.Session.AgentSessionID, secondAgentSessionID)
+	if second.Snapshot.Session.AgentSessionID != secondAgentSessionID || secondAgentSessionID == firstAgentSessionID {
+		t.Fatalf("scope 2 agent_session_id = %q, want rotated %q", second.Snapshot.Session.AgentSessionID, secondAgentSessionID)
 	}
 	if _, err := store.CompleteTurn(context.Background(), WorkspaceTurnCompletion{
 		Key:          key,
@@ -212,7 +212,7 @@ func TestAgentWorkspaceStoreScopeChangeClearsFoldedArtifacts(t *testing.T) {
 	if err := store.FailTurn(context.Background(), WorkspaceTurnFailure{Key: key, TurnID: begin.Turn.ID, Attempt: begin.Turn.Attempt, ErrorCode: "seed"}); err != nil {
 		t.Fatalf("release seed turn: %v", err)
 	}
-	if err := db.Model(&model.AgentSummarySession{}).Where("id = ?", begin.Session.ID).Updates(map[string]interface{}{
+	if err := db.Model(&model.AgentSummarySession{}).Where("id = ?", begin.Snapshot.Session.ID).Updates(map[string]interface{}{
 		"latest_preview_message_id":      11,
 		"latest_preview_saved_task_id":   12,
 		"pending_proposal_status":        "pending",
@@ -326,7 +326,7 @@ func TestAgentWorkspaceStoreCompletionClearsMutuallyExclusiveArtifacts(t *testin
 				ReferencedTaskIDs: []int64{},
 			}
 			begin := beginWorkspaceTurnForTest(t, store, key, "request-1", 1, scope)
-			if err := db.Model(&model.AgentSummarySession{}).Where("id = ?", begin.Session.ID).Updates(map[string]interface{}{
+			if err := db.Model(&model.AgentSummarySession{}).Where("id = ?", begin.Snapshot.Session.ID).Updates(map[string]interface{}{
 				"latest_preview_message_id":      11,
 				"latest_preview_saved_task_id":   12,
 				"pending_proposal_status":        "pending",

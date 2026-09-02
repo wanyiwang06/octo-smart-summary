@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -60,6 +61,19 @@ type summaryWorkspaceCoordinator struct {
 	workerTriggerURL  string
 	messageTableCount int
 	now               func() time.Time
+}
+
+type summaryWorkspaceScopeValidation struct {
+	sourcesValid      bool
+	participantsValid bool
+	referencesValid   bool
+	teamScopeReason   string
+}
+
+type summaryWorkspaceScopeLookupError struct {
+	turnCode string
+	message  string
+	cause    error
 }
 
 type summaryWorkspaceResponder struct {
@@ -286,38 +300,15 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		return
 	}
 
-	sourcesValid, err := h.workspace.validateSources(c.Request.Context(), spaceID, uid, contextValue.SelectedChannels)
-	if err != nil {
-		failTurn("SOURCE_LOOKUP_FAILED")
-		responder.fail(http.StatusInternalServerError, 50000, "读取会话权限失败", true)
+	validation, lookupErr := h.workspace.validateWorkspaceScope(c.Request.Context(), spaceID, uid, contextValue)
+	if lookupErr != nil {
+		failTurn(lookupErr.turnCode)
+		log.Printf("[summary-workspace] %s: %v", lookupErr.turnCode, lookupErr.cause)
+		responder.fail(http.StatusInternalServerError, 50000, lookupErr.message, true)
 		return
-	}
-	participantsValid, err := h.workspace.validateParticipants(c.Request.Context(), spaceID, uid, contextValue.Participants)
-	if err != nil {
-		failTurn("PARTICIPANT_LOOKUP_FAILED")
-		responder.fail(http.StatusInternalServerError, 50000, "读取参与者权限失败", true)
-		return
-	}
-	teamScopeReason := teamScopeReasonNone
-	if !participantsValid && len(contextValue.Participants) > 0 {
-		teamScopeReason = teamScopeReasonParticipantInactive
-	}
-	referencesValid, err := h.workspace.validateReferences(c.Request.Context(), spaceID, uid, contextValue.ReferencedTaskIDs)
-	if err != nil {
-		failTurn("REFERENCE_LOOKUP_FAILED")
-		responder.fail(http.StatusInternalServerError, 50000, "读取引用总结失败", true)
-		return
-	}
-	if participantsValid && len(contextValue.Participants) > 0 && len(contextValue.SelectedChannels) > 0 {
-		participantsValid, teamScopeReason, err = h.workspace.validateTeamScope(c.Request.Context(), contextValue.SelectedChannels, contextValue.Participants)
-		if err != nil {
-			failTurn("TEAM_SCOPE_LOOKUP_FAILED")
-			responder.fail(http.StatusInternalServerError, 50000, "读取协作范围失败", true)
-			return
-		}
 	}
 	explicitRunIntent := intent == service.SummaryIntentGenerate && summaryWorkspaceExecutionAuthorized(req.InputOrigin)
-	route := deriveWorkspaceRoute(contextValue, intent, explicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent, begin.Snapshot, participantsValid, sourcesValid, referencesValid)
+	route := deriveWorkspaceRoute(contextValue, intent, explicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent, begin.Snapshot, validation.participantsValid, validation.sourcesValid, validation.referencesValid)
 
 	var snapshot WorkspaceSnapshot
 	switch route {
@@ -331,13 +322,13 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		snapshot, err = h.completeWorkspaceAgentTurn(c.Request.Context(), responder, key, begin.Turn.ID, begin.Turn.Attempt, req, contextValue, begin.Snapshot, route, openScopeAgent, inferredSource)
 	default:
 		reply := "请先选择一个你有权限的会话，再告诉我希望总结的内容。"
-		if len(contextValue.ReferencedTaskIDs) > 0 && !referencesValid {
+		if len(contextValue.ReferencedTaskIDs) > 0 && !validation.referencesValid {
 			reply = "部分引用总结不可用，请调整后重试。"
-		} else if len(contextValue.Participants) > 0 && !participantsValid {
-			reply = summaryWorkspaceTeamScopeMessage(teamScopeReason)
+		} else if len(contextValue.Participants) > 0 && !validation.participantsValid {
+			reply = summaryWorkspaceTeamScopeMessage(validation.teamScopeReason)
 		} else if len(contextValue.Participants) > 0 && !hasRequirement {
 			reply = "请选择模板或输入总结要求后再开始多人总结。"
-		} else if len(contextValue.SelectedChannels) > 0 && !sourcesValid {
+		} else if len(contextValue.SelectedChannels) > 0 && !validation.sourcesValid {
 			reply = "当前会话不可访问，请重新选择会话。"
 		}
 		snapshot, err = h.completeWorkspaceConversation(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req, workspaceResultClarification, reply)
@@ -708,7 +699,7 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	if err := json.Unmarshal(result.Terminal.Payload, &payload); err != nil {
 		return WorkspaceSnapshot{}, err
 	}
-	if !containsString(allowedResults, payload.ResultType) {
+	if !slices.Contains(allowedResults, payload.ResultType) {
 		return WorkspaceSnapshot{}, fmt.Errorf("unexpected terminal result %q for route %q", payload.ResultType, route)
 	}
 	parentMessageID := 0
@@ -746,7 +737,10 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	if err != nil {
 		return WorkspaceSnapshot{}, err
 	}
-	resolvedRunID := firstNonEmpty(runID, beginRunID(messages))
+	resolvedRunID := runID
+	if resolvedRunID == "" {
+		resolvedRunID = beginRunID(messages)
+	}
 	snapshot, err := h.workspace.store.CompleteTurn(ctx, WorkspaceTurnCompletion{
 		Key:             key,
 		TurnID:          turnID,
@@ -791,15 +785,6 @@ func beginRunID(messages []agent.Message) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].RunID != "" {
 			return messages[i].RunID
-		}
-	}
-	return ""
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if value != "" {
-			return value
 		}
 	}
 	return ""
@@ -900,7 +885,8 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 		_ = h.workspace.store.FailTurn(context.Background(), WorkspaceTurnFailure{Key: key, TurnID: begin.Turn.ID, Attempt: begin.Turn.Attempt, ErrorCode: code})
 	}
 	var persistedContext summaryWorkspaceContext
-	if strings.TrimSpace(begin.Session.ScopeJSON) == "" || json.Unmarshal([]byte(begin.Session.ScopeJSON), &persistedContext) != nil {
+	session := begin.Snapshot.Session
+	if strings.TrimSpace(session.ScopeJSON) == "" || json.Unmarshal([]byte(session.ScopeJSON), &persistedContext) != nil {
 		failTurn("PROPOSAL_SCOPE_DECODE_FAILED")
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取协作范围失败"})
 		return
@@ -912,48 +898,22 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 		return
 	}
 	contextValue = canonicalizeSummaryWorkspaceContextForActor(persistedContext, uid)
-	sourcesValid, err := h.workspace.validateSources(c.Request.Context(), spaceID, uid, contextValue.SelectedChannels)
-	if err != nil {
-		failTurn("SOURCE_LOOKUP_FAILED")
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取会话权限失败"})
+	validation, lookupErr := h.workspace.validateWorkspaceScope(c.Request.Context(), spaceID, uid, contextValue)
+	if lookupErr != nil {
+		failTurn(lookupErr.turnCode)
+		log.Printf("[summary-workspace] %s: %v", lookupErr.turnCode, lookupErr.cause)
+		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: lookupErr.message})
 		return
 	}
-	participantsValid, err := h.workspace.validateParticipants(c.Request.Context(), spaceID, uid, contextValue.Participants)
-	if err != nil {
-		failTurn("PARTICIPANT_LOOKUP_FAILED")
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取参与者权限失败"})
-		return
-	}
-	referencesValid, err := h.workspace.validateReferences(c.Request.Context(), spaceID, uid, contextValue.ReferencedTaskIDs)
-	if err != nil {
-		failTurn("REFERENCE_LOOKUP_FAILED")
-		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取引用总结失败"})
-		return
-	}
-	teamScopeValid := participantsValid && len(contextValue.SelectedChannels) == 0
-	teamScopeReason := teamScopeReasonNone
-	if !participantsValid {
-		teamScopeReason = teamScopeReasonParticipantInactive
-	}
-	if participantsValid && len(contextValue.SelectedChannels) > 0 {
-		teamScopeValid, teamScopeReason, err = h.workspace.validateTeamScope(c.Request.Context(), contextValue.SelectedChannels, contextValue.Participants)
-		if err != nil {
-			failTurn("TEAM_SCOPE_LOOKUP_FAILED")
-			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取协作范围失败"})
-			return
-		}
-	}
-	if (len(contextValue.SelectedChannels) > 0 && !sourcesValid) || !participantsValid || !referencesValid || !teamScopeValid {
+	if (len(contextValue.SelectedChannels) > 0 && !validation.sourcesValid) || !validation.participantsValid || !validation.referencesValid {
 		failTurn("CONFIRM_SCOPE_INVALID")
 		message := "协作范围已失效，请重新生成提案"
 		switch {
-		case len(contextValue.SelectedChannels) > 0 && !sourcesValid:
+		case len(contextValue.SelectedChannels) > 0 && !validation.sourcesValid:
 			message = "部分群聊已不可访问，请重新选择群聊"
-		case !participantsValid:
-			message = "部分参与者已不在当前 Space，或账号已失效"
-		case !teamScopeValid:
-			message = summaryWorkspaceTeamScopeMessage(teamScopeReason)
-		case !referencesValid:
+		case !validation.participantsValid:
+			message = summaryWorkspaceTeamScopeMessage(validation.teamScopeReason)
+		case !validation.referencesValid:
 			message = "部分引用总结已不可用，请重新选择"
 		}
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: message})
@@ -961,12 +921,12 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 	}
 
 	var proposal summaryWorkspaceProposal
-	if begin.Session.PendingProposalJSON == nil || strings.TrimSpace(*begin.Session.PendingProposalJSON) == "" {
+	if session.PendingProposalJSON == nil || strings.TrimSpace(*session.PendingProposalJSON) == "" {
 		failTurn("PROPOSAL_DECODE_FAILED")
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取协作提案失败"})
 		return
 	}
-	if err := json.Unmarshal([]byte(*begin.Session.PendingProposalJSON), &proposal); err != nil {
+	if err := json.Unmarshal([]byte(*session.PendingProposalJSON), &proposal); err != nil {
 		failTurn("PROPOSAL_DECODE_FAILED")
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取协作提案失败"})
 		return
@@ -1563,15 +1523,6 @@ func (w *summaryWorkspaceCoordinator) findMostRecentAuthorizedChannel(ctx contex
 	}, nil
 }
 
-func containsString(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
-}
-
 func summaryWorkspaceExecutionCommandRemainder(message string) (string, bool) {
 	trimmed := strings.TrimSpace(message)
 	lower := strings.ToLower(trimmed)
@@ -1692,6 +1643,33 @@ func summaryWorkspaceOrigin(context summaryWorkspaceContext) (string, int) {
 	default:
 		return "", 0
 	}
+}
+
+func (w *summaryWorkspaceCoordinator) validateWorkspaceScope(ctx context.Context, spaceID, actorID string, value summaryWorkspaceContext) (summaryWorkspaceScopeValidation, *summaryWorkspaceScopeLookupError) {
+	validation := summaryWorkspaceScopeValidation{teamScopeReason: teamScopeReasonNone}
+	var err error
+	validation.sourcesValid, err = w.validateSources(ctx, spaceID, actorID, value.SelectedChannels)
+	if err != nil {
+		return validation, &summaryWorkspaceScopeLookupError{turnCode: "SOURCE_LOOKUP_FAILED", message: "读取会话权限失败", cause: err}
+	}
+	validation.participantsValid, err = w.validateParticipants(ctx, spaceID, actorID, value.Participants)
+	if err != nil {
+		return validation, &summaryWorkspaceScopeLookupError{turnCode: "PARTICIPANT_LOOKUP_FAILED", message: "读取参与者权限失败", cause: err}
+	}
+	if !validation.participantsValid && len(value.Participants) > 0 {
+		validation.teamScopeReason = teamScopeReasonParticipantInactive
+	}
+	validation.referencesValid, err = w.validateReferences(ctx, spaceID, actorID, value.ReferencedTaskIDs)
+	if err != nil {
+		return validation, &summaryWorkspaceScopeLookupError{turnCode: "REFERENCE_LOOKUP_FAILED", message: "读取引用总结失败", cause: err}
+	}
+	if validation.participantsValid && len(value.Participants) > 0 && len(value.SelectedChannels) > 0 {
+		validation.participantsValid, validation.teamScopeReason, err = w.validateTeamScope(ctx, value.SelectedChannels, value.Participants)
+		if err != nil {
+			return validation, &summaryWorkspaceScopeLookupError{turnCode: "TEAM_SCOPE_LOOKUP_FAILED", message: "读取协作范围失败", cause: err}
+		}
+	}
+	return validation, nil
 }
 
 func (w *summaryWorkspaceCoordinator) validateParticipants(ctx context.Context, spaceID, actorID string, participants []summaryWorkspaceParticipant) (bool, error) {
@@ -1873,7 +1851,8 @@ func (w *summaryWorkspaceCoordinator) validateTeamScope(ctx context.Context, cha
 	}
 	ids := make([]string, 0, len(participants))
 	seen := make(map[string]struct{}, len(participants))
-	for _, uid := range participantIDs(participants) {
+	for _, participant := range participants {
+		uid := participant.UserID
 		if strings.TrimSpace(uid) == "" {
 			return false, teamScopeReasonParticipantMissing, nil
 		}
@@ -1897,14 +1876,6 @@ func (w *summaryWorkspaceCoordinator) validateTeamScope(ctx context.Context, cha
 		return false, teamScopeReasonParticipantMissing, nil
 	}
 	return true, teamScopeReasonNone, nil
-}
-
-func participantIDs(participants []summaryWorkspaceParticipant) []string {
-	ids := make([]string, 0, len(participants))
-	for _, participant := range participants {
-		ids = append(ids, participant.UserID)
-	}
-	return ids
 }
 
 func writeSummaryWorkspaceSSEDone(sink *sseSink, turn summaryWorkspaceTurn) {
@@ -2071,18 +2042,13 @@ func decodeWorkspacePreviewPayload(message *model.AgentMessage) (string, []strin
 	if payload.Preview == nil || strings.TrimSpace(payload.Preview.Content) == "" {
 		return "", nil, errors.New("workspace preview content is missing")
 	}
-	assumptions := append([]string(nil), payload.Preview.Assumptions...)
-	if assumptions == nil {
-		assumptions = []string{}
-	}
-	return payload.Preview.Content, assumptions, nil
+	return payload.Preview.Content, append([]string{}, payload.Preview.Assumptions...), nil
 }
 
 func latestWorkspaceAssistant(messages []model.AgentMessage) *model.AgentMessage {
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "assistant" && messages[i].ResultType != "" {
-			message := messages[i]
-			return &message
+			return &messages[i]
 		}
 	}
 	return nil
@@ -2094,8 +2060,7 @@ func workspaceMessageByID(messages []model.AgentMessage, id int64) *model.AgentM
 	}
 	for i := range messages {
 		if messages[i].ID == id {
-			message := messages[i]
-			return &message
+			return &messages[i]
 		}
 	}
 	return nil
@@ -2156,8 +2121,7 @@ func (w *summaryWorkspaceCoordinator) turnFromSnapshot(ctx context.Context, sess
 		}
 		runID = message.RunID
 	}
-	actions := workspaceActionsForResult(message.ResultType, message.SavedTaskID > 0)
-	turn := summaryWorkspaceTurn{
+	return summaryWorkspaceTurn{
 		ContractVersion:  summaryWorkspaceContractVersion,
 		SessionID:        sessionID,
 		MessageID:        message.ID,
@@ -2166,10 +2130,9 @@ func (w *summaryWorkspaceCoordinator) turnFromSnapshot(ctx context.Context, sess
 		ScopeVersion:     message.ScopeVersion,
 		ArtifactVersion:  message.ArtifactVersion,
 		RunID:            runID,
-		AvailableActions: actions,
+		AvailableActions: workspaceActionsForResult(message.ResultType, message.SavedTaskID > 0),
 		State:            state,
-	}
-	return turn, nil
+	}, nil
 }
 
 func (w *summaryWorkspaceCoordinator) historyFromSnapshot(ctx context.Context, sessionID string, snapshot WorkspaceSnapshot) (summaryWorkspaceHistory, error) {
@@ -2184,22 +2147,8 @@ func (w *summaryWorkspaceCoordinator) historyFromSnapshot(ctx context.Context, s
 			continue
 		}
 		actions := []string{}
-		if message.Role == "assistant" {
+		if message.Role == "assistant" && workspaceMessageMatchesState(&message, state) {
 			actions = workspaceActionsForResult(message.ResultType, message.SavedTaskID > 0)
-			switch message.ResultType {
-			case workspaceResultAgentPreview, workspaceResultAgentRevision:
-				if state.CurrentPreview == nil || state.CurrentPreview.MessageID != message.ID {
-					actions = []string{}
-				}
-			case workspaceResultWorkflowConfirm:
-				if state.PendingProposal == nil || state.PendingProposal.MessageID != message.ID {
-					actions = []string{}
-				}
-			case workspaceResultWorkflowStarted, workspaceResultWorkflowCompleted:
-				if state.Workflow == nil || state.Workflow.MessageID != message.ID || state.Workflow.ResultType != message.ResultType {
-					actions = []string{}
-				}
-			}
 		}
 		messages = append(messages, summaryWorkspaceHistoryMessage{
 			ID:               message.ID,

@@ -57,7 +57,6 @@ type WorkspaceBeginTurnInput struct {
 
 type WorkspaceBeginTurnResult struct {
 	Disposition WorkspaceTurnDisposition
-	Session     model.AgentSummarySession
 	Turn        model.AgentSummaryTurn
 	Snapshot    WorkspaceSnapshot
 }
@@ -153,6 +152,13 @@ func (s *AgentWorkspaceStore) BeginTurn(ctx context.Context, in WorkspaceBeginTu
 		if err != nil {
 			return err
 		}
+		finish := func(disposition WorkspaceTurnDisposition, turn model.AgentSummaryTurn) error {
+			snapshot, err := loadWorkspaceSnapshotTx(tx, in.Key)
+			if err == nil {
+				result = WorkspaceBeginTurnResult{Disposition: disposition, Turn: turn, Snapshot: snapshot}
+			}
+			return err
+		}
 		if in.ScopeVersion < session.ScopeVersion || (in.ScopeVersion == session.ScopeVersion && session.ScopeHash != "" && session.ScopeHash != in.ScopeHash) {
 			return ErrWorkspaceScopeConflict
 		}
@@ -167,12 +173,7 @@ func (s *AgentWorkspaceStore) BeginTurn(ctx context.Context, in WorkspaceBeginTu
 				return ErrWorkspaceRequestMismatch
 			}
 			if existing.Status == "completed" {
-				snapshot, snapErr := loadWorkspaceSnapshotTx(tx, in.Key)
-				if snapErr != nil {
-					return snapErr
-				}
-				result = WorkspaceBeginTurnResult{Disposition: WorkspaceTurnReplay, Session: snapshot.Session, Turn: existing, Snapshot: snapshot}
-				return nil
+				return finish(WorkspaceTurnReplay, existing)
 			}
 		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
@@ -182,48 +183,28 @@ func (s *AgentWorkspaceStore) BeginTurn(ctx context.Context, in WorkspaceBeginTu
 			var active model.AgentSummaryTurn
 			activeErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", session.ActiveTurnID).Take(&active).Error
 			if activeErr == nil && active.Status == "running" && active.LeaseExpiresAt != nil && active.LeaseExpiresAt.After(now) {
-				snapshot, snapErr := loadWorkspaceSnapshotTx(tx, in.Key)
-				if snapErr != nil {
-					return snapErr
-				}
-				result = WorkspaceBeginTurnResult{Disposition: WorkspaceTurnInProgress, Session: snapshot.Session, Turn: active, Snapshot: snapshot}
-				return nil
+				return finish(WorkspaceTurnInProgress, active)
 			}
 			if activeErr != nil && !errors.Is(activeErr, gorm.ErrRecordNotFound) {
 				return activeErr
 			}
 		}
 		if hasExisting && existing.Status == "running" && existing.LeaseExpiresAt != nil && existing.LeaseExpiresAt.After(now) {
-			snapshot, snapErr := loadWorkspaceSnapshotTx(tx, in.Key)
-			if snapErr != nil {
-				return snapErr
-			}
-			result = WorkspaceBeginTurnResult{Disposition: WorkspaceTurnInProgress, Session: snapshot.Session, Turn: existing, Snapshot: snapshot}
-			return nil
+			return finish(WorkspaceTurnInProgress, existing)
 		}
 
 		if in.ScopeVersion > session.ScopeVersion {
 			updates := map[string]interface{}{
-				"agent_session_id":               summaryWorkspaceAgentSessionID(in.Key.SpaceID, in.Key.SessionID, in.ScopeVersion),
-				"scope_version":                  in.ScopeVersion,
-				"scope_json":                     string(in.ScopeJSON),
-				"scope_hash":                     in.ScopeHash,
-				"latest_preview_message_id":      0,
-				"latest_preview_saved_task_id":   0,
-				"pending_proposal_status":        "",
-				"pending_proposal_token":         "",
-				"pending_proposal_json":          nil,
-				"pending_proposal_message_id":    0,
-				"pending_proposal_scope_version": 0,
-				"pending_proposal_task_id":       0,
-				"workflow_task_id":               0,
-				"workflow_scope":                 "",
-				"workflow_scope_version":         0,
-				"workflow_started_message_id":    0,
-				"workflow_terminal_message_id":   0,
-				"expires_at":                     summaryWorkspaceExpiresAt(now),
-				"updated_at":                     now,
+				"agent_session_id": summaryWorkspaceAgentSessionID(in.Key.SpaceID, in.Key.SessionID, in.ScopeVersion),
+				"scope_version":    in.ScopeVersion,
+				"scope_json":       string(in.ScopeJSON),
+				"scope_hash":       in.ScopeHash,
+				"expires_at":       summaryWorkspaceExpiresAt(now),
+				"updated_at":       now,
 			}
+			clearWorkspacePreview(updates)
+			clearWorkspaceProposal(updates)
+			clearWorkspaceWorkflow(updates)
 			if err := tx.Model(&model.AgentSummarySession{}).Where("id = ?", session.ID).Updates(updates).Error; err != nil {
 				return err
 			}
@@ -242,16 +223,10 @@ func (s *AgentWorkspaceStore) BeginTurn(ctx context.Context, in WorkspaceBeginTu
 			if err := tx.Save(&existing).Error; err != nil {
 				return err
 			}
-			if err := tx.Model(&model.AgentSummarySession{}).Where("id = ?", session.ID).
-				Updates(map[string]interface{}{"active_turn_id": existing.ID, "state": "running", "expires_at": summaryWorkspaceExpiresAt(now), "updated_at": now}).Error; err != nil {
+			if err := markWorkspaceSessionRunning(tx, session.ID, existing.ID, now); err != nil {
 				return err
 			}
-			snapshot, snapErr := loadWorkspaceSnapshotTx(tx, in.Key)
-			if snapErr != nil {
-				return snapErr
-			}
-			result = WorkspaceBeginTurnResult{Disposition: WorkspaceTurnAcquired, Session: snapshot.Session, Turn: existing, Snapshot: snapshot}
-			return nil
+			return finish(WorkspaceTurnAcquired, existing)
 		}
 
 		turn := model.AgentSummaryTurn{
@@ -271,18 +246,17 @@ func (s *AgentWorkspaceStore) BeginTurn(ctx context.Context, in WorkspaceBeginTu
 		if err := tx.Create(&turn).Error; err != nil {
 			return err
 		}
-		if err := tx.Model(&model.AgentSummarySession{}).Where("id = ?", session.ID).
-			Updates(map[string]interface{}{"active_turn_id": turn.ID, "state": "running", "expires_at": summaryWorkspaceExpiresAt(now), "updated_at": now}).Error; err != nil {
+		if err := markWorkspaceSessionRunning(tx, session.ID, turn.ID, now); err != nil {
 			return err
 		}
-		snapshot, err := loadWorkspaceSnapshotTx(tx, in.Key)
-		if err != nil {
-			return err
-		}
-		result = WorkspaceBeginTurnResult{Disposition: WorkspaceTurnAcquired, Session: snapshot.Session, Turn: turn, Snapshot: snapshot}
-		return nil
+		return finish(WorkspaceTurnAcquired, turn)
 	})
 	return result, err
+}
+
+func markWorkspaceSessionRunning(tx *gorm.DB, sessionID, turnID int64, now time.Time) error {
+	return tx.Model(&model.AgentSummarySession{}).Where("id = ?", sessionID).
+		Updates(map[string]interface{}{"active_turn_id": turnID, "state": "running", "expires_at": summaryWorkspaceExpiresAt(now), "updated_at": now}).Error
 }
 
 func validateWorkspaceBegin(in WorkspaceBeginTurnInput) error {
@@ -408,26 +382,12 @@ func (s *AgentWorkspaceStore) CompleteTurn(ctx context.Context, in WorkspaceTurn
 			updates["artifact_version"] = artifactVersion
 			updates["latest_preview_message_id"] = responseMessageID
 			updates["latest_preview_saved_task_id"] = 0
-			updates["pending_proposal_status"] = ""
-			updates["pending_proposal_token"] = ""
-			updates["pending_proposal_json"] = nil
-			updates["pending_proposal_message_id"] = 0
-			updates["pending_proposal_scope_version"] = 0
-			updates["pending_proposal_task_id"] = 0
-			updates["workflow_task_id"] = 0
-			updates["workflow_scope"] = ""
-			updates["workflow_scope_version"] = 0
-			updates["workflow_started_message_id"] = 0
-			updates["workflow_terminal_message_id"] = 0
+			clearWorkspaceProposal(updates)
+			clearWorkspaceWorkflow(updates)
 		}
 		if in.Proposal != nil {
-			updates["latest_preview_message_id"] = 0
-			updates["latest_preview_saved_task_id"] = 0
-			updates["workflow_task_id"] = 0
-			updates["workflow_scope"] = ""
-			updates["workflow_scope_version"] = 0
-			updates["workflow_started_message_id"] = 0
-			updates["workflow_terminal_message_id"] = 0
+			clearWorkspacePreview(updates)
+			clearWorkspaceWorkflow(updates)
 			token := strings.TrimSpace(in.Proposal.Token)
 			if token == "" {
 				var tokenErr error
@@ -445,8 +405,7 @@ func (s *AgentWorkspaceStore) CompleteTurn(ctx context.Context, in WorkspaceTurn
 			updates["pending_proposal_task_id"] = 0
 		}
 		if in.Workflow != nil {
-			updates["latest_preview_message_id"] = 0
-			updates["latest_preview_saved_task_id"] = 0
+			clearWorkspacePreview(updates)
 			updates["workflow_task_id"] = in.Workflow.TaskID
 			updates["workflow_scope"] = in.Workflow.Scope
 			updates["workflow_scope_version"] = in.ScopeVersion
@@ -454,12 +413,7 @@ func (s *AgentWorkspaceStore) CompleteTurn(ctx context.Context, in WorkspaceTurn
 				updates["pending_proposal_status"] = "confirmed"
 				updates["pending_proposal_task_id"] = in.Workflow.TaskID
 			} else {
-				updates["pending_proposal_status"] = ""
-				updates["pending_proposal_token"] = ""
-				updates["pending_proposal_json"] = nil
-				updates["pending_proposal_message_id"] = 0
-				updates["pending_proposal_scope_version"] = 0
-				updates["pending_proposal_task_id"] = 0
+				clearWorkspaceProposal(updates)
 			}
 			if in.Workflow.Terminal {
 				updates["workflow_started_message_id"] = 0
@@ -489,6 +443,28 @@ func (s *AgentWorkspaceStore) CompleteTurn(ctx context.Context, in WorkspaceTurn
 		return err
 	})
 	return snapshot, err
+}
+
+func clearWorkspacePreview(updates map[string]interface{}) {
+	updates["latest_preview_message_id"] = 0
+	updates["latest_preview_saved_task_id"] = 0
+}
+
+func clearWorkspaceProposal(updates map[string]interface{}) {
+	updates["pending_proposal_status"] = ""
+	updates["pending_proposal_token"] = ""
+	updates["pending_proposal_json"] = nil
+	updates["pending_proposal_message_id"] = 0
+	updates["pending_proposal_scope_version"] = 0
+	updates["pending_proposal_task_id"] = 0
+}
+
+func clearWorkspaceWorkflow(updates map[string]interface{}) {
+	updates["workflow_task_id"] = 0
+	updates["workflow_scope"] = ""
+	updates["workflow_scope_version"] = 0
+	updates["workflow_started_message_id"] = 0
+	updates["workflow_terminal_message_id"] = 0
 }
 
 func workspaceMessageRow(key WorkspaceSessionKey, turnID int64, item WorkspacePersistMessage) (model.AgentMessage, error) {
@@ -653,6 +629,13 @@ func (s *AgentWorkspaceStore) BeginProposalConfirmation(ctx context.Context, in 
 			Take(&session).Error; err != nil {
 			return err
 		}
+		finish := func(disposition WorkspaceTurnDisposition, turn model.AgentSummaryTurn) error {
+			snapshot, err := loadWorkspaceSnapshotTx(tx, in.Begin.Key)
+			if err == nil {
+				result = WorkspaceBeginTurnResult{Disposition: disposition, Turn: turn, Snapshot: snapshot}
+			}
+			return err
+		}
 
 		var existing model.AgentSummaryTurn
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -667,12 +650,7 @@ func (s *AgentWorkspaceStore) BeginProposalConfirmation(ctx context.Context, in 
 				if session.ScopeVersion != in.Begin.ScopeVersion || session.ScopeHash != in.Begin.ScopeHash {
 					return ErrWorkspaceScopeConflict
 				}
-				snapshot, snapErr := loadWorkspaceSnapshotTx(tx, in.Begin.Key)
-				if snapErr != nil {
-					return snapErr
-				}
-				result = WorkspaceBeginTurnResult{Disposition: WorkspaceTurnReplay, Session: snapshot.Session, Turn: existing, Snapshot: snapshot}
-				return nil
+				return finish(WorkspaceTurnReplay, existing)
 			}
 		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
@@ -690,24 +668,14 @@ func (s *AgentWorkspaceStore) BeginProposalConfirmation(ctx context.Context, in 
 			var active model.AgentSummaryTurn
 			activeErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", session.ActiveTurnID).Take(&active).Error
 			if activeErr == nil && active.Status == "running" && active.LeaseExpiresAt != nil && active.LeaseExpiresAt.After(now) {
-				snapshot, snapErr := loadWorkspaceSnapshotTx(tx, in.Begin.Key)
-				if snapErr != nil {
-					return snapErr
-				}
-				result = WorkspaceBeginTurnResult{Disposition: WorkspaceTurnInProgress, Session: snapshot.Session, Turn: active, Snapshot: snapshot}
-				return nil
+				return finish(WorkspaceTurnInProgress, active)
 			}
 			if activeErr != nil && !errors.Is(activeErr, gorm.ErrRecordNotFound) {
 				return activeErr
 			}
 		}
 		if hasExisting && existing.Status == "running" && existing.LeaseExpiresAt != nil && existing.LeaseExpiresAt.After(now) {
-			snapshot, snapErr := loadWorkspaceSnapshotTx(tx, in.Begin.Key)
-			if snapErr != nil {
-				return snapErr
-			}
-			result = WorkspaceBeginTurnResult{Disposition: WorkspaceTurnInProgress, Session: snapshot.Session, Turn: existing, Snapshot: snapshot}
-			return nil
+			return finish(WorkspaceTurnInProgress, existing)
 		}
 
 		if hasExisting {
@@ -720,16 +688,10 @@ func (s *AgentWorkspaceStore) BeginProposalConfirmation(ctx context.Context, in 
 			if err := tx.Save(&existing).Error; err != nil {
 				return err
 			}
-			if err := tx.Model(&model.AgentSummarySession{}).Where("id = ?", session.ID).
-				Updates(map[string]interface{}{"active_turn_id": existing.ID, "state": "running", "expires_at": summaryWorkspaceExpiresAt(now), "updated_at": now}).Error; err != nil {
+			if err := markWorkspaceSessionRunning(tx, session.ID, existing.ID, now); err != nil {
 				return err
 			}
-			snapshot, snapErr := loadWorkspaceSnapshotTx(tx, in.Begin.Key)
-			if snapErr != nil {
-				return snapErr
-			}
-			result = WorkspaceBeginTurnResult{Disposition: WorkspaceTurnAcquired, Session: snapshot.Session, Turn: existing, Snapshot: snapshot}
-			return nil
+			return finish(WorkspaceTurnAcquired, existing)
 		}
 
 		turn := model.AgentSummaryTurn{
@@ -749,16 +711,10 @@ func (s *AgentWorkspaceStore) BeginProposalConfirmation(ctx context.Context, in 
 		if err := tx.Create(&turn).Error; err != nil {
 			return err
 		}
-		if err := tx.Model(&model.AgentSummarySession{}).Where("id = ?", session.ID).
-			Updates(map[string]interface{}{"active_turn_id": turn.ID, "state": "running", "expires_at": summaryWorkspaceExpiresAt(now), "updated_at": now}).Error; err != nil {
+		if err := markWorkspaceSessionRunning(tx, session.ID, turn.ID, now); err != nil {
 			return err
 		}
-		snapshot, snapErr := loadWorkspaceSnapshotTx(tx, in.Begin.Key)
-		if snapErr != nil {
-			return snapErr
-		}
-		result = WorkspaceBeginTurnResult{Disposition: WorkspaceTurnAcquired, Session: snapshot.Session, Turn: turn, Snapshot: snapshot}
-		return nil
+		return finish(WorkspaceTurnAcquired, turn)
 	})
 	return result, err
 }
