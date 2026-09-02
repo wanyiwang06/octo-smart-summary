@@ -201,7 +201,7 @@ func (s *SummaryWorkflowService) CreateFromLegacyHTTP(ctx context.Context, in Le
 		return zero, errors.New("summary workflow service database is required")
 	}
 
-	normalized, err := s.normalize(in)
+	normalized, err := s.normalize(in, s.defaultTimeRangeDays)
 	if err != nil {
 		return zero, err
 	}
@@ -267,12 +267,8 @@ func (s *SummaryWorkflowService) createFromAgent(ctx context.Context, in AgentCr
 	if err := validateAgentWorkflowSources(sources); err != nil {
 		return zero, err
 	}
-
-	timeRange := in.TimeRange
-	if timeRange == nil {
-		end := timezone.Now()
-		start := end.Add(-AgentSummaryDefaultTimeRangeDays * 24 * time.Hour)
-		timeRange = &SummaryWorkflowTimeRange{Start: start, End: end}
+	if in.TimeRange == nil && s.maxTimeRangeDays > 0 && AgentSummaryDefaultTimeRangeDays > s.maxTimeRangeDays {
+		return zero, NewBizError(40002, fmt.Sprintf("时间范围不能超过%d天", s.maxTimeRangeDays), http.StatusBadRequest)
 	}
 
 	normalized, err := s.normalize(LegacyCreateSummaryWorkflowInput{
@@ -281,14 +277,14 @@ func (s *SummaryWorkflowService) createFromAgent(ctx context.Context, in AgentCr
 		SpaceID:             in.SpaceID,
 		Title:               in.Title,
 		Topic:               in.Requirement,
-		TimeRange:           timeRange,
+		TimeRange:           in.TimeRange,
 		Sources:             sources,
 		Participants:        in.Participants,
 		ConfirmTimeoutHours: in.ConfirmTimeoutHours,
 		OriginChannelID:     in.OriginChannelID,
 		OriginChannelType:   in.OriginChannelType,
 		IdempotencyKey:      in.IdempotencyKey,
-	})
+	}, AgentSummaryDefaultTimeRangeDays)
 	if err != nil {
 		return zero, err
 	}
@@ -296,15 +292,7 @@ func (s *SummaryWorkflowService) createFromAgent(ctx context.Context, in AgentCr
 		return zero, NewBizError(40001, "workflow target does not match confirmed route", http.StatusBadRequest)
 	}
 
-	hashInput := normalized
-	// The default range is a server policy, not caller-owned request data. Its
-	// concrete timestamps change between retries, so omit them from the
-	// idempotency fingerprint while still persisting the first request's actual
-	// seven-day window. Explicit client ranges remain part of the hash.
-	if in.TimeRange == nil {
-		hashInput.explicitTimeRange = false
-	}
-	return s.persistIdempotently(ctx, normalized, canonicalSummaryWorkflowRequestHash(hashInput))
+	return s.persistIdempotently(ctx, normalized, canonicalSummaryWorkflowRequestHash(normalized))
 }
 
 func (s *SummaryWorkflowService) persistIdempotently(ctx context.Context, in normalizedSummaryWorkflowInput, requestHash string) (CreateSummaryWorkflowResult, error) {
@@ -339,7 +327,7 @@ func validateAgentWorkflowSources(sources []SummaryWorkflowSource) *BizError {
 	return nil
 }
 
-func (s *SummaryWorkflowService) normalize(in LegacyCreateSummaryWorkflowInput) (normalizedSummaryWorkflowInput, error) {
+func (s *SummaryWorkflowService) normalize(in LegacyCreateSummaryWorkflowInput, defaultTimeRangeDays int) (normalizedSummaryWorkflowInput, error) {
 	if strings.TrimSpace(in.SpaceID) == "" {
 		return normalizedSummaryWorkflowInput{}, NewBizError(40001, "space_id is required", http.StatusBadRequest)
 	}
@@ -367,7 +355,7 @@ func (s *SummaryWorkflowService) normalize(in LegacyCreateSummaryWorkflowInput) 
 		timeEnd = in.TimeRange.End
 	} else {
 		timeEnd = timezone.Now()
-		timeStart = timeEnd.Add(-time.Duration(s.defaultTimeRangeDays) * 24 * time.Hour)
+		timeStart = timeEnd.Add(-time.Duration(defaultTimeRangeDays) * 24 * time.Hour)
 	}
 
 	scope := model.SnapshotScope{ChannelIDs: workflowChannelIDs(sources)}

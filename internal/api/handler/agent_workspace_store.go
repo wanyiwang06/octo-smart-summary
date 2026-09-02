@@ -152,45 +152,21 @@ func (s *AgentWorkspaceStore) BeginTurn(ctx context.Context, in WorkspaceBeginTu
 		if err != nil {
 			return err
 		}
-		finish := func(disposition WorkspaceTurnDisposition, turn model.AgentSummaryTurn) error {
-			snapshot, err := loadWorkspaceSnapshotTx(tx, in.Key)
-			if err == nil {
-				result = WorkspaceBeginTurnResult{Disposition: disposition, Turn: turn, Snapshot: snapshot}
-			}
-			return err
-		}
 		if in.ScopeVersion < session.ScopeVersion || (in.ScopeVersion == session.ScopeVersion && session.ScopeHash != "" && session.ScopeHash != in.ScopeHash) {
 			return ErrWorkspaceScopeConflict
 		}
 
-		var existing model.AgentSummaryTurn
-		err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("space_id = ? AND user_id = ? AND session_id = ? AND request_id = ?", in.Key.SpaceID, in.Key.UserID, in.Key.SessionID, in.RequestID).
-			Take(&existing).Error
-		hasExisting := err == nil
-		if err == nil {
-			if existing.RequestHash != in.RequestHash {
-				return ErrWorkspaceRequestMismatch
-			}
-			if existing.Status == "completed" {
-				return finish(WorkspaceTurnReplay, existing)
-			}
-		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		existing, hasExisting, err := lockWorkspaceRequestTurn(tx, in)
+		if err != nil {
 			return err
 		}
-
-		if session.ActiveTurnID > 0 {
-			var active model.AgentSummaryTurn
-			activeErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", session.ActiveTurnID).Take(&active).Error
-			if activeErr == nil && active.Status == "running" && active.LeaseExpiresAt != nil && active.LeaseExpiresAt.After(now) {
-				return finish(WorkspaceTurnInProgress, active)
-			}
-			if activeErr != nil && !errors.Is(activeErr, gorm.ErrRecordNotFound) {
-				return activeErr
-			}
+		if hasExisting && existing.Status == "completed" {
+			return finishWorkspaceBegin(tx, in.Key, WorkspaceTurnReplay, existing, &result)
 		}
-		if hasExisting && existing.Status == "running" && existing.LeaseExpiresAt != nil && existing.LeaseExpiresAt.After(now) {
-			return finish(WorkspaceTurnInProgress, existing)
+		if running, found, err := lockRunningWorkspaceTurn(tx, session.ActiveTurnID, existing, hasExisting, now); err != nil {
+			return err
+		} else if found {
+			return finishWorkspaceBegin(tx, in.Key, WorkspaceTurnInProgress, running, &result)
 		}
 
 		if in.ScopeVersion > session.ScopeVersion {
@@ -213,23 +189,72 @@ func (s *AgentWorkspaceStore) BeginTurn(ctx context.Context, in WorkspaceBeginTu
 			}
 		}
 
-		if hasExisting {
-			existing.Status = "running"
-			existing.Attempt++
-			existing.LeaseExpiresAt = &leaseUntil
-			existing.ErrorCode = ""
-			existing.RunID = in.RunID
-			existing.UpdatedAt = now
-			if err := tx.Save(&existing).Error; err != nil {
-				return err
-			}
-			if err := markWorkspaceSessionRunning(tx, session.ID, existing.ID, now); err != nil {
-				return err
-			}
-			return finish(WorkspaceTurnAcquired, existing)
+		turn, err := acquireWorkspaceTurn(tx, session.ID, in, existing, hasExisting, leaseUntil, now)
+		if err != nil {
+			return err
 		}
+		return finishWorkspaceBegin(tx, in.Key, WorkspaceTurnAcquired, turn, &result)
+	})
+	return result, err
+}
 
-		turn := model.AgentSummaryTurn{
+func markWorkspaceSessionRunning(tx *gorm.DB, sessionID, turnID int64, now time.Time) error {
+	return tx.Model(&model.AgentSummarySession{}).Where("id = ?", sessionID).
+		Updates(map[string]interface{}{"active_turn_id": turnID, "state": "running", "expires_at": summaryWorkspaceExpiresAt(now), "updated_at": now}).Error
+}
+
+func lockWorkspaceRequestTurn(tx *gorm.DB, in WorkspaceBeginTurnInput) (model.AgentSummaryTurn, bool, error) {
+	var turn model.AgentSummaryTurn
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("space_id = ? AND user_id = ? AND session_id = ? AND request_id = ?", in.Key.SpaceID, in.Key.UserID, in.Key.SessionID, in.RequestID).
+		Take(&turn).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return turn, false, nil
+	}
+	if err != nil {
+		return turn, false, err
+	}
+	if turn.RequestHash != in.RequestHash {
+		return turn, false, ErrWorkspaceRequestMismatch
+	}
+	return turn, true, nil
+}
+
+func lockRunningWorkspaceTurn(tx *gorm.DB, activeTurnID int64, existing model.AgentSummaryTurn, hasExisting bool, now time.Time) (model.AgentSummaryTurn, bool, error) {
+	if activeTurnID > 0 {
+		var active model.AgentSummaryTurn
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", activeTurnID).Take(&active).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return active, false, err
+		}
+		if err == nil && workspaceTurnLeaseActive(active, now) {
+			return active, true, nil
+		}
+	}
+	if hasExisting && workspaceTurnLeaseActive(existing, now) {
+		return existing, true, nil
+	}
+	return model.AgentSummaryTurn{}, false, nil
+}
+
+func workspaceTurnLeaseActive(turn model.AgentSummaryTurn, now time.Time) bool {
+	return turn.Status == "running" && turn.LeaseExpiresAt != nil && turn.LeaseExpiresAt.After(now)
+}
+
+func acquireWorkspaceTurn(tx *gorm.DB, sessionID int64, in WorkspaceBeginTurnInput, existing model.AgentSummaryTurn, hasExisting bool, leaseUntil, now time.Time) (model.AgentSummaryTurn, error) {
+	turn := existing
+	if hasExisting {
+		turn.Status = "running"
+		turn.Attempt++
+		turn.LeaseExpiresAt = &leaseUntil
+		turn.ErrorCode = ""
+		turn.RunID = in.RunID
+		turn.UpdatedAt = now
+		if err := tx.Save(&turn).Error; err != nil {
+			return turn, err
+		}
+	} else {
+		turn = model.AgentSummaryTurn{
 			SpaceID:        in.Key.SpaceID,
 			UserID:         in.Key.UserID,
 			SessionID:      in.Key.SessionID,
@@ -244,19 +269,18 @@ func (s *AgentWorkspaceStore) BeginTurn(ctx context.Context, in WorkspaceBeginTu
 			UpdatedAt:      now,
 		}
 		if err := tx.Create(&turn).Error; err != nil {
-			return err
+			return turn, err
 		}
-		if err := markWorkspaceSessionRunning(tx, session.ID, turn.ID, now); err != nil {
-			return err
-		}
-		return finish(WorkspaceTurnAcquired, turn)
-	})
-	return result, err
+	}
+	return turn, markWorkspaceSessionRunning(tx, sessionID, turn.ID, now)
 }
 
-func markWorkspaceSessionRunning(tx *gorm.DB, sessionID, turnID int64, now time.Time) error {
-	return tx.Model(&model.AgentSummarySession{}).Where("id = ?", sessionID).
-		Updates(map[string]interface{}{"active_turn_id": turnID, "state": "running", "expires_at": summaryWorkspaceExpiresAt(now), "updated_at": now}).Error
+func finishWorkspaceBegin(tx *gorm.DB, key WorkspaceSessionKey, disposition WorkspaceTurnDisposition, turn model.AgentSummaryTurn, result *WorkspaceBeginTurnResult) error {
+	snapshot, err := loadWorkspaceSnapshotTx(tx, key)
+	if err == nil {
+		*result = WorkspaceBeginTurnResult{Disposition: disposition, Turn: turn, Snapshot: snapshot}
+	}
+	return err
 }
 
 func validateWorkspaceBegin(in WorkspaceBeginTurnInput) error {
@@ -272,11 +296,25 @@ func validateWorkspaceBegin(in WorkspaceBeginTurnInput) error {
 	return nil
 }
 
-func lockOrCreateWorkspaceSession(tx *gorm.DB, in WorkspaceBeginTurnInput, now time.Time) (model.AgentSummarySession, error) {
+func lockWorkspaceSession(tx *gorm.DB, key WorkspaceSessionKey) (model.AgentSummarySession, error) {
 	var session model.AgentSummarySession
-	query := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where("space_id = ? AND user_id = ? AND session_id = ?", in.Key.SpaceID, in.Key.UserID, in.Key.SessionID)
-	if err := query.Take(&session).Error; err == nil {
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("space_id = ? AND user_id = ? AND session_id = ?", key.SpaceID, key.UserID, key.SessionID).
+		Take(&session).Error
+	return session, err
+}
+
+func lockWorkspaceTurn(tx *gorm.DB, key WorkspaceSessionKey, turnID int64) (model.AgentSummaryTurn, error) {
+	var turn model.AgentSummaryTurn
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND space_id = ? AND user_id = ? AND session_id = ?", turnID, key.SpaceID, key.UserID, key.SessionID).
+		Take(&turn).Error
+	return turn, err
+}
+
+func lockOrCreateWorkspaceSession(tx *gorm.DB, in WorkspaceBeginTurnInput, now time.Time) (model.AgentSummarySession, error) {
+	session, err := lockWorkspaceSession(tx, in.Key)
+	if err == nil {
 		return session, nil
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return session, err
@@ -302,9 +340,7 @@ func lockOrCreateWorkspaceSession(tx *gorm.DB, in WorkspaceBeginTurnInput, now t
 	// Always re-read the unique row under lock. MySQL CLIENT_FOUND_ROWS may
 	// report a conflict/no-op insert as affected, so RowsAffected cannot tell
 	// whether session contains the persisted row (including its primary key).
-	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where("space_id = ? AND user_id = ? AND session_id = ?", in.Key.SpaceID, in.Key.UserID, in.Key.SessionID).
-		Take(&session).Error; err != nil {
+	if session, err = lockWorkspaceSession(tx, in.Key); err != nil {
 		return session, err
 	}
 	return session, nil
@@ -316,16 +352,12 @@ func (s *AgentWorkspaceStore) CompleteTurn(ctx context.Context, in WorkspaceTurn
 	}
 	var snapshot WorkspaceSnapshot
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var session model.AgentSummarySession
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("space_id = ? AND user_id = ? AND session_id = ?", in.Key.SpaceID, in.Key.UserID, in.Key.SessionID).
-			Take(&session).Error; err != nil {
+		session, err := lockWorkspaceSession(tx, in.Key)
+		if err != nil {
 			return err
 		}
-		var turn model.AgentSummaryTurn
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ? AND space_id = ? AND user_id = ? AND session_id = ?", in.TurnID, in.Key.SpaceID, in.Key.UserID, in.Key.SessionID).
-			Take(&turn).Error; err != nil {
+		turn, err := lockWorkspaceTurn(tx, in.Key, in.TurnID)
+		if err != nil {
 			return err
 		}
 		if in.Attempt <= 0 || turn.Attempt != in.Attempt {
@@ -438,7 +470,6 @@ func (s *AgentWorkspaceStore) CompleteTurn(ctx context.Context, in WorkspaceTurn
 		}).Error; err != nil {
 			return err
 		}
-		var err error
 		snapshot, err = loadWorkspaceSnapshotTx(tx, in.Key)
 		return err
 	})
@@ -506,16 +537,12 @@ func (s *AgentWorkspaceStore) FailTurn(ctx context.Context, in WorkspaceTurnFail
 	}
 	now := timezone.Now()
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var session model.AgentSummarySession
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("space_id = ? AND user_id = ? AND session_id = ?", in.Key.SpaceID, in.Key.UserID, in.Key.SessionID).
-			Take(&session).Error; err != nil {
+		session, err := lockWorkspaceSession(tx, in.Key)
+		if err != nil {
 			return err
 		}
-		var turn model.AgentSummaryTurn
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ? AND space_id = ? AND user_id = ? AND session_id = ?", in.TurnID, in.Key.SpaceID, in.Key.UserID, in.Key.SessionID).
-			Take(&turn).Error; err != nil {
+		turn, err := lockWorkspaceTurn(tx, in.Key, in.TurnID)
+		if err != nil {
 			return err
 		}
 		if in.Attempt <= 0 || turn.Attempt != in.Attempt || turn.Status != "running" || session.ActiveTurnID != turn.ID {
@@ -623,37 +650,19 @@ func (s *AgentWorkspaceStore) BeginProposalConfirmation(ctx context.Context, in 
 	leaseUntil := now.Add(lease)
 	result := WorkspaceBeginTurnResult{}
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var session model.AgentSummarySession
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("space_id = ? AND user_id = ? AND session_id = ?", in.Begin.Key.SpaceID, in.Begin.Key.UserID, in.Begin.Key.SessionID).
-			Take(&session).Error; err != nil {
+		session, err := lockWorkspaceSession(tx, in.Begin.Key)
+		if err != nil {
 			return err
 		}
-		finish := func(disposition WorkspaceTurnDisposition, turn model.AgentSummaryTurn) error {
-			snapshot, err := loadWorkspaceSnapshotTx(tx, in.Begin.Key)
-			if err == nil {
-				result = WorkspaceBeginTurnResult{Disposition: disposition, Turn: turn, Snapshot: snapshot}
-			}
+		existing, hasExisting, err := lockWorkspaceRequestTurn(tx, in.Begin)
+		if err != nil {
 			return err
 		}
-
-		var existing model.AgentSummaryTurn
-		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("space_id = ? AND user_id = ? AND session_id = ? AND request_id = ?", in.Begin.Key.SpaceID, in.Begin.Key.UserID, in.Begin.Key.SessionID, in.Begin.RequestID).
-			Take(&existing).Error
-		hasExisting := err == nil
-		if err == nil {
-			if existing.RequestHash != in.Begin.RequestHash {
-				return ErrWorkspaceRequestMismatch
+		if hasExisting && existing.Status == "completed" {
+			if session.ScopeVersion != in.Begin.ScopeVersion || session.ScopeHash != in.Begin.ScopeHash {
+				return ErrWorkspaceScopeConflict
 			}
-			if existing.Status == "completed" {
-				if session.ScopeVersion != in.Begin.ScopeVersion || session.ScopeHash != in.Begin.ScopeHash {
-					return ErrWorkspaceScopeConflict
-				}
-				return finish(WorkspaceTurnReplay, existing)
-			}
-		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return err
+			return finishWorkspaceBegin(tx, in.Begin.Key, WorkspaceTurnReplay, existing, &result)
 		}
 
 		if session.ScopeVersion != in.Begin.ScopeVersion || session.ScopeHash != in.Begin.ScopeHash ||
@@ -664,57 +673,17 @@ func (s *AgentWorkspaceStore) BeginProposalConfirmation(ctx context.Context, in 
 			return ErrWorkspaceProposalStale
 		}
 
-		if session.ActiveTurnID > 0 {
-			var active model.AgentSummaryTurn
-			activeErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", session.ActiveTurnID).Take(&active).Error
-			if activeErr == nil && active.Status == "running" && active.LeaseExpiresAt != nil && active.LeaseExpiresAt.After(now) {
-				return finish(WorkspaceTurnInProgress, active)
-			}
-			if activeErr != nil && !errors.Is(activeErr, gorm.ErrRecordNotFound) {
-				return activeErr
-			}
-		}
-		if hasExisting && existing.Status == "running" && existing.LeaseExpiresAt != nil && existing.LeaseExpiresAt.After(now) {
-			return finish(WorkspaceTurnInProgress, existing)
+		if running, found, err := lockRunningWorkspaceTurn(tx, session.ActiveTurnID, existing, hasExisting, now); err != nil {
+			return err
+		} else if found {
+			return finishWorkspaceBegin(tx, in.Begin.Key, WorkspaceTurnInProgress, running, &result)
 		}
 
-		if hasExisting {
-			existing.Status = "running"
-			existing.Attempt++
-			existing.LeaseExpiresAt = &leaseUntil
-			existing.ErrorCode = ""
-			existing.RunID = in.Begin.RunID
-			existing.UpdatedAt = now
-			if err := tx.Save(&existing).Error; err != nil {
-				return err
-			}
-			if err := markWorkspaceSessionRunning(tx, session.ID, existing.ID, now); err != nil {
-				return err
-			}
-			return finish(WorkspaceTurnAcquired, existing)
-		}
-
-		turn := model.AgentSummaryTurn{
-			SpaceID:        in.Begin.Key.SpaceID,
-			UserID:         in.Begin.Key.UserID,
-			SessionID:      in.Begin.Key.SessionID,
-			RequestID:      in.Begin.RequestID,
-			RequestHash:    in.Begin.RequestHash,
-			ScopeVersion:   in.Begin.ScopeVersion,
-			Status:         "running",
-			Attempt:        1,
-			LeaseExpiresAt: &leaseUntil,
-			RunID:          in.Begin.RunID,
-			CreatedAt:      now,
-			UpdatedAt:      now,
-		}
-		if err := tx.Create(&turn).Error; err != nil {
+		turn, err := acquireWorkspaceTurn(tx, session.ID, in.Begin, existing, hasExisting, leaseUntil, now)
+		if err != nil {
 			return err
 		}
-		if err := markWorkspaceSessionRunning(tx, session.ID, turn.ID, now); err != nil {
-			return err
-		}
-		return finish(WorkspaceTurnAcquired, turn)
+		return finishWorkspaceBegin(tx, in.Begin.Key, WorkspaceTurnAcquired, turn, &result)
 	})
 	return result, err
 }
@@ -725,10 +694,8 @@ func (s *AgentWorkspaceStore) ReconcileWorkflow(ctx context.Context, in Workspac
 	}
 	var snapshot WorkspaceSnapshot
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var session model.AgentSummarySession
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("space_id = ? AND user_id = ? AND session_id = ?", in.Key.SpaceID, in.Key.UserID, in.Key.SessionID).
-			Take(&session).Error; err != nil {
+		session, err := lockWorkspaceSession(tx, in.Key)
+		if err != nil {
 			return err
 		}
 		// A terminal workflow message is authoritative regardless of whether the
@@ -801,7 +768,6 @@ func (s *AgentWorkspaceStore) ReconcileWorkflow(ctx context.Context, in Workspac
 		if err := tx.Model(&model.AgentSummarySession{}).Where("id = ?", session.ID).Updates(updates).Error; err != nil {
 			return err
 		}
-		var err error
 		snapshot, err = loadWorkspaceSnapshotTx(tx, in.Key)
 		return err
 	})
