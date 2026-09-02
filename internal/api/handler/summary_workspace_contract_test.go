@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -94,6 +95,24 @@ func TestNormalizeSummaryWorkspaceContextRejectsRangeOverNinetyDays(t *testing.T
 	})
 	if err == nil {
 		t.Fatal("expected over-limit time range to be rejected")
+	}
+}
+
+func TestNormalizeSummaryWorkspaceContextEnforcesWorkspaceSelectionLimits(t *testing.T) {
+	channels := make([]summaryWorkspaceChannel, maxSummaryWorkspaceSelectedChannels+1)
+	for index := range channels {
+		channels[index] = summaryWorkspaceChannel{ChatID: fmt.Sprintf("group-%d", index), ChatType: "group", Name: "群聊"}
+	}
+	if _, err := normalizeSummaryWorkspaceContext(summaryWorkspaceContext{SelectedChannels: channels}); err == nil {
+		t.Fatal("expected selected channel limit error")
+	}
+
+	participants := make([]summaryWorkspaceParticipant, maxSummaryWorkspaceParticipants+1)
+	for index := range participants {
+		participants[index] = summaryWorkspaceParticipant{UserID: fmt.Sprintf("user-%d", index)}
+	}
+	if _, err := normalizeSummaryWorkspaceContext(summaryWorkspaceContext{Participants: participants}); err == nil {
+		t.Fatal("expected participant limit error")
 	}
 }
 

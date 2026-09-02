@@ -16,28 +16,29 @@ const (
 	summaryWorkspaceContractVersion = "1"
 	summaryWorkspaceProfile         = "summary_workspace"
 
-	workspaceResultClarification      = "clarification"
-	workspaceResultExplanation        = "explanation"
-	workspaceResultWorkflowConfirm    = "workflow_confirmation"
-	workspaceResultWorkflowStarted    = "workflow_started"
-	workspaceResultWorkflowCompleted  = "workflow_completed"
-	workspaceResultAgentPreview       = "agent_preview"
-	workspaceResultAgentRevision      = "agent_revision"
-	workspaceResultError              = "error"
-	workspaceActionConfirmWorkflow    = "confirm_workflow"
-	workspaceActionSavePreview        = "save_preview"
-	workspaceActionViewSummary        = "view_summary"
-	workspaceActionViewProgress       = "view_progress"
-	workspaceActionContinueChat       = "continue_chat"
-	workspaceSnapshotVersion          = 1
-	maxSummaryWorkspaceParticipants   = 100
-	maxSummaryWorkspaceReferencedTask = 20
-	maxSummaryWorkspaceIDLength       = 256
-	maxSummaryWorkspaceLabelLength    = 256
-	maxSummaryWorkspaceRequirement    = 8192
-	summaryWorkspaceInputUser         = "user"
-	summaryWorkspaceInputTemplate     = "template"
-	summaryWorkspaceInputSystemIntent = "system_intent"
+	workspaceResultClarification        = "clarification"
+	workspaceResultExplanation          = "explanation"
+	workspaceResultWorkflowConfirm      = "workflow_confirmation"
+	workspaceResultWorkflowStarted      = "workflow_started"
+	workspaceResultWorkflowCompleted    = "workflow_completed"
+	workspaceResultAgentPreview         = "agent_preview"
+	workspaceResultAgentRevision        = "agent_revision"
+	workspaceResultError                = "error"
+	workspaceActionConfirmWorkflow      = "confirm_workflow"
+	workspaceActionSavePreview          = "save_preview"
+	workspaceActionViewSummary          = "view_summary"
+	workspaceActionViewProgress         = "view_progress"
+	workspaceActionContinueChat         = "continue_chat"
+	workspaceSnapshotVersion            = 1
+	maxSummaryWorkspaceSelectedChannels = 30
+	maxSummaryWorkspaceParticipants     = 30
+	maxSummaryWorkspaceReferencedTask   = 20
+	maxSummaryWorkspaceIDLength         = 256
+	maxSummaryWorkspaceLabelLength      = 256
+	maxSummaryWorkspaceRequirement      = 8192
+	summaryWorkspaceInputUser           = "user"
+	summaryWorkspaceInputTemplate       = "template"
+	summaryWorkspaceInputSystemIntent   = "system_intent"
 )
 
 var errInvalidSummaryWorkspaceContext = errors.New("invalid summary workspace context")
@@ -169,8 +170,8 @@ func emptySummaryWorkspaceContext() summaryWorkspaceContext {
 
 func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorkspaceContext, error) {
 	out := emptySummaryWorkspaceContext()
-	if len(in.SelectedChannels) > maxSelectedChannels {
-		return out, fmt.Errorf("%w: selected_channels exceeds %d", errInvalidSummaryWorkspaceContext, maxSelectedChannels)
+	if len(in.SelectedChannels) > maxSummaryWorkspaceSelectedChannels {
+		return out, fmt.Errorf("%w: 最多选择 %d 个聊天", errInvalidSummaryWorkspaceContext, maxSummaryWorkspaceSelectedChannels)
 	}
 	seenChannels := make(map[string]struct{}, len(in.SelectedChannels))
 	for _, channel := range in.SelectedChannels {
@@ -194,7 +195,7 @@ func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorksp
 	}
 
 	if len(in.Participants) > maxSummaryWorkspaceParticipants {
-		return out, fmt.Errorf("%w: participants exceeds %d", errInvalidSummaryWorkspaceContext, maxSummaryWorkspaceParticipants)
+		return out, fmt.Errorf("%w: 最多选择 %d 位参与者", errInvalidSummaryWorkspaceContext, maxSummaryWorkspaceParticipants)
 	}
 	seenParticipants := make(map[string]struct{}, len(in.Participants))
 	for _, participant := range in.Participants {

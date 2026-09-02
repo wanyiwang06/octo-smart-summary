@@ -458,6 +458,7 @@ func TestAgentTeamWorkflowCreatesCollaborators(t *testing.T) {
 	svc, db := newSummaryWorkflowTestService(t)
 	in := baseAgentWorkflowInput()
 	in.IdempotencyKey = "agent-team-001"
+	in.Sources = append(in.Sources, SummaryWorkflowSource{SourceType: model.SourceGroup, SourceID: "group-2"})
 	in.Participants = []SummaryWorkflowParticipant{{UserID: "p1", UserName: "P1"}}
 
 	got, err := svc.CreateTeamFromAgent(context.Background(), in)
@@ -473,5 +474,12 @@ func TestAgentTeamWorkflowCreatesCollaborators(t *testing.T) {
 	}
 	if len(participants) != 2 {
 		t.Fatalf("participants = %d, want creator + collaborator", len(participants))
+	}
+	var sources []model.SummarySource
+	if err := db.Where("task_id = ?", got.Task.ID).Order("source_id").Find(&sources).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 2 || sources[0].SourceID != "group-1" || sources[1].SourceID != "group-2" {
+		t.Fatalf("sources = %#v, want both selected groups", sources)
 	}
 }

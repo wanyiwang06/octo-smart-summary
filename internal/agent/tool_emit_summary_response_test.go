@@ -53,6 +53,36 @@ func TestEmitSummaryResponseHonorsContextAllowlist(t *testing.T) {
 	}
 }
 
+func TestEmitSummaryResponseRequiresCitationForChatBackedPreview(t *testing.T) {
+	_, handler := EmitSummaryResponseTool()
+	ctx := WithSummaryCitationTracking(context.Background())
+	markSummaryCitationEvidence(ctx, 1)
+
+	withoutCitation := json.RawMessage(`{"result_type":"agent_preview","reply":"ready","execution_target":"agent_preview","preview":{"content":"chat-backed body","version":1}}`)
+	if _, err := handler(ctx, withoutCitation); err == nil || !strings.Contains(err.Error(), "must include citation markers") {
+		t.Fatalf("missing citation accepted: %v", err)
+	}
+
+	withCitation := json.RawMessage(`{"result_type":"agent_preview","reply":"ready","execution_target":"agent_preview","preview":{"content":"chat-backed body [1]","version":1}}`)
+	if _, err := handler(ctx, withCitation); err != nil {
+		t.Fatalf("cited preview rejected: %v", err)
+	}
+
+	explanation := json.RawMessage(`{"result_type":"explanation","reply":"ready"}`)
+	if _, err := handler(ctx, explanation); err != nil {
+		t.Fatalf("non-preview response should not require citations: %v", err)
+	}
+}
+
+func TestEmitSummaryResponseAllowsUncitedPreviewForQuietChat(t *testing.T) {
+	_, handler := EmitSummaryResponseTool()
+	ctx := WithSummaryCitationTracking(context.Background())
+	args := json.RawMessage(`{"result_type":"agent_preview","reply":"ready","execution_target":"agent_preview","preview":{"content":"No messages were found.","version":1}}`)
+	if _, err := handler(ctx, args); err != nil {
+		t.Fatalf("quiet-chat preview rejected: %v", err)
+	}
+}
+
 func TestEmitSummaryResponseRejectsInvalidShapes(t *testing.T) {
 	_, handler := EmitSummaryResponseTool()
 	tests := []struct {

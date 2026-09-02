@@ -27,6 +27,29 @@ import (
 
 const summaryWorkspaceTurnLease = 6 * time.Minute
 
+const (
+	teamScopeReasonNone                = ""
+	teamScopeReasonSourceType          = "source_type"
+	teamScopeReasonSourceLimit         = "source_limit"
+	teamScopeReasonParticipantMissing  = "participant_missing"
+	teamScopeReasonParticipantInactive = "participant_inactive"
+)
+
+func summaryWorkspaceTeamScopeMessage(reason string) string {
+	switch reason {
+	case teamScopeReasonSourceType:
+		return "多人总结的聊天来源只能选择群聊。"
+	case teamScopeReasonSourceLimit:
+		return fmt.Sprintf("多人总结最多选择 %d 个群聊。", maxSummaryWorkspaceSelectedChannels)
+	case teamScopeReasonParticipantMissing:
+		return "部分参与者不属于任何已选群聊，或已退出群聊。"
+	case teamScopeReasonParticipantInactive:
+		return "部分参与者已不在当前 Space，或账号已失效。"
+	default:
+		return "多人总结的协作范围无效，请重新选择群聊和参与者。"
+	}
+}
+
 // summaryWorkspaceCoordinator owns only the unified-entry orchestration. The
 // existing chat profiles and legacy summary endpoints keep their old behavior.
 type summaryWorkspaceCoordinator struct {
@@ -275,6 +298,10 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		responder.fail(http.StatusInternalServerError, 50000, "读取参与者权限失败", true)
 		return
 	}
+	teamScopeReason := teamScopeReasonNone
+	if !participantsValid && len(contextValue.Participants) > 0 {
+		teamScopeReason = teamScopeReasonParticipantInactive
+	}
 	referencesValid, err := h.workspace.validateReferences(c.Request.Context(), spaceID, uid, contextValue.ReferencedTaskIDs)
 	if err != nil {
 		failTurn("REFERENCE_LOOKUP_FAILED")
@@ -282,7 +309,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		return
 	}
 	if participantsValid && len(contextValue.Participants) > 0 && len(contextValue.SelectedChannels) > 0 {
-		participantsValid, err = h.workspace.validateTeamScope(c.Request.Context(), uid, contextValue.SelectedChannels, contextValue.Participants)
+		participantsValid, teamScopeReason, err = h.workspace.validateTeamScope(c.Request.Context(), contextValue.SelectedChannels, contextValue.Participants)
 		if err != nil {
 			failTurn("TEAM_SCOPE_LOOKUP_FAILED")
 			responder.fail(http.StatusInternalServerError, 50000, "读取协作范围失败", true)
@@ -307,7 +334,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		if len(contextValue.ReferencedTaskIDs) > 0 && !referencesValid {
 			reply = "部分引用总结不可用，请调整后重试。"
 		} else if len(contextValue.Participants) > 0 && !participantsValid {
-			reply = "多人总结目前仅支持一个群聊，且参与者必须都是该群有效成员。"
+			reply = summaryWorkspaceTeamScopeMessage(teamScopeReason)
 		} else if len(contextValue.Participants) > 0 && !hasRequirement {
 			reply = "请选择模板或输入总结要求后再开始多人总结。"
 		} else if len(contextValue.SelectedChannels) > 0 && !sourcesValid {
@@ -651,6 +678,9 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 		allowedResults = append(allowedResults, agent.SummaryResultClarification)
 	}
 	ctx = agent.WithAllowedSummaryResultTypes(ctx, allowedResults...)
+	if len(contextValue.SelectedChannels) > 0 || openScopeAgent {
+		ctx = agent.WithSummaryCitationTracking(ctx)
+	}
 	ctx = context.WithValue(ctx, agent.ContextKeyRunOwnerID, key.UserID)
 	ctx = context.WithValue(ctx, agent.ContextKeySessionID, agentSessionID)
 
@@ -901,8 +931,12 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 		return
 	}
 	teamScopeValid := participantsValid && len(contextValue.SelectedChannels) == 0
+	teamScopeReason := teamScopeReasonNone
+	if !participantsValid {
+		teamScopeReason = teamScopeReasonParticipantInactive
+	}
 	if participantsValid && len(contextValue.SelectedChannels) > 0 {
-		teamScopeValid, err = h.workspace.validateTeamScope(c.Request.Context(), uid, contextValue.SelectedChannels, contextValue.Participants)
+		teamScopeValid, teamScopeReason, err = h.workspace.validateTeamScope(c.Request.Context(), contextValue.SelectedChannels, contextValue.Participants)
 		if err != nil {
 			failTurn("TEAM_SCOPE_LOOKUP_FAILED")
 			c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "读取协作范围失败"})
@@ -911,7 +945,18 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 	}
 	if (len(contextValue.SelectedChannels) > 0 && !sourcesValid) || !participantsValid || !referencesValid || !teamScopeValid {
 		failTurn("CONFIRM_SCOPE_INVALID")
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "多人总结仅支持一个群聊，且参与者必须都是该群有效成员"})
+		message := "协作范围已失效，请重新生成提案"
+		switch {
+		case len(contextValue.SelectedChannels) > 0 && !sourcesValid:
+			message = "部分群聊已不可访问，请重新选择群聊"
+		case !participantsValid:
+			message = "部分参与者已不在当前 Space，或账号已失效"
+		case !teamScopeValid:
+			message = summaryWorkspaceTeamScopeMessage(teamScopeReason)
+		case !referencesValid:
+			message = "部分引用总结已不可用，请重新选择"
+		}
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: message})
 		return
 	}
 
@@ -1723,7 +1768,9 @@ func (w *summaryWorkspaceCoordinator) validateSources(ctx context.Context, space
 		}
 	}
 	requestedPeers := make([]string, 0)
+	requestedGroups := make([]string, 0)
 	seenPeers := make(map[string]struct{})
+	seenGroups := make(map[string]struct{})
 	for _, channel := range channels {
 		id := channel.ChatID
 		if channel.ChatType == "direct" {
@@ -1742,6 +1789,22 @@ func (w *summaryWorkspaceCoordinator) validateSources(ctx context.Context, space
 				seenPeers[peerID] = struct{}{}
 				requestedPeers = append(requestedPeers, peerID)
 			}
+		} else if channel.ChatType == "group" {
+			if _, exists := seenGroups[id]; !exists {
+				seenGroups[id] = struct{}{}
+				requestedGroups = append(requestedGroups, id)
+			}
+		}
+	}
+	if len(requestedGroups) > 0 {
+		var count int64
+		if err := w.imDB.WithContext(ctx).Table("group_member").
+			Where("group_no IN ? AND uid = ? AND status = 1 AND is_deleted = 0", requestedGroups, actorID).
+			Distinct("group_no").Count(&count).Error; err != nil {
+			return false, err
+		}
+		if count != int64(len(requestedGroups)) {
+			return false, nil
 		}
 	}
 	if len(requestedPeers) > 0 {
@@ -1791,15 +1854,28 @@ func (w *summaryWorkspaceCoordinator) validateReferences(ctx context.Context, sp
 	return true, nil
 }
 
-func (w *summaryWorkspaceCoordinator) validateTeamScope(ctx context.Context, actorID string, channels []summaryWorkspaceChannel, participants []summaryWorkspaceParticipant) (bool, error) {
-	if len(channels) != 1 || channels[0].ChatType != "group" || len(participants) == 0 {
-		return false, nil
+func (w *summaryWorkspaceCoordinator) validateTeamScope(ctx context.Context, channels []summaryWorkspaceChannel, participants []summaryWorkspaceParticipant) (bool, string, error) {
+	if len(channels) == 0 || len(participants) == 0 {
+		return false, teamScopeReasonParticipantMissing, nil
 	}
-	ids := make([]string, 0, len(participants)+1)
-	seen := make(map[string]struct{}, len(participants)+1)
-	for _, uid := range append([]string{actorID}, participantIDs(participants)...) {
+	if len(channels) > maxSummaryWorkspaceSelectedChannels {
+		return false, teamScopeReasonSourceLimit, nil
+	}
+	groupIDs := make([]string, 0, len(channels))
+	for _, channel := range channels {
+		if channel.ChatType != "group" {
+			return false, teamScopeReasonSourceType, nil
+		}
+		groupIDs = append(groupIDs, channel.ChatID)
+	}
+	if w == nil || w.imDB == nil {
+		return false, teamScopeReasonNone, errors.New("IM database not available")
+	}
+	ids := make([]string, 0, len(participants))
+	seen := make(map[string]struct{}, len(participants))
+	for _, uid := range participantIDs(participants) {
 		if strings.TrimSpace(uid) == "" {
-			return false, nil
+			return false, teamScopeReasonParticipantMissing, nil
 		}
 		if _, exists := seen[uid]; exists {
 			continue
@@ -1807,14 +1883,20 @@ func (w *summaryWorkspaceCoordinator) validateTeamScope(ctx context.Context, act
 		seen[uid] = struct{}{}
 		ids = append(ids, uid)
 	}
-	if len(ids) < 2 {
-		return false, nil
+	if len(ids) == 0 {
+		return false, teamScopeReasonParticipantMissing, nil
 	}
 	var count int64
 	err := w.imDB.WithContext(ctx).Table("group_member").
-		Where("group_no = ? AND uid IN ? AND is_deleted = 0", channels[0].ChatID, ids).
+		Where("group_no IN ? AND uid IN ? AND status = 1 AND is_deleted = 0", groupIDs, ids).
 		Distinct("uid").Count(&count).Error
-	return count == int64(len(ids)), err
+	if err != nil {
+		return false, teamScopeReasonNone, err
+	}
+	if count != int64(len(ids)) {
+		return false, teamScopeReasonParticipantMissing, nil
+	}
+	return true, teamScopeReasonNone, nil
 }
 
 func participantIDs(participants []summaryWorkspaceParticipant) []string {

@@ -198,7 +198,7 @@ func TestGetProfile_SummaryWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadPrompt: %v", err)
 	}
-	for _, phrase := range []string{"emit_summary_response", "preview.content", "禁止直接输出自由文本"} {
+	for _, phrase := range []string{"emit_summary_response", "preview.content", "禁止直接输出自由文本", "不得完全没有引用标记"} {
 		if !strings.Contains(prompt, phrase) {
 			t.Errorf("prompt missing %q", phrase)
 		}

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 )
 
 const (
@@ -84,6 +85,12 @@ type SummaryResponseTimeRange struct {
 
 type allowedSummaryResultTypesContextKey struct{}
 
+type summaryCitationTrackingContextKey struct{}
+
+type summaryCitationTrackingState struct {
+	hasEvidence atomic.Bool
+}
+
 // WithAllowedSummaryResultTypes constrains which result types the terminal tool
 // may accept for this request. Absence means structural validation only; an
 // explicitly empty allowlist denies every result. The application layer should
@@ -97,6 +104,24 @@ func WithAllowedSummaryResultTypes(ctx context.Context, resultTypes ...string) c
 		}
 	}
 	return context.WithValue(ctx, allowedSummaryResultTypesContextKey{}, allowed)
+}
+
+// WithSummaryCitationTracking enables a run-scoped citation guard. Fetch tools
+// mark the shared state only after they persist at least one message, so quiet
+// chats may still produce an explicit "no messages" preview without inventing
+// a citation. When evidence exists, an uncited terminal preview is rejected and
+// the Agent loop gets a chance to repair it.
+func WithSummaryCitationTracking(ctx context.Context) context.Context {
+	return context.WithValue(ctx, summaryCitationTrackingContextKey{}, &summaryCitationTrackingState{})
+}
+
+func markSummaryCitationEvidence(ctx context.Context, messageCount int) {
+	if messageCount <= 0 {
+		return
+	}
+	if state, ok := ctx.Value(summaryCitationTrackingContextKey{}).(*summaryCitationTrackingState); ok && state != nil {
+		state.hasEvidence.Store(true)
+	}
 }
 
 // EmitSummaryResponseTool returns the only successful termination mechanism
@@ -180,6 +205,12 @@ func EmitSummaryResponseTool() (Tool, TerminalHandler) {
 			if _, accepted := allowed[payload.ResultType]; !accepted {
 				return TerminalOutcome{}, fmt.Errorf("result_type %q is not allowed for this request", payload.ResultType)
 			}
+		}
+		tracking, _ := ctx.Value(summaryCitationTrackingContextKey{}).(*summaryCitationTrackingState)
+		if tracking != nil && tracking.hasEvidence.Load() &&
+			(payload.ResultType == SummaryResultAgentPreview || payload.ResultType == SummaryResultAgentRevision) &&
+			(payload.Preview == nil || !strings.Contains(payload.Preview.Content, "[1]")) {
+			return TerminalOutcome{}, errors.New("preview.content must include citation markers such as [1] for chat-backed summaries")
 		}
 		return TerminalOutcome{
 			VisibleContent: payload.Reply,
