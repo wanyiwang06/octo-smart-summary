@@ -13,14 +13,13 @@ const (
 )
 
 // SummaryAction is the trusted UI action attached to a request. Chat asks the
-// policy to derive a route; confirm/save actions must satisfy persisted-state
-// guards before a side effect is allowed.
+// policy to derive a route; confirmation must satisfy persisted-state guards
+// before a side effect is allowed.
 type SummaryAction string
 
 const (
 	SummaryActionChat            SummaryAction = "chat"
 	SummaryActionConfirmWorkflow SummaryAction = "confirm_workflow"
-	SummaryActionSavePreview     SummaryAction = "save_preview"
 )
 
 // SummaryRoute is the next operation allowed by the deterministic policy.
@@ -33,7 +32,6 @@ const (
 	SummaryRouteTeamWorkflow     SummaryRoute = "team_workflow"
 	SummaryRouteAgentPreview     SummaryRoute = "agent_preview"
 	SummaryRouteAgentRevision    SummaryRoute = "agent_revision"
-	SummaryRouteAgentPreviewSave SummaryRoute = "agent_preview_save"
 	SummaryRouteExplanation      SummaryRoute = "explanation"
 )
 
@@ -70,11 +68,6 @@ func DeriveSummaryRoute(in SummaryRouteInput) SummaryRoute {
 			return SummaryRouteClarification
 		}
 		return SummaryRouteTeamWorkflow
-	case SummaryActionSavePreview:
-		if in.HasCurrentPreview && in.PreviewScopeMatches {
-			return SummaryRouteAgentPreviewSave
-		}
-		return SummaryRouteClarification
 	case "", SummaryActionChat:
 		// Continue below. Empty keeps zero-value callers backward compatible.
 	default:

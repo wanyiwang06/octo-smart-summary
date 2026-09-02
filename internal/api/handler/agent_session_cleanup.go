@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // agent_message 清理策略(CHAT-REFERENCE-BASED-DESIGN 后续加固,
@@ -158,7 +160,35 @@ func runOnce(db *gorm.DB) {
 	// by agent_summary_session; workspace retirement must remove that session
 	// before this Legacy cleanup may collect its evidence.
 	evStart := timezone.Now()
-	evResult := db.Exec(`
+	evRows, evErr := cleanupExpiredAgentEvidence(db, cutoff)
+	evElapsed := time.Since(evStart)
+	if evErr != nil {
+		log.Printf("[agent-cleanup] ERROR evidence delete failed after %s: %v", evElapsed, evErr)
+		return
+	}
+	if evRows > 0 {
+		log.Printf("[agent-cleanup] cleaned %d evidence rows in %s (cutoff=%s)",
+			evRows, evElapsed, cutoff.Format(time.RFC3339))
+	}
+	if evElapsed > cleanupSlowThreshold {
+		log.Printf("[agent-cleanup] SLOW evidence delete took %s (rows=%d, cutoff=%s) — consider indexing agent_message_evidence(session_id, created_at)",
+			evElapsed, evRows, cutoff.Format(time.RFC3339))
+	}
+}
+
+func cleanupExpiredAgentEvidence(db *gorm.DB, cutoff time.Time) (int64, error) {
+	if db == nil {
+		return 0, fmt.Errorf("evidence cleanup database is required")
+	}
+	// Workspace session identifiers are binary-collated in MySQL, while the
+	// older evidence table uses utf8mb4_unicode_ci. Make the comparison explicit
+	// so MySQL does not raise error 1267 and identifier matching remains
+	// case-sensitive. SQLite uses the portable equality expression in tests.
+	sessionMatch := "agent_summary_session.agent_session_id = agent_message_evidence.session_id"
+	if db.Dialector.Name() == "mysql" {
+		sessionMatch = "agent_summary_session.agent_session_id = agent_message_evidence.session_id COLLATE utf8mb4_0900_bin"
+	}
+	result := db.Exec(fmt.Sprintf(`
 		DELETE FROM agent_message_evidence
 		WHERE (user_id, session_id) IN (
 			SELECT user_id, session_id FROM (
@@ -172,22 +202,10 @@ func runOnce(db *gorm.DB) {
 			SELECT 1
 			FROM agent_summary_session
 			WHERE agent_summary_session.user_id = agent_message_evidence.user_id
-			  AND agent_summary_session.agent_session_id = agent_message_evidence.session_id
+			  AND %s
 		)
-	`, cutoff)
-	evElapsed := time.Since(evStart)
-	if evResult.Error != nil {
-		log.Printf("[agent-cleanup] ERROR evidence delete failed after %s: %v", evElapsed, evResult.Error)
-		return
-	}
-	if evResult.RowsAffected > 0 {
-		log.Printf("[agent-cleanup] cleaned %d evidence rows in %s (cutoff=%s)",
-			evResult.RowsAffected, evElapsed, cutoff.Format(time.RFC3339))
-	}
-	if evElapsed > cleanupSlowThreshold {
-		log.Printf("[agent-cleanup] SLOW evidence delete took %s (rows=%d, cutoff=%s) — consider indexing agent_message_evidence(session_id, created_at)",
-			evElapsed, evResult.RowsAffected, cutoff.Format(time.RFC3339))
-	}
+	`, sessionMatch), cutoff)
+	return result.RowsAffected, result.Error
 }
 
 // cleanupExpiredSummaryWorkspaces retires inactive workspace state after the
@@ -200,26 +218,26 @@ func cleanupExpiredSummaryWorkspaces(db *gorm.DB, now time.Time) (int64, error) 
 	}
 	legacyCutoff := now.Add(-summaryWorkspaceRetention)
 	var cleaned int64
+	var afterID int64
 	for {
 		var sessions []model.AgentSummarySession
-		if err := db.Where("expires_at <= ? OR (expires_at IS NULL AND updated_at <= ?)", now, legacyCutoff).
+		if err := db.Where("id > ? AND (expires_at <= ? OR (expires_at IS NULL AND updated_at <= ?))", afterID, now, legacyCutoff).
 			Order("id ASC").Limit(workspaceCleanupBatchSize).Find(&sessions).Error; err != nil {
 			return cleaned, fmt.Errorf("load expired workspace sessions: %w", err)
 		}
 		if len(sessions) == 0 {
 			break
 		}
-		if err := db.Transaction(func(tx *gorm.DB) error {
-			for _, session := range sessions {
-				if err := deleteWorkspaceSessionState(tx, session); err != nil {
-					return err
-				}
+		for _, session := range sessions {
+			afterID = session.ID
+			deleted, err := deleteExpiredWorkspaceSessionState(db, session.ID, now, legacyCutoff)
+			if err != nil {
+				return cleaned, err
 			}
-			return nil
-		}); err != nil {
-			return cleaned, err
+			if deleted {
+				cleaned++
+			}
 		}
-		cleaned += int64(len(sessions))
 		if len(sessions) < workspaceCleanupBatchSize {
 			break
 		}
@@ -240,6 +258,47 @@ func cleanupExpiredSummaryWorkspaces(db *gorm.DB, now time.Time) (int64, error) 
 		return cleaned, fmt.Errorf("clean workflow idempotency tombstones: %w", err)
 	}
 	return cleaned, nil
+}
+
+func deleteExpiredWorkspaceSessionState(db *gorm.DB, sessionID int64, now, legacyCutoff time.Time) (bool, error) {
+	deleted := false
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var session model.AgentSummarySession
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", sessionID).Take(&session).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return fmt.Errorf("lock workspace session %d: %w", sessionID, err)
+		}
+		if !workspaceSessionExpired(session, now, legacyCutoff) {
+			return nil
+		}
+		if session.ActiveTurnID > 0 {
+			var turn model.AgentSummaryTurn
+			err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND space_id = ? AND user_id = ? AND session_id = ?", session.ActiveTurnID, session.SpaceID, session.UserID, session.SessionID).
+				Take(&turn).Error
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("lock active workspace turn %d: %w", session.ActiveTurnID, err)
+			}
+			if err == nil && turn.Status == "running" && turn.LeaseExpiresAt != nil && turn.LeaseExpiresAt.After(now) {
+				return nil
+			}
+		}
+		if err := deleteWorkspaceSessionState(tx, session); err != nil {
+			return err
+		}
+		deleted = true
+		return nil
+	})
+	return deleted, err
+}
+
+func workspaceSessionExpired(session model.AgentSummarySession, now, legacyCutoff time.Time) bool {
+	if session.ExpiresAt != nil {
+		return !session.ExpiresAt.After(now)
+	}
+	return !session.UpdatedAt.After(legacyCutoff)
 }
 
 func deleteWorkspaceSessionState(tx *gorm.DB, session model.AgentSummarySession) error {

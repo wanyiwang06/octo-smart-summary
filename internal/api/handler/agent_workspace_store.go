@@ -21,7 +21,6 @@ var (
 	ErrWorkspaceScopeConflict   = errors.New("summary workspace scope conflict")
 	ErrWorkspaceRequestMismatch = errors.New("summary workspace request id reused with a different request")
 	ErrWorkspaceProposalStale   = errors.New("summary workspace proposal is stale")
-	ErrWorkspacePreviewStale    = errors.New("summary workspace preview is stale")
 	ErrWorkspaceTurnLeaseLost   = errors.New("summary workspace turn lease was lost")
 )
 
@@ -111,13 +110,6 @@ type WorkspaceSnapshot struct {
 	CurrentPreview *model.AgentMessage
 }
 
-type WorkspaceProposalValidation struct {
-	Key             WorkspaceSessionKey
-	ProposalVersion int
-	ProposalToken   string
-	ScopeVersion    int
-}
-
 type WorkspaceProposalConfirmationInput struct {
 	Begin           WorkspaceBeginTurnInput
 	ProposalVersion int
@@ -132,15 +124,6 @@ type WorkspaceWorkflowReconcile struct {
 	MessageID     int64
 	Reply         string
 	ClearWorkflow bool
-}
-
-type WorkspacePreviewSave struct {
-	Key                     WorkspaceSessionKey
-	MessageID               int64
-	ScopeVersion            int
-	ExpectedArtifactVersion int
-	SnapshotVersion         int
-	TaskID                  int64
 }
 
 type AgentWorkspaceStore struct {
@@ -780,24 +763,6 @@ func (s *AgentWorkspaceStore) BeginProposalConfirmation(ctx context.Context, in 
 	return result, err
 }
 
-func (s *AgentWorkspaceStore) ValidateProposal(ctx context.Context, in WorkspaceProposalValidation) (model.AgentSummarySession, error) {
-	if s == nil || s.db == nil {
-		return model.AgentSummarySession{}, errors.New("workspace database is required")
-	}
-	var session model.AgentSummarySession
-	if err := s.db.WithContext(ctx).
-		Where("space_id = ? AND user_id = ? AND session_id = ?", in.Key.SpaceID, in.Key.UserID, in.Key.SessionID).
-		Take(&session).Error; err != nil {
-		return session, err
-	}
-	if session.PendingProposalStatus != "pending" || session.PendingProposalVersion != in.ProposalVersion ||
-		session.PendingProposalToken != strings.TrimSpace(in.ProposalToken) ||
-		session.PendingProposalScopeVersion != in.ScopeVersion || session.ScopeVersion != in.ScopeVersion {
-		return session, ErrWorkspaceProposalStale
-	}
-	return session, nil
-}
-
 func (s *AgentWorkspaceStore) ReconcileWorkflow(ctx context.Context, in WorkspaceWorkflowReconcile) (WorkspaceSnapshot, error) {
 	if s == nil || s.db == nil {
 		return WorkspaceSnapshot{}, errors.New("workspace database is required")
@@ -810,7 +775,12 @@ func (s *AgentWorkspaceStore) ReconcileWorkflow(ctx context.Context, in Workspac
 			Take(&session).Error; err != nil {
 			return err
 		}
-		if session.WorkflowTerminalMessageID > 0 && !in.ClearWorkflow {
+		// A terminal workflow message is authoritative regardless of whether the
+		// first reconciliation retained or cleared the workflow pointer. Failed,
+		// cancelled, and deleted workflows clear workflow_task_id, so checking the
+		// task/scope tuple first would make every later history poll fail instead
+		// of replaying the already-persisted terminal state.
+		if session.WorkflowTerminalMessageID > 0 {
 			var err error
 			snapshot, err = loadWorkspaceSnapshotTx(tx, in.Key)
 			return err
@@ -873,54 +843,6 @@ func (s *AgentWorkspaceStore) ReconcileWorkflow(ctx context.Context, in Workspac
 			updates["workflow_started_message_id"] = 0
 		}
 		if err := tx.Model(&model.AgentSummarySession{}).Where("id = ?", session.ID).Updates(updates).Error; err != nil {
-			return err
-		}
-		var err error
-		snapshot, err = loadWorkspaceSnapshotTx(tx, in.Key)
-		return err
-	})
-	return snapshot, err
-}
-
-func (s *AgentWorkspaceStore) MarkPreviewSaved(ctx context.Context, in WorkspacePreviewSave) (WorkspaceSnapshot, error) {
-	if s == nil || s.db == nil {
-		return WorkspaceSnapshot{}, errors.New("workspace database is required")
-	}
-	var snapshot WorkspaceSnapshot
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var session model.AgentSummarySession
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("space_id = ? AND user_id = ? AND session_id = ?", in.Key.SpaceID, in.Key.UserID, in.Key.SessionID).
-			Take(&session).Error; err != nil {
-			return err
-		}
-		if session.ScopeVersion != in.ScopeVersion || session.LatestPreviewMessageID != in.MessageID || session.ArtifactVersion != in.ExpectedArtifactVersion {
-			return ErrWorkspacePreviewStale
-		}
-		var message model.AgentMessage
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ? AND space_id = ? AND user_id = ? AND session_id = ?", in.MessageID, in.Key.SpaceID, in.Key.UserID, in.Key.SessionID).
-			Take(&message).Error; err != nil {
-			return err
-		}
-		if (message.ResultType != workspaceResultAgentPreview && message.ResultType != workspaceResultAgentRevision) ||
-			message.ScopeVersion != in.ScopeVersion || message.ArtifactVersion != in.ExpectedArtifactVersion ||
-			message.SnapshotVersion != in.SnapshotVersion {
-			return ErrWorkspacePreviewStale
-		}
-		if message.SavedTaskID > 0 && message.SavedTaskID != in.TaskID {
-			return ErrWorkspacePreviewStale
-		}
-		if err := tx.Model(&model.AgentMessage{}).Where("id = ?", message.ID).Update("saved_task_id", in.TaskID).Error; err != nil {
-			return err
-		}
-		now := timezone.Now()
-		if err := tx.Model(&model.AgentSummarySession{}).Where("id = ?", session.ID).Updates(map[string]interface{}{
-			"latest_preview_saved_task_id": in.TaskID,
-			"state_version":                gorm.Expr("state_version + 1"),
-			"expires_at":                   summaryWorkspaceExpiresAt(now),
-			"updated_at":                   now,
-		}).Error; err != nil {
 			return err
 		}
 		var err error

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -290,6 +291,22 @@ func ValidateRequired(fields map[string]string) {
 	if len(missing) != 0 {
 		log.Fatalf("[config] required environment variables not set: %s", strings.Join(missing, ", "))
 	}
+}
+
+// ValidateSummaryTimeRanges keeps the implicit summary window inside the
+// configured hard ceiling. Both API and worker must reject the same invalid
+// startup configuration before copying these values into pipeline globals.
+func ValidateSummaryTimeRanges(defaultDays, maxDays int) error {
+	if defaultDays <= 0 {
+		return fmt.Errorf("DEFAULT_TIME_RANGE_DAYS must be greater than 0")
+	}
+	if maxDays <= 0 {
+		return fmt.Errorf("MAX_TIME_RANGE_DAYS must be greater than 0")
+	}
+	if maxDays < defaultDays {
+		return fmt.Errorf("MAX_TIME_RANGE_DAYS (%d) must be greater than or equal to DEFAULT_TIME_RANGE_DAYS (%d)", maxDays, defaultDays)
+	}
+	return nil
 }
 
 func envStr(key, def string) string {

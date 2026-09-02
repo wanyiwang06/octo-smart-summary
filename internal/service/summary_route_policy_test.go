@@ -216,23 +216,6 @@ func TestDeriveSummaryRoute(t *testing.T) {
 			want: SummaryRouteClarification,
 		},
 		{
-			name: "current preview can be saved",
-			in: SummaryRouteInput{
-				Action:              SummaryActionSavePreview,
-				HasCurrentPreview:   true,
-				PreviewScopeMatches: true,
-			},
-			want: SummaryRouteAgentPreviewSave,
-		},
-		{
-			name: "stale preview cannot be saved",
-			in: SummaryRouteInput{
-				Action:            SummaryActionSavePreview,
-				HasCurrentPreview: true,
-			},
-			want: SummaryRouteClarification,
-		},
-		{
 			name: "hard missing data overrides all routes",
 			in: SummaryRouteInput{
 				Intent:                     SummaryIntentGenerate,

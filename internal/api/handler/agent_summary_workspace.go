@@ -3,7 +3,6 @@ package handler
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -1112,19 +1111,6 @@ func hasExplicitSummaryRunIntent(message string) bool {
 		"prepare a team summary", "run the summary", "summarize")
 }
 
-func hasExplicitWorkspaceRunIntent(message string, template *summaryWorkspaceTemplate) bool {
-	if template == nil {
-		return hasExplicitSummaryRunIntent(message)
-	}
-
-	normalizedMessage := strings.TrimSpace(message)
-	normalizedRequirement := strings.TrimSpace(template.Requirement)
-	if normalizedRequirement != "" && normalizedMessage == normalizedRequirement {
-		return true
-	}
-	return hasExplicitSummaryExecutionCommand(message)
-}
-
 var summaryWorkspaceExecutionCommands = []string{
 	"开始总结", "直接生成总结", "立即生成总结", "发起总结", "发起多人总结", "准备多人总结任务",
 	"请根据当前选择生成总结", "请根据当前选择准备多人总结任务",
@@ -1272,14 +1258,6 @@ func summaryWorkspaceExecutionRequirement(contextValue summaryWorkspaceContext, 
 		parts = append(parts, requirement)
 	}
 	return strings.Join(parts, "\n\n")
-}
-
-func summaryWorkspaceRequirement(context summaryWorkspaceContext, message string) string {
-	origin, _ := normalizeSummaryWorkspaceInputOrigin("", context, message)
-	if requirement := summaryWorkspaceExecutionRequirement(context, message, origin); requirement != "" {
-		return requirement
-	}
-	return "请按“概览、关键进展与结论、风险与未决问题、行动项”组织总结；仅在消息中有依据时填写负责人和截止时间"
 }
 
 func summaryWorkspaceAssumptions(context summaryWorkspaceContext) []string {
@@ -1671,14 +1649,6 @@ func summaryWorkspaceOrigin(context summaryWorkspaceContext) (string, int) {
 	}
 }
 
-func newSummaryWorkspaceProposalToken() (string, error) {
-	raw := make([]byte, 24)
-	if _, err := rand.Read(raw); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(raw), nil
-}
-
 func (w *summaryWorkspaceCoordinator) validateParticipants(ctx context.Context, spaceID, actorID string, participants []summaryWorkspaceParticipant) (bool, error) {
 	if len(participants) == 0 {
 		return true, nil
@@ -1900,14 +1870,6 @@ func parseWorkspaceProposalVersion(value string) (int, error) {
 		return 0, errors.New("invalid proposal version")
 	}
 	return version, nil
-}
-
-func writeWorkspaceServiceError(c *gin.Context, err error) {
-	httpStatus, code, message, _, data := classifySummaryWorkspaceServiceError(err, "summary workspace failed")
-	if httpStatus >= http.StatusInternalServerError {
-		log.Printf("[summary-workspace] service error: %v", err)
-	}
-	c.JSON(httpStatus, apiResponse{Code: code, Message: message, Data: data})
 }
 
 func (w *summaryWorkspaceCoordinator) stateFromSnapshot(ctx context.Context, snapshot WorkspaceSnapshot) (summaryWorkspaceState, error) {
@@ -2174,12 +2136,3 @@ func (w *summaryWorkspaceCoordinator) historyFromSnapshot(ctx context.Context, s
 		State:           state,
 	}, nil
 }
-
-// compile-time references kept close to the orchestration file; the concrete
-// endpoint methods are below once the persistence store has acquired/replay
-// semantics available.
-var (
-	_ = fmt.Sprintf
-	_ = middleware.GetUserID
-	_ = agent.SummaryResultAgentPreview
-)

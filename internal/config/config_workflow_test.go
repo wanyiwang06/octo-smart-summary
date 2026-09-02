@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -83,6 +84,35 @@ func TestLoad_WorkflowConfigs(t *testing.T) {
 			t.Errorf("TokenizerHTTPTimeout = %d, want 20", cfg.TokenizerHTTPTimeout)
 		}
 	})
+}
+
+func TestValidateSummaryTimeRanges(t *testing.T) {
+	tests := []struct {
+		name        string
+		defaultDays int
+		maxDays     int
+		wantError   string
+	}{
+		{name: "valid defaults", defaultDays: 31, maxDays: 90},
+		{name: "equal values", defaultDays: 31, maxDays: 31},
+		{name: "non-positive default", defaultDays: 0, maxDays: 90, wantError: "DEFAULT_TIME_RANGE_DAYS"},
+		{name: "non-positive max", defaultDays: 31, maxDays: 0, wantError: "MAX_TIME_RANGE_DAYS"},
+		{name: "max below default", defaultDays: 31, maxDays: 7, wantError: "greater than or equal"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateSummaryTimeRanges(tt.defaultDays, tt.maxDays)
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("error = %v, want substring %q", err, tt.wantError)
+			}
+		})
+	}
 }
 
 func TestResolveSkipMapReduceThreshold(t *testing.T) {

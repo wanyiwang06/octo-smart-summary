@@ -174,23 +174,6 @@ func TestHasExplicitSummaryRunIntent(t *testing.T) {
 	}
 }
 
-func TestTemplateAutofillOnlyRunsWorkflowBeforeUserEdits(t *testing.T) {
-	template := &summaryWorkspaceTemplate{
-		TemplateID:  "weekly",
-		Label:       "周报",
-		Requirement: "总结项目进展，按进展、风险和下一步整理",
-	}
-	if !hasExplicitWorkspaceRunIntent(template.Requirement, template) {
-		t.Fatal("unchanged template requirement must authorize the configured workflow")
-	}
-	if hasExplicitWorkspaceRunIntent(template.Requirement+"，只看研发团队", template) {
-		t.Fatal("edited template requirement must return to Agent preview")
-	}
-	if !hasExplicitWorkspaceRunIntent("直接生成总结：只看研发团队", template) {
-		t.Fatal("an explicit execution command must still authorize the workflow")
-	}
-}
-
 func TestExplicitExecutionCommandOverridesExistingPreviewWithoutHijackingRevision(t *testing.T) {
 	if !hasExplicitSummaryExecutionCommand("开始总结") ||
 		!hasExplicitSummaryExecutionCommand("发起多人总结：按风险排序") ||
@@ -205,23 +188,6 @@ func TestExplicitExecutionCommandOverridesExistingPreviewWithoutHijackingRevisio
 	}
 	if got := classifySummaryWorkspaceIntent("请总结得更简洁", true); got != service.SummaryIntentRevise {
 		t.Fatalf("revision intent=%q", got)
-	}
-}
-
-func TestSummaryWorkspaceRequirementOmitsGeneratedExecutionMessage(t *testing.T) {
-	template := &summaryWorkspaceTemplate{
-		TemplateID:  "weekly",
-		Label:       "周报",
-		Requirement: "按进展、风险和下一步输出",
-	}
-	if got := summaryWorkspaceRequirement(summaryWorkspaceContext{Template: template}, "请根据当前选择生成总结"); got != template.Requirement {
-		t.Fatalf("template requirement = %q, want %q", got, template.Requirement)
-	}
-	if got := summaryWorkspaceRequirement(summaryWorkspaceContext{}, "Prepare a team summary task from the current selection"); got != "请按“概览、关键进展与结论、风险与未决问题、行动项”组织总结；仅在消息中有依据时填写负责人和截止时间" {
-		t.Fatalf("default team requirement = %q", got)
-	}
-	if got := summaryWorkspaceRequirement(summaryWorkspaceContext{Template: template}, "重点关注延期风险"); got != template.Requirement+"\n\n重点关注延期风险" {
-		t.Fatalf("custom requirement = %q", got)
 	}
 }
 

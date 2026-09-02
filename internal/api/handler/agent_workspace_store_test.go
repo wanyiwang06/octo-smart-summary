@@ -164,7 +164,7 @@ func TestAgentWorkspaceStorePreviewReplayAndScopeInvalidation(t *testing.T) {
 	}
 }
 
-func TestAgentWorkspaceStoreProposalAndPreviewSaveGuards(t *testing.T) {
+func TestAgentWorkspaceStoreProposalToken(t *testing.T) {
 	db := newWorkspaceStoreTestDB(t)
 	store := NewAgentWorkspaceStore(db)
 	key := WorkspaceSessionKey{SpaceID: "space-1", UserID: "user-1", SessionID: "session-2"}
@@ -196,16 +196,6 @@ func TestAgentWorkspaceStoreProposalAndPreviewSaveGuards(t *testing.T) {
 	}
 	if snapshot.Session.PendingProposalVersion != 1 || snapshot.Session.PendingProposalToken == "" {
 		t.Fatalf("proposal not signed: %#v", snapshot.Session)
-	}
-	if _, err := store.ValidateProposal(context.Background(), WorkspaceProposalValidation{
-		Key: key, ProposalVersion: 1, ProposalToken: snapshot.Session.PendingProposalToken, ScopeVersion: 1,
-	}); err != nil {
-		t.Fatalf("validate proposal: %v", err)
-	}
-	if _, err := store.ValidateProposal(context.Background(), WorkspaceProposalValidation{
-		Key: key, ProposalVersion: 1, ProposalToken: "wrong", ScopeVersion: 1,
-	}); !errors.Is(err, ErrWorkspaceProposalStale) {
-		t.Fatalf("wrong token err=%v", err)
 	}
 }
 

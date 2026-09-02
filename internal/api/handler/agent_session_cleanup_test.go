@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -96,8 +97,8 @@ func TestRunOnce_expiredSessionCleaned(t *testing.T) {
 		return
 	}
 	// session A: 最后一条 25h 前 → 过期,该清
-	seedMsg(t, db, "session-A", "user-1", "user", time.Now().Add(-30*time.Hour))
-	seedMsg(t, db, "session-A", "user-1", "assistant", time.Now().Add(-25*time.Hour))
+	seedMsg(t, db, "session-A", "user-1", "user", timezone.Now().Add(-30*time.Hour))
+	seedMsg(t, db, "session-A", "user-1", "assistant", timezone.Now().Add(-25*time.Hour))
 
 	runOnce(db)
 
@@ -112,8 +113,8 @@ func TestRunOnce_freshSessionUntouched(t *testing.T) {
 		return
 	}
 	// session B: 最后一条 1h 前 → 活跃,不动
-	seedMsg(t, db, "session-B", "user-1", "user", time.Now().Add(-2*time.Hour))
-	seedMsg(t, db, "session-B", "user-1", "assistant", time.Now().Add(-1*time.Hour))
+	seedMsg(t, db, "session-B", "user-1", "user", timezone.Now().Add(-2*time.Hour))
+	seedMsg(t, db, "session-B", "user-1", "assistant", timezone.Now().Add(-1*time.Hour))
 
 	runOnce(db)
 
@@ -128,7 +129,7 @@ func TestRunOnce_borderline23_9hUntouched(t *testing.T) {
 		return
 	}
 	// session C: 最后一条 23h55min 前 → 还没到 24h,不动
-	seedMsg(t, db, "session-C", "user-1", "user", time.Now().Add(-23*time.Hour-55*time.Minute))
+	seedMsg(t, db, "session-C", "user-1", "user", timezone.Now().Add(-23*time.Hour-55*time.Minute))
 
 	runOnce(db)
 
@@ -146,8 +147,8 @@ func TestRunOnce_mixedFreshAndOldSessionPartiallyPreserved(t *testing.T) {
 		return
 	}
 	// session D: 有老消息 (30h 前) 也有新消息 (1h 前) → 整段 session 应保留
-	seedMsg(t, db, "session-D", "user-1", "user", time.Now().Add(-30*time.Hour))
-	seedMsg(t, db, "session-D", "user-1", "assistant", time.Now().Add(-1*time.Hour))
+	seedMsg(t, db, "session-D", "user-1", "user", timezone.Now().Add(-30*time.Hour))
+	seedMsg(t, db, "session-D", "user-1", "assistant", timezone.Now().Add(-1*time.Hour))
 
 	runOnce(db)
 
@@ -161,10 +162,10 @@ func TestRunOnce_multipleSessionsIsolated(t *testing.T) {
 	if skip {
 		return
 	}
-	seedMsg(t, db, "session-old", "user-1", "user", time.Now().Add(-48*time.Hour))
-	seedMsg(t, db, "session-old", "user-1", "assistant", time.Now().Add(-40*time.Hour))
-	seedMsg(t, db, "session-new", "user-1", "user", time.Now().Add(-30*time.Minute))
-	seedMsg(t, db, "session-new", "user-1", "assistant", time.Now().Add(-10*time.Minute))
+	seedMsg(t, db, "session-old", "user-1", "user", timezone.Now().Add(-48*time.Hour))
+	seedMsg(t, db, "session-old", "user-1", "assistant", timezone.Now().Add(-40*time.Hour))
+	seedMsg(t, db, "session-new", "user-1", "user", timezone.Now().Add(-30*time.Minute))
+	seedMsg(t, db, "session-new", "user-1", "assistant", timezone.Now().Add(-10*time.Minute))
 
 	runOnce(db)
 
@@ -182,8 +183,8 @@ func TestRunOnce_expiredWorkspaceMessagesPreserved(t *testing.T) {
 		return
 	}
 
-	seedMsgInSpace(t, db, "space-1", "workspace-old", "user-1", "user", time.Now().Add(-30*time.Hour))
-	seedMsgInSpace(t, db, "space-1", "workspace-old", "user-1", "assistant", time.Now().Add(-25*time.Hour))
+	seedMsgInSpace(t, db, "space-1", "workspace-old", "user-1", "user", timezone.Now().Add(-30*time.Hour))
+	seedMsgInSpace(t, db, "space-1", "workspace-old", "user-1", "assistant", timezone.Now().Add(-25*time.Hour))
 
 	runOnce(db)
 
@@ -200,8 +201,8 @@ func TestRunOnce_legacyAndWorkspaceMessagesSameTupleIsolated(t *testing.T) {
 
 	// A fresh workspace message must neither be deleted nor keep the stale
 	// Legacy tuple alive when both reuse the same owner/session identifiers.
-	seedMsg(t, db, "shared-session", "user-1", "user", time.Now().Add(-30*time.Hour))
-	seedMsgInSpace(t, db, "space-1", "shared-session", "user-1", "assistant", time.Now().Add(-1*time.Hour))
+	seedMsg(t, db, "shared-session", "user-1", "user", timezone.Now().Add(-30*time.Hour))
+	seedMsgInSpace(t, db, "space-1", "shared-session", "user-1", "assistant", timezone.Now().Add(-1*time.Hour))
 
 	runOnce(db)
 
@@ -243,10 +244,10 @@ func TestRunOnce_sameSessionIDDifferentUsers_scopedByOwner(t *testing.T) {
 	}
 
 	// Two users share the same session_id literal, both idle > 24h.
-	seedMsg(t, db, "sess-shared", "user-alice", "user", time.Now().Add(-30*time.Hour))
-	seedMsg(t, db, "sess-shared", "user-alice", "assistant", time.Now().Add(-25*time.Hour))
-	seedMsg(t, db, "sess-shared", "user-bob", "user", time.Now().Add(-40*time.Hour))
-	seedMsg(t, db, "sess-shared", "user-bob", "assistant", time.Now().Add(-26*time.Hour))
+	seedMsg(t, db, "sess-shared", "user-alice", "user", timezone.Now().Add(-30*time.Hour))
+	seedMsg(t, db, "sess-shared", "user-alice", "assistant", timezone.Now().Add(-25*time.Hour))
+	seedMsg(t, db, "sess-shared", "user-bob", "user", timezone.Now().Add(-40*time.Hour))
+	seedMsg(t, db, "sess-shared", "user-bob", "assistant", timezone.Now().Add(-26*time.Hour))
 
 	runOnce(db)
 
@@ -272,11 +273,11 @@ func TestRunOnce_sameSessionIDDifferentUsers_activeTuplePreserved(t *testing.T) 
 	}
 
 	// Alice: idle > 24h → must be cleaned.
-	seedMsg(t, db, "sess-shared", "user-alice", "user", time.Now().Add(-30*time.Hour))
-	seedMsg(t, db, "sess-shared", "user-alice", "assistant", time.Now().Add(-25*time.Hour))
+	seedMsg(t, db, "sess-shared", "user-alice", "user", timezone.Now().Add(-30*time.Hour))
+	seedMsg(t, db, "sess-shared", "user-alice", "assistant", timezone.Now().Add(-25*time.Hour))
 	// Bob: last message 1h ago → must be untouched.
-	seedMsg(t, db, "sess-shared", "user-bob", "user", time.Now().Add(-2*time.Hour))
-	seedMsg(t, db, "sess-shared", "user-bob", "assistant", time.Now().Add(-1*time.Hour))
+	seedMsg(t, db, "sess-shared", "user-bob", "user", timezone.Now().Add(-2*time.Hour))
+	seedMsg(t, db, "sess-shared", "user-bob", "assistant", timezone.Now().Add(-1*time.Hour))
 
 	runOnce(db)
 
@@ -318,7 +319,7 @@ func countEvidence(t *testing.T, db *gorm.DB, userID, sessionID string) int64 {
 
 func seedWorkspaceSession(t *testing.T, db *gorm.DB, spaceID, userID, sessionID string) {
 	t.Helper()
-	now := time.Now()
+	now := timezone.Now()
 	pendingProposalJSON := "{}"
 	if err := db.Create(&model.AgentSummarySession{
 		SpaceID:             spaceID,
@@ -350,7 +351,7 @@ func TestRunOnce_expiredEvidenceCleaned(t *testing.T) {
 		return
 	}
 	// evidence-A: 30h old → expired → should be cleaned
-	seedEvidence(t, db, "user-1", "session-A", "msg_u1_1", time.Now().Add(-30*time.Hour))
+	seedEvidence(t, db, "user-1", "session-A", "msg_u1_1", timezone.Now().Add(-30*time.Hour))
 
 	runOnce(db)
 
@@ -368,7 +369,7 @@ func TestRunOnce_freshEvidenceUntouched(t *testing.T) {
 		return
 	}
 	// evidence-B: 1h old → fresh → keep
-	seedEvidence(t, db, "user-1", "session-B", "msg_u1_2", time.Now().Add(-1*time.Hour))
+	seedEvidence(t, db, "user-1", "session-B", "msg_u1_2", timezone.Now().Add(-1*time.Hour))
 
 	runOnce(db)
 
@@ -383,7 +384,7 @@ func TestRunOnce_expiredEvidenceReferencedByWorkspacePreserved(t *testing.T) {
 		return
 	}
 
-	seedEvidence(t, db, "user-1", summaryWorkspaceAgentSessionID("space-1", "workspace-session", 1), "msg_u1_3", time.Now().Add(-30*time.Hour))
+	seedEvidence(t, db, "user-1", summaryWorkspaceAgentSessionID("space-1", "workspace-session", 1), "msg_u1_3", timezone.Now().Add(-30*time.Hour))
 	seedWorkspaceSession(t, db, "space-1", "user-1", "workspace-session")
 
 	runOnce(db)
@@ -400,8 +401,8 @@ func TestRunOnce_workspaceEvidenceProtectionScopedByOwner(t *testing.T) {
 	}
 
 	internalSessionID := summaryWorkspaceAgentSessionID("space-1", "shared-session", 1)
-	seedEvidence(t, db, "user-1", internalSessionID, "msg_u1_4", time.Now().Add(-30*time.Hour))
-	seedEvidence(t, db, "user-2", internalSessionID, "msg_u2_2", time.Now().Add(-30*time.Hour))
+	seedEvidence(t, db, "user-1", internalSessionID, "msg_u1_4", timezone.Now().Add(-30*time.Hour))
+	seedEvidence(t, db, "user-2", internalSessionID, "msg_u2_2", timezone.Now().Add(-30*time.Hour))
 	seedWorkspaceSession(t, db, "space-1", "user-1", "shared-session")
 
 	runOnce(db)
@@ -425,12 +426,13 @@ func TestRunOnce_expiredWorkspaceSessionAndEvidenceCleaned(t *testing.T) {
 	if err := db.Where("space_id = ? AND user_id = ? AND session_id = ?", "space-1", "user-1", "workspace-expired").Take(&session).Error; err != nil {
 		t.Fatalf("load workspace session: %v", err)
 	}
-	expiredAt := time.Now().Add(-time.Hour)
-	if err := db.Model(&session).Updates(map[string]interface{}{"expires_at": expiredAt, "updated_at": time.Now().Add(-summaryWorkspaceRetention - time.Hour)}).Error; err != nil {
+	now := timezone.Now()
+	expiredAt := now.Add(-time.Hour)
+	if err := db.Model(&session).Updates(map[string]interface{}{"expires_at": expiredAt, "updated_at": now.Add(-summaryWorkspaceRetention - time.Hour)}).Error; err != nil {
 		t.Fatalf("expire workspace session: %v", err)
 	}
-	seedMsgInSpace(t, db, "space-1", "workspace-expired", "user-1", "assistant", time.Now().Add(-48*time.Hour))
-	seedEvidence(t, db, "user-1", session.AgentSessionID, "msg_workspace_expired", time.Now().Add(-48*time.Hour))
+	seedMsgInSpace(t, db, "space-1", "workspace-expired", "user-1", "assistant", now.Add(-48*time.Hour))
+	seedEvidence(t, db, "user-1", session.AgentSessionID, "msg_workspace_expired", now.Add(-48*time.Hour))
 	if err := db.Create(&model.AgentSummaryTurn{
 		SpaceID: "space-1", UserID: "user-1", SessionID: "workspace-expired", RequestID: "req-1",
 		RequestHash: "hash", ScopeVersion: 1, Status: "completed", CreatedAt: expiredAt, UpdatedAt: expiredAt,
@@ -463,12 +465,13 @@ func TestRunOnce_activeWorkspaceSessionPreserved(t *testing.T) {
 	if err := db.Where("space_id = ? AND user_id = ? AND session_id = ?", "space-1", "user-1", "workspace-active").Take(&session).Error; err != nil {
 		t.Fatalf("load workspace session: %v", err)
 	}
-	future := time.Now().Add(time.Hour)
+	now := timezone.Now()
+	future := now.Add(time.Hour)
 	if err := db.Model(&session).Update("expires_at", future).Error; err != nil {
 		t.Fatalf("extend workspace session: %v", err)
 	}
-	seedMsgInSpace(t, db, "space-1", "workspace-active", "user-1", "assistant", time.Now().Add(-48*time.Hour))
-	seedEvidence(t, db, "user-1", session.AgentSessionID, "msg_workspace_active", time.Now().Add(-48*time.Hour))
+	seedMsgInSpace(t, db, "space-1", "workspace-active", "user-1", "assistant", now.Add(-48*time.Hour))
+	seedEvidence(t, db, "user-1", session.AgentSessionID, "msg_workspace_active", now.Add(-48*time.Hour))
 
 	runOnce(db)
 
@@ -480,6 +483,86 @@ func TestRunOnce_activeWorkspaceSessionPreserved(t *testing.T) {
 	}
 	if got := countEvidence(t, db, "user-1", session.AgentSessionID); got != 1 {
 		t.Errorf("active workspace evidence = %d, want 1", got)
+	}
+}
+
+func TestDeleteExpiredWorkspaceSessionState_RechecksRenewalAfterScan(t *testing.T) {
+	db, skip := newCleanupTestDB(t)
+	if skip {
+		return
+	}
+
+	now := timezone.Now()
+	seedWorkspaceSession(t, db, "space-1", "user-1", "workspace-renewed")
+	var session model.AgentSummarySession
+	if err := db.Where("space_id = ? AND user_id = ? AND session_id = ?", "space-1", "user-1", "workspace-renewed").Take(&session).Error; err != nil {
+		t.Fatalf("load workspace session: %v", err)
+	}
+	if err := db.Model(&session).Updates(map[string]interface{}{
+		"expires_at": now.Add(-time.Minute),
+		"updated_at": now.Add(-summaryWorkspaceRetention - time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("expire workspace session: %v", err)
+	}
+
+	// Simulate BeginTurn renewing the row after the cleanup scan captured its ID
+	// but before the deletion transaction locks and re-checks it.
+	if err := db.Model(&session).Updates(map[string]interface{}{
+		"expires_at": now.Add(time.Hour),
+		"updated_at": now,
+	}).Error; err != nil {
+		t.Fatalf("renew workspace session: %v", err)
+	}
+	deleted, err := deleteExpiredWorkspaceSessionState(db, session.ID, now, now.Add(-summaryWorkspaceRetention))
+	if err != nil {
+		t.Fatalf("delete expired workspace session: %v", err)
+	}
+	if deleted {
+		t.Fatal("renewed workspace session must not be deleted")
+	}
+	if got := countModelRows(t, db, &model.AgentSummarySession{}, "id = ?", session.ID); got != 1 {
+		t.Fatalf("renewed workspace sessions = %d, want 1", got)
+	}
+}
+
+func TestDeleteExpiredWorkspaceSessionState_PreservesLiveTurnLease(t *testing.T) {
+	db, skip := newCleanupTestDB(t)
+	if skip {
+		return
+	}
+
+	now := timezone.Now()
+	seedWorkspaceSession(t, db, "space-1", "user-1", "workspace-live-turn")
+	var session model.AgentSummarySession
+	if err := db.Where("space_id = ? AND user_id = ? AND session_id = ?", "space-1", "user-1", "workspace-live-turn").Take(&session).Error; err != nil {
+		t.Fatalf("load workspace session: %v", err)
+	}
+	leaseUntil := now.Add(time.Minute)
+	turn := model.AgentSummaryTurn{
+		SpaceID: "space-1", UserID: "user-1", SessionID: "workspace-live-turn", RequestID: "request-live-turn",
+		RequestHash: "hash", ScopeVersion: 1, Status: "running", Attempt: 1, LeaseExpiresAt: &leaseUntil,
+		CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute),
+	}
+	if err := db.Create(&turn).Error; err != nil {
+		t.Fatalf("seed live workspace turn: %v", err)
+	}
+	if err := db.Model(&session).Updates(map[string]interface{}{
+		"active_turn_id": turn.ID,
+		"expires_at":     now.Add(-time.Minute),
+		"updated_at":     now.Add(-summaryWorkspaceRetention - time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("expire workspace session with live turn: %v", err)
+	}
+
+	deleted, err := deleteExpiredWorkspaceSessionState(db, session.ID, now, now.Add(-summaryWorkspaceRetention))
+	if err != nil {
+		t.Fatalf("delete expired workspace session: %v", err)
+	}
+	if deleted {
+		t.Fatal("workspace session with a live turn lease must not be deleted")
+	}
+	if got := countModelRows(t, db, &model.AgentSummarySession{}, "id = ?", session.ID); got != 1 {
+		t.Fatalf("workspace sessions with live turn = %d, want 1", got)
 	}
 }
 
@@ -501,8 +584,8 @@ func TestRunOnce_evidenceOwnerScoped(t *testing.T) {
 		return
 	}
 	// user-1's evidence expired, user-2's still fresh; same session_id literal
-	seedEvidence(t, db, "user-1", "shared-session", "msg_u1_3", time.Now().Add(-30*time.Hour))
-	seedEvidence(t, db, "user-2", "shared-session", "msg_u2_1", time.Now().Add(-1*time.Hour))
+	seedEvidence(t, db, "user-1", "shared-session", "msg_u1_3", timezone.Now().Add(-30*time.Hour))
+	seedEvidence(t, db, "user-2", "shared-session", "msg_u2_1", timezone.Now().Add(-1*time.Hour))
 
 	runOnce(db)
 
