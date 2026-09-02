@@ -83,13 +83,6 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 		// session_id. See handler/agent_summary.go.
 		v1.POST("/summaries/batch-status", taskH.BatchStatus)
 		v1.GET("/summaries", taskH.ListSummaries)
-		// Poll-friendly badge endpoint: same numbers GET /summaries returns
-		// alongside its page, without the page rendering cost. Registered as a
-		// static sibling of /summaries/:id, which gin's radix tree accepts
-		// (a static segment is matched before the wildcard at the same position),
-		// so "attention" can never be swallowed as an :id. Add ?fresh=1 to bypass
-		// the short-lived response cache after a user action.
-		v1.GET("/summaries/attention", taskH.GetAttention)
 		v1.GET("/summaries/:id", taskH.GetSummary)
 		v1.POST("/summaries/:id/shares", shareH.Create)
 		v1.GET("/summary-shares/:share_id", shareH.Get)

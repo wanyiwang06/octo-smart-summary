@@ -173,18 +173,32 @@ func (c *attentionCache) put(key attentionCacheKey, counts attentionCounts) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.now()
+	// Refreshing an existing key must never wipe the entire cache. Without
+	// this short-circuit a put at capacity flushes all live entries.
+	if _, exists := c.entries[key]; exists {
+		c.entries[key] = attentionCacheEntry{counts: counts, expiresAt: now.Add(c.ttl)}
+		return
+	}
 	if len(c.entries) >= maxAttentionCacheEntries {
 		for k, e := range c.entries {
 			if !now.Before(e.expiresAt) {
 				delete(c.entries, k)
 			}
 		}
-		// Still full: every entry is live, so there is no "least valuable"
-		// one to pick without tracking extra metadata. Reset wholesale. The
-		// only cost is that the next poll of each dropped key re-queries,
-		// and the cap is high enough that this is a pathological case.
+		// Still full: every entry is live, so evict the one closest to
+		// expiry rather than resetting wholesale.
 		if len(c.entries) >= maxAttentionCacheEntries {
-			c.entries = make(map[attentionCacheKey]attentionCacheEntry)
+			var oldestK attentionCacheKey
+			var oldestT time.Time
+			first := true
+			for k, e := range c.entries {
+				if first || e.expiresAt.Before(oldestT) {
+					oldestK = k
+					oldestT = e.expiresAt
+					first = false
+				}
+			}
+			delete(c.entries, oldestK)
 		}
 	}
 	c.entries[key] = attentionCacheEntry{counts: counts, expiresAt: now.Add(c.ttl)}

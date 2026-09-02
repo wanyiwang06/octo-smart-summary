@@ -2,39 +2,49 @@ package router
 
 import (
 	"net/http"
-	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
 // GET /api/v1/summaries/attention is a static sibling of the /summaries/:id
-// wildcard. gin's radix tree panics at REGISTRATION time on a shape it cannot
-// represent, so building the real router is the assertion that the two routes
-// coexist; serving one request each then proves "attention" is not swallowed as
-// an :id and that the endpoint is mounted behind the human-token group (not the
-// bot group, which must stay a read-only bot surface).
+// wildcard. Assert against the route table rather than response codes: the auth
+// middleware returns 401 before routing matters, so a response-code test cannot
+// distinguish "route exists" from "route is missing and falls through to :id".
+// A route-table assertion proves the handler binding and that the endpoint is
+// not mounted on the bot group.
 func TestAttentionRouteCoexistsWithSummaryIDRoute(t *testing.T) {
 	r := SetupPublic(nil, nil, nil, nil, fixedBotResolver{}, "", 0, false, 0, nil, "", "", "", 0, 0, nil)
 
-	for _, path := range []string{
-		"/api/v1/summaries/attention",
-		"/api/v1/summaries/42",
-	} {
-		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, path, nil)
-		r.ServeHTTP(w, req)
-		// No token -> the auth middleware rejects before any handler runs.
-		// A 404 here would mean the route is not registered at all.
-		if w.Code != http.StatusUnauthorized {
-			t.Fatalf("%s: expected 401 from the human-token guard, got %d: %s", path, w.Code, w.Body.String())
+	routes := r.Routes()
+
+	// The attention endpoint must be bound to GetAttention on the human-token
+	// group, not swallowed by the /summaries/:id wildcard.
+	found := false
+	for _, rt := range routes {
+		if rt.Method == http.MethodGet && rt.Path == "/api/v1/summaries/attention" {
+			if !strings.Contains(rt.Handler, "GetAttention") {
+				t.Fatalf("GET /api/v1/summaries/attention is bound to %s, not GetAttention", rt.Handler)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("GET /api/v1/summaries/attention is not registered")
+	}
+
+	// /summaries/:id must still resolve to GetSummary, not GetAttention.
+	for _, rt := range routes {
+		if rt.Method == http.MethodGet && rt.Path == "/api/v1/summaries/:id" {
+			if !strings.Contains(rt.Handler, "GetSummary") {
+				t.Fatalf("GET /api/v1/summaries/:id is bound to %s, not GetSummary", rt.Handler)
+			}
 		}
 	}
 
-	// The bot surface must NOT gain the new endpoint.
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/bot/summaries/attention", nil)
-	req.Header.Set("Authorization", "Bearer irrelevant")
-	r.ServeHTTP(w, req)
-	if w.Code == http.StatusOK {
-		t.Fatalf("the attention endpoint must not be mounted on the bot group: %d %s", w.Code, w.Body.String())
+	// The bot surface must NOT gain the attention endpoint.
+	for _, rt := range routes {
+		if strings.HasPrefix(rt.Path, "/api/v1/bot/") && strings.Contains(rt.Handler, "GetAttention") {
+			t.Fatalf("attention endpoint must not be mounted on the bot surface: %s", rt.Path)
+		}
 	}
 }

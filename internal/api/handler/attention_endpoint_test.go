@@ -46,10 +46,9 @@ func parseAttentionCounts(t *testing.T, w *httptest.ResponseRecorder) attentionC
 }
 
 // setupAttentionRouter mounts the attention endpoint next to the list endpoint
-// AND next to the /summaries/:id wildcard. Registering the static sibling here
-// is itself an assertion: gin panics at registration time on a route tree it
-// cannot represent, so a regression in the route shape fails every test in this
-// file rather than only at server start.
+// AND next to the /summaries/:id wildcard. gin's radix tree gives static
+// segments priority over wildcards at the same position regardless of
+// registration order, so both routes resolve correctly.
 func setupAttentionRouter(h *TaskHandler) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -156,7 +155,7 @@ func TestGetAttention_MatchesListSummaries(t *testing.T) {
 	}
 	list := parseAttentionList(t, lw)
 
-	aw := doRequest(r, http.MethodGet, "/api/v1/summaries/attention", "participant1")
+	aw := doRequest(r, http.MethodGet, "/api/v1/summaries/attention?fresh=1", "participant1")
 	if aw.Code != http.StatusOK {
 		t.Fatalf("attention: expected 200, got %d: %s", aw.Code, aw.Body.String())
 	}
