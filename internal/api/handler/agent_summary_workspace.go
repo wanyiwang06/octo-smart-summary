@@ -313,9 +313,9 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	var snapshot WorkspaceSnapshot
 	switch route {
 	case service.SummaryRoutePersonalWorkflow:
-		snapshot, err = h.completePersonalWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req, contextValue)
+		snapshot, err = h.completeWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req.RequestID, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin), service.SummaryWorkflowPersonal)
 	case service.SummaryRouteTeamWorkflow:
-		snapshot, err = h.completeTeamWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req.RequestID, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin))
+		snapshot, err = h.completeWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req.RequestID, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin), service.SummaryWorkflowTeam)
 	case service.SummaryRouteTeamConfirmation:
 		snapshot, err = h.completeWorkspaceProposal(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req, contextValue)
 	case service.SummaryRouteAgentPreview, service.SummaryRouteAgentRevision, service.SummaryRouteExplanation:
@@ -366,8 +366,18 @@ func workspaceConversationMessages(userMessage, reply string, scopeVersion int, 
 	}
 }
 
-func (h *AgentChatHandler) completeWorkspaceConversation(ctx context.Context, key WorkspaceSessionKey, turnID int64, attempt int, req agentChatRequest, resultType, reply string) (WorkspaceSnapshot, error) {
-	payload, err := json.Marshal(agent.SummaryResponsePayload{ResultType: resultType, Reply: reply})
+func (h *AgentChatHandler) completeWorkspaceResponse(
+	ctx context.Context,
+	key WorkspaceSessionKey,
+	turnID int64,
+	attempt int,
+	userMessage string,
+	scopeVersion int,
+	response agent.SummaryResponsePayload,
+	proposal *WorkspaceProposalMutation,
+	workflow *WorkspaceWorkflowMutation,
+) (WorkspaceSnapshot, error) {
+	payload, err := json.Marshal(response)
 	if err != nil {
 		return WorkspaceSnapshot{}, err
 	}
@@ -375,11 +385,20 @@ func (h *AgentChatHandler) completeWorkspaceConversation(ctx context.Context, ke
 		Key:             key,
 		TurnID:          turnID,
 		Attempt:         attempt,
-		Messages:        workspaceConversationMessages(req.Message, reply, req.ScopeVersion, resultType, payload),
-		ResultType:      resultType,
+		Messages:        workspaceConversationMessages(userMessage, response.Reply, scopeVersion, response.ResultType, payload),
+		ResultType:      response.ResultType,
 		ResponsePayload: payload,
-		ScopeVersion:    req.ScopeVersion,
+		ScopeVersion:    scopeVersion,
+		Proposal:        proposal,
+		Workflow:        workflow,
 	})
+}
+
+func (h *AgentChatHandler) completeWorkspaceConversation(ctx context.Context, key WorkspaceSessionKey, turnID int64, attempt int, req agentChatRequest, resultType, reply string) (WorkspaceSnapshot, error) {
+	return h.completeWorkspaceResponse(ctx, key, turnID, attempt, req.Message, req.ScopeVersion, agent.SummaryResponsePayload{
+		ResultType: resultType,
+		Reply:      reply,
+	}, nil, nil)
 }
 
 func (h *AgentChatHandler) completeWorkspaceProposal(ctx context.Context, key WorkspaceSessionKey, turnID int64, attempt int, req agentChatRequest, contextValue summaryWorkspaceContext) (WorkspaceSnapshot, error) {
@@ -402,95 +421,20 @@ func (h *AgentChatHandler) completeWorkspaceProposal(ctx context.Context, key Wo
 		return WorkspaceSnapshot{}, err
 	}
 	reply := fmt.Sprintf("已整理好协作要求，将邀请 %d 位参与者。请确认后发起协作。", len(contextValue.Participants))
-	payload, err := json.Marshal(agent.SummaryResponsePayload{
-		ResultType:      agent.SummaryResultWorkflowConfirmation,
+	return h.completeWorkspaceResponse(ctx, key, turnID, attempt, req.Message, req.ScopeVersion, agent.SummaryResponsePayload{
+		ResultType:      workspaceResultWorkflowConfirm,
 		Reply:           reply,
 		ExecutionTarget: "team_workflow",
 		Confirmation:    map[string]json.RawMessage{"proposal": proposalJSON},
-	})
-	if err != nil {
-		return WorkspaceSnapshot{}, err
-	}
-	return h.workspace.store.CompleteTurn(ctx, WorkspaceTurnCompletion{
-		Key:             key,
-		TurnID:          turnID,
-		Attempt:         attempt,
-		Messages:        workspaceConversationMessages(req.Message, reply, req.ScopeVersion, workspaceResultWorkflowConfirm, payload),
-		ResultType:      workspaceResultWorkflowConfirm,
-		ResponsePayload: payload,
-		ScopeVersion:    req.ScopeVersion,
-		Proposal:        &WorkspaceProposalMutation{JSON: proposalJSON},
-	})
+	}, &WorkspaceProposalMutation{JSON: proposalJSON}, nil)
 }
 
-func (h *AgentChatHandler) completePersonalWorkspaceWorkflow(ctx context.Context, key WorkspaceSessionKey, turnID int64, attempt int, req agentChatRequest, contextValue summaryWorkspaceContext) (WorkspaceSnapshot, error) {
-	timeRange, err := workspaceWorkflowTimeRange(contextValue)
-	if err != nil {
-		return WorkspaceSnapshot{}, err
-	}
-	originID, originType := summaryWorkspaceOrigin(contextValue)
-	created, err := h.workspace.workflow.CreatePersonalFromAgent(ctx, service.AgentCreateSummaryWorkflowInput{
-		ActorID:           key.UserID,
-		SpaceID:           key.SpaceID,
-		Title:             summaryWorkspaceTitle(contextValue),
-		Requirement:       summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin),
-		TimeRange:         timeRange,
-		Sources:           summaryWorkspaceSources(contextValue),
-		OriginChannelID:   originID,
-		OriginChannelType: originType,
-		IdempotencyKey:    req.RequestID,
-	})
-	if err != nil {
-		return WorkspaceSnapshot{}, err
-	}
-	if created.WorkerTrigger != nil {
-		go func(trigger model.WorkerTriggerRequest) {
-			if triggerErr := h.workspace.triggerWorker(trigger); triggerErr != nil {
-				log.Printf("[summary-workspace] worker trigger failed task=%d: %v", trigger.TaskID, triggerErr)
-			}
-		}(*created.WorkerTrigger)
-	}
-	resultType := workspaceResultWorkflowStarted
-	reply := "已开始生成总结，完成后会自动保存。"
-	saved := false
-	terminal := false
-	if created.Task.Status == model.StatusCompleted {
-		resultType = workspaceResultWorkflowCompleted
-		reply = "总结已生成并自动保存。"
-		saved = true
-		terminal = true
-	}
-	payload, err := json.Marshal(agent.SummaryResponsePayload{
-		ResultType:      resultType,
-		Reply:           reply,
-		ExecutionTarget: "personal_workflow",
-		Workflow: &agent.SummaryResponseWorkflow{
-			TaskID: created.Task.ID,
-			Status: strconv.Itoa(created.Task.Status),
-			Saved:  saved,
-		},
-	})
-	if err != nil {
-		return WorkspaceSnapshot{}, err
-	}
-	return h.workspace.store.CompleteTurn(ctx, WorkspaceTurnCompletion{
-		Key:             key,
-		TurnID:          turnID,
-		Attempt:         attempt,
-		Messages:        workspaceConversationMessages(req.Message, reply, req.ScopeVersion, resultType, payload),
-		ResultType:      resultType,
-		ResponsePayload: payload,
-		ScopeVersion:    req.ScopeVersion,
-		Workflow:        &WorkspaceWorkflowMutation{TaskID: created.Task.ID, Scope: "personal", Terminal: terminal},
-	})
-}
-
-// completeTeamWorkspaceWorkflow is shared by the direct workbench route and
-// the legacy proposal-confirm endpoint. The workflow service owns durable task
-// idempotency; the workspace store then folds the returned task into the exact
-// turn that initiated it. A retry after task creation but before turn folding
-// therefore reuses the task instead of inviting participants twice.
-func (h *AgentChatHandler) completeTeamWorkspaceWorkflow(
+// completeWorkspaceWorkflow is shared by personal, direct-team, and legacy
+// proposal-confirm routes. The workflow service owns durable task idempotency;
+// the workspace store folds the returned task into the exact initiating turn.
+// A retry after task creation therefore reuses the task instead of dispatching
+// the worker or inviting participants twice.
+func (h *AgentChatHandler) completeWorkspaceWorkflow(
 	ctx context.Context,
 	key WorkspaceSessionKey,
 	turnID int64,
@@ -500,25 +444,41 @@ func (h *AgentChatHandler) completeTeamWorkspaceWorkflow(
 	scopeVersion int,
 	contextValue summaryWorkspaceContext,
 	requirement string,
+	target service.SummaryWorkflowTarget,
 ) (WorkspaceSnapshot, error) {
 	timeRange, err := workspaceWorkflowTimeRange(contextValue)
 	if err != nil {
 		return WorkspaceSnapshot{}, err
 	}
 	originID, originType := summaryWorkspaceOrigin(contextValue)
-	created, err := h.workspace.workflow.CreateTeamFromAgent(ctx, service.AgentCreateSummaryWorkflowInput{
-		ActorID:             key.UserID,
-		SpaceID:             key.SpaceID,
-		Title:               summaryWorkspaceTitle(contextValue),
-		Requirement:         strings.TrimSpace(requirement),
-		TimeRange:           timeRange,
-		Sources:             summaryWorkspaceSources(contextValue),
-		Participants:        summaryWorkspaceParticipants(contextValue, key.UserID),
-		ConfirmTimeoutHours: 24,
-		OriginChannelID:     originID,
-		OriginChannelType:   originType,
-		IdempotencyKey:      idempotencyKey,
-	})
+	input := service.AgentCreateSummaryWorkflowInput{
+		ActorID:           key.UserID,
+		SpaceID:           key.SpaceID,
+		Title:             summaryWorkspaceTitle(contextValue),
+		Requirement:       strings.TrimSpace(requirement),
+		TimeRange:         timeRange,
+		Sources:           summaryWorkspaceSources(contextValue),
+		OriginChannelID:   originID,
+		OriginChannelType: originType,
+		IdempotencyKey:    idempotencyKey,
+	}
+	workflowScope := "personal"
+	startedReply := "已开始生成总结，完成后会自动保存。"
+	completedReply := "总结已生成并自动保存。"
+	var created service.CreateSummaryWorkflowResult
+	switch target {
+	case service.SummaryWorkflowPersonal:
+		created, err = h.workspace.workflow.CreatePersonalFromAgent(ctx, input)
+	case service.SummaryWorkflowTeam:
+		input.Participants = summaryWorkspaceParticipants(contextValue, key.UserID)
+		input.ConfirmTimeoutHours = 24
+		created, err = h.workspace.workflow.CreateTeamFromAgent(ctx, input)
+		workflowScope = "team"
+		startedReply = fmt.Sprintf("已发起 %d 人协作总结。", len(contextValue.Participants))
+		completedReply = "团队总结已完成并自动保存。"
+	default:
+		return WorkspaceSnapshot{}, fmt.Errorf("unsupported summary workflow target %q", target)
+	}
 	if err != nil {
 		return WorkspaceSnapshot{}, err
 	}
@@ -530,38 +490,25 @@ func (h *AgentChatHandler) completeTeamWorkspaceWorkflow(
 		}(*created.WorkerTrigger)
 	}
 	resultType := workspaceResultWorkflowStarted
-	reply := fmt.Sprintf("已发起 %d 人协作总结。", len(contextValue.Participants))
-	terminal := false
+	reply := startedReply
 	saved := false
+	terminal := false
 	if created.Task.Status == model.StatusCompleted {
 		resultType = workspaceResultWorkflowCompleted
-		reply = "团队总结已完成并自动保存。"
-		terminal = true
+		reply = completedReply
 		saved = true
+		terminal = true
 	}
-	payload, err := json.Marshal(agent.SummaryResponsePayload{
+	return h.completeWorkspaceResponse(ctx, key, turnID, attempt, userMessage, scopeVersion, agent.SummaryResponsePayload{
 		ResultType:      resultType,
 		Reply:           reply,
-		ExecutionTarget: "team_workflow",
+		ExecutionTarget: string(target),
 		Workflow: &agent.SummaryResponseWorkflow{
 			TaskID: created.Task.ID,
 			Status: strconv.Itoa(created.Task.Status),
 			Saved:  saved,
 		},
-	})
-	if err != nil {
-		return WorkspaceSnapshot{}, err
-	}
-	return h.workspace.store.CompleteTurn(ctx, WorkspaceTurnCompletion{
-		Key:             key,
-		TurnID:          turnID,
-		Attempt:         attempt,
-		Messages:        workspaceConversationMessages(userMessage, reply, scopeVersion, resultType, payload),
-		ResultType:      resultType,
-		ResponsePayload: payload,
-		ScopeVersion:    scopeVersion,
-		Workflow:        &WorkspaceWorkflowMutation{TaskID: created.Task.ID, Scope: "team", Terminal: terminal},
-	})
+	}, nil, &WorkspaceWorkflowMutation{TaskID: created.Task.ID, Scope: workflowScope, Terminal: terminal})
 }
 
 func workspacePersistAgentMessages(messages []agent.Message, resultType string, payload json.RawMessage, scopeVersion, snapshotVersion, parentMessageID int) []WorkspacePersistMessage {
@@ -938,9 +885,10 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 	}
 	contextValue.Participants = append([]summaryWorkspaceParticipant(nil), proposal.Participants...)
 	workflowIdempotencyKey := workspaceMutationRequestID("workflow", fmt.Sprintf("%s:%d", req.ProposalToken, proposalVersion))
-	snapshot, err := h.completeTeamWorkspaceWorkflow(
+	snapshot, err := h.completeWorkspaceWorkflow(
 		c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt,
 		workflowIdempotencyKey, "确认并发起协作", req.ScopeVersion, contextValue, proposal.Requirement,
+		service.SummaryWorkflowTeam,
 	)
 	if err != nil {
 		failTurn("WORKFLOW_CREATE_FAILED")

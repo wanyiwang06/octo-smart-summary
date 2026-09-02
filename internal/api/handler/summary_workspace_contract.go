@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
@@ -16,14 +17,14 @@ const (
 	summaryWorkspaceContractVersion = "1"
 	summaryWorkspaceProfile         = "summary_workspace"
 
-	workspaceResultClarification        = "clarification"
-	workspaceResultExplanation          = "explanation"
-	workspaceResultWorkflowConfirm      = "workflow_confirmation"
-	workspaceResultWorkflowStarted      = "workflow_started"
-	workspaceResultWorkflowCompleted    = "workflow_completed"
-	workspaceResultAgentPreview         = "agent_preview"
-	workspaceResultAgentRevision        = "agent_revision"
-	workspaceResultError                = "error"
+	workspaceResultClarification        = agent.SummaryResultClarification
+	workspaceResultExplanation          = agent.SummaryResultExplanation
+	workspaceResultWorkflowConfirm      = agent.SummaryResultWorkflowConfirmation
+	workspaceResultWorkflowStarted      = agent.SummaryResultWorkflowStarted
+	workspaceResultWorkflowCompleted    = agent.SummaryResultWorkflowCompleted
+	workspaceResultAgentPreview         = agent.SummaryResultAgentPreview
+	workspaceResultAgentRevision        = agent.SummaryResultAgentRevision
+	workspaceResultError                = agent.SummaryResultError
 	workspaceActionConfirmWorkflow      = "confirm_workflow"
 	workspaceActionSavePreview          = "save_preview"
 	workspaceActionViewSummary          = "view_summary"
