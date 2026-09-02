@@ -28,6 +28,19 @@
 //	   closes it by construction: the guarded names live here, and re-running the
 //	   generator finds new members.
 //
+// Rule C is NFKC-only, so it cannot reach traditional/simplified Han variants — those
+// are listed explicitly in guardedTagVariants and merged into the same table. See that
+// declaration for why the derived set needs a hand-listed supplement in exactly this
+// one place.
+//
+// The generated set covers the DECLARED MECHANICAL POLICY above — NFKC equivalence
+// plus two Unicode-name heuristics — not every visually confusable character. A rune
+// that looks angle-like but whose name matches neither heuristic (U+22D6 LESS-THAN
+// WITH DOT, arrowhead modifier letters) is out of scope by construction and is
+// accepted residual: such runes are distinct tokens that do not read as a bare fence.
+// This is a policy boundary, not an exhaustive-confusables claim; widening the policy
+// means editing the rules here and re-running, which is the point of deriving it.
+//
 // "ANGLE QUOTATION MARK" counts as an angle bracket for rule B: U+2039/U+203A
 // (‹›) and U+276E/U+276F (❮❯) are named as quotation marks but render as bare
 // angle brackets, so a reader — and a model — sees `‹/引用数据›` as the fence.
@@ -46,8 +59,18 @@ import (
 	"golang.org/x/text/unicode/runenames"
 )
 
-// excluded name fragments: decorated, enclosed, or composite glyphs that do not
-// render as a bare delimiter, plus REVERSE SOLIDUS which is a different character.
+// excluded name fragments: glyphs whose names match the angle/solidus heuristics but
+// that do not read as a bare delimiter, plus REVERSE SOLIDUS which is a different
+// character.
+//
+// The rule here is "exclude when the decoration changes what a reader sees as the
+// token", NOT "exclude everything decorated". `《》` (DOUBLE ANGLE) is out because two
+// chevrons do not read as one bracket, and enclosed/circled forms are out because the
+// enclosure dominates the glyph. But `⦑` (LEFT ANGLE BRACKET WITH DOT), `⫽` (DOUBLE
+// SOLIDUS OPERATOR) and `⹊` (DOTTED SOLIDUS) ARE kept: the dot or the doubling does
+// not stop them reading as a bracket or a slash. Erring inclusive is the safe
+// direction here — a false positive costs one substituted rune inside a tag pattern,
+// a false negative is a fence escape.
 var excluded = []string{
 	"OVERLAY", "CIRCLE", "CIRCLED", "SQUARED", "APL ", "MUSICAL", "OCR ",
 	"MODIFIER", "KANGXI", "TAG ", "INTEGRAL", "PRECEDING", "DOUBLE ANGLE",
@@ -65,6 +88,28 @@ var excluded = []string{
 // guard. Keep in sync with the newFenceGuard call sites;
 // TestFenceTagNameFoldsCoverGuardedNames pins it.
 var guardedTagNames = []string{"引用数据"}
+
+// guardedTagVariants are additional SPELLINGS of a guarded name that rule C cannot
+// reach, listed explicitly.
+//
+// Rule C is NFKC-preimage only, and traditional/simplified Han variants are not
+// NFKC-equivalent: `數` is not a compatibility form of `数`. So re-running the
+// generator can never discover `引用數據`, and the PR's own thesis — that a
+// hand-written list is a set the attacker picks from the complement — applies to the
+// derived set too. For a CJK tag name in a Chinese-language product, 繁/简 variants
+// are the most obvious member of that complement: copying a traditional spelling
+// takes no effort and no knowledge.
+//
+// These are folded ONTO the canonical runes, so they join the same in-pattern
+// alternation as the NFKC preimages. TestFenceGuardHanVariantsAreGuarded pins them.
+//
+// This list is a DECISION, not a derivation, and it is the one place in this file
+// that is. It is small and it is stated; the alternative was leaving a documented
+// hole for the most likely spelling an attacker would reach for.
+var guardedTagVariants = map[string]string{
+	"數": "数", // U+6578 traditional 'number'
+	"據": "据", // U+64DA traditional 'according to'
+}
 
 type entry struct {
 	r         rune
@@ -140,6 +185,24 @@ func main() {
 	}
 
 	sort.Slice(entries, func(i, j int) bool { return entries[i].r < entries[j].r })
+
+	// Merge the explicitly-listed Han variants into the tag-name entries. They cannot
+	// be derived (see guardedTagVariants), so they are appended and then sorted with
+	// the derived ones — the table stays a single ordered list regardless of origin,
+	// and the `rule` column records which mechanism produced each row.
+	for from, to := range guardedTagVariants {
+		fromRunes := []rune(from)
+		toRunes := []rune(to)
+		if len(fromRunes) != 1 || len(toRunes) != 1 {
+			fmt.Fprintf(os.Stderr, "guardedTagVariants: %q -> %q must both be single runes\n", from, to)
+			os.Exit(1)
+		}
+		if !nameRunes[toRunes[0]] {
+			fmt.Fprintf(os.Stderr, "guardedTagVariants: %q folds to %q, which is not in any guarded tag name\n", from, to)
+			os.Exit(1)
+		}
+		nameEntries = append(nameEntries, entry{fromRunes[0], to, "Han-variant", runenames.Name(fromRunes[0])})
+	}
 	sort.Slice(nameEntries, func(i, j int) bool { return nameEntries[i].r < nameEntries[j].r })
 
 	var buf bytes.Buffer

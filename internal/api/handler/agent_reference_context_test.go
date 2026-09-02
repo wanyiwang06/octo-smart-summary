@@ -45,15 +45,15 @@ func TestSanitizeRef(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := sanitizeRef(c.in)
+			got := sanitizeRefLine(c.in)
 			for _, a := range c.absent {
 				if strings.Contains(got, a) {
-					t.Errorf("sanitizeRef(%q) still contains forbidden %q: got %q", c.in, a, got)
+					t.Errorf("sanitizeRefLine(%q) still contains forbidden %q: got %q", c.in, a, got)
 				}
 			}
 			for _, p := range c.present {
 				if !strings.Contains(got, p) {
-					t.Errorf("sanitizeRef(%q) dropped expected %q: got %q", c.in, p, got)
+					t.Errorf("sanitizeRefLine(%q) dropped expected %q: got %q", c.in, p, got)
 				}
 			}
 		})
@@ -275,14 +275,14 @@ func TestSanitizeRef_ControlChars(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := sanitizeRef(c.in)
+			got := sanitizeRefLine(c.in)
 			for _, a := range c.absent {
 				if strings.Contains(got, a) {
-					t.Errorf("sanitizeRef(%q) still contains %q: got %q", c.in, a, got)
+					t.Errorf("sanitizeRefLine(%q) still contains %q: got %q", c.in, a, got)
 				}
 			}
 			if c.want != "" && got != c.want {
-				t.Errorf("sanitizeRef(%q) = %q, want %q", c.in, got, c.want)
+				t.Errorf("sanitizeRefLine(%q) = %q, want %q", c.in, got, c.want)
 			}
 		})
 	}
@@ -378,12 +378,12 @@ func TestSanitizeRef_FenceReassembly(t *testing.T) {
 		refDataOpen + "</引用数据>",
 	}
 	for _, p := range payloads {
-		got := sanitizeRef(p)
+		got := sanitizeRefLine(p)
 		if strings.Contains(got, refDataOpen) {
-			t.Errorf("sanitizeRef(%q) still contains refDataOpen: got %q", p, got)
+			t.Errorf("sanitizeRefLine(%q) still contains refDataOpen: got %q", p, got)
 		}
 		if strings.Contains(got, refDataClose) {
-			t.Errorf("sanitizeRef(%q) still contains refDataClose: got %q", p, got)
+			t.Errorf("sanitizeRefLine(%q) still contains refDataClose: got %q", p, got)
 		}
 	}
 }

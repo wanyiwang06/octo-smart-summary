@@ -41,14 +41,43 @@ import (
 // PLACE — one rune substituted for one rune, nothing removed:
 //
 //   - headPattern matches an opener adjacent to the tag name, with no closing `>`
-//     required, and replaces every `<` in the match with `[`. It therefore needs no
-//     length bounds anywhere, which means there is no attacker-selectable number to
-//     pad past to reach the model unchanged.
+//     required, and replaces every opener rune in the match with `[`. It therefore
+//     carries NO length bound and NO line-break exclusion, which is what makes it a
+//     true fallback: there is no attacker-selectable number to pad past, and no
+//     padding SHAPE that both passes decline.
 //   - tagPattern is a COSMETIC pass over well-formed tags only. Its character
-//     classes admit nothing but delimiters, separators and the tag name itself, so
-//     it cannot swallow a clause even in principle — the failure mode where a stray
-//     `<` and a `>` two paragraphs later deleted everything between them is not
-//     expressible in this grammar, because the grammar has no "any rune" component.
+//     classes admit nothing but delimiters, separators, zero-width runes and the tag
+//     name itself, so it cannot swallow a clause even in principle — the failure mode
+//     where a stray `<` and a `>` two paragraphs later deleted everything between
+//     them is not expressible in this grammar, because the grammar has no "any rune"
+//     component. Its one bound (fenceMaxSepRun) is a FAITHFULNESS parameter, not a
+//     security boundary: exceeding it declines the cosmetic rewrite and falls to
+//     headPattern, which has no bound at all.
+//
+// The relationship between the two passes is the security argument, so it is stated
+// once here precisely: headPattern's match set is a strict SUPERSET of the openers
+// tagPattern can match. Any shape tagPattern declines — for any reason, including
+// every bound it carries — is still reached by headPattern. An earlier revision
+// broke exactly this property by excluding `\n` from headPattern's pre-name region
+// while allowing it between tag-name runes, which left 32 newline-padded shapes
+// matched by neither pass; TestFenceGuardHeadPassIsTrueFallback pins it now.
+//
+// # Why the delimiter alphabet is matched, not folded
+//
+// Both alphabets — delimiters and tag-name runes — are applied as ALTERNATIONS
+// INSIDE the patterns, never as a global rewrite of the text.
+//
+// This is not a style choice. An earlier revision folded the 31 delimiter homoglyphs
+// globally in normalize(), which rewrote legitimate content: 〈〉 (U+3008/U+3009) are
+// 单书名号, ordinary Chinese punctuation for article and chapter titles, so
+// `推荐阅读〈论持久战〉` came back as `推荐阅读<论持久战>`. Likewise `1⁄2` → `1/2`
+// (U+2044 FRACTION SLASH), `‹bonjour›` → `<bonjour>` (French guillemets), and
+// `︿︿` → `<<` (common CJK IM emoticon eyes). This is a Chinese-language
+// summarizer whose entire job is to reproduce quoted text verbatim, and the mutated
+// text is what the model quotes back to users.
+//
+// Matching more inside a pattern costs the text nothing. Folding globally corrupts
+// it. The coverage is identical either way.
 //
 // There is deliberately no attribute-tail construct and no prose-crossing prefix on
 // the deleting pass. Anything tagPattern declines falls through to headPattern and
@@ -72,14 +101,11 @@ type fenceGuard struct {
 // as a character-class body so it can be embedded with and without negation.
 const fenceWordClass = `\p{L}\p{Nd}`
 
-// fenceLineBreak is the single line-terminator this file has to reason about.
-//
+// The cosmetic pass reasons about a single line terminator, `\n`, because
 // normalize() folds every other line/paragraph separator INTO it (see
-// fenceControlFolds), which is what makes the line-break exclusions below
-// reachable. The predecessor folded them to a SPACE instead, so `\n` was the only
-// terminator any exclusion could actually see and `\u2028` / `\u2029` / `\u0085`
-// slipped past every one of them.
-const fenceLineBreak = `\n`
+// fenceControlFolds). Folding them to a SPACE, as the predecessor did, would make any
+// line-break reasoning unreachable for eight of the nine terminator spellings, and
+// would silently turn a quoted paragraph break into prose.
 
 // Zero-width and separator classes for the gaps BETWEEN tag-name runes.
 //
@@ -110,11 +136,24 @@ const (
 	fenceSepClass     = `[\p{Z}\p{Cc}]`
 	// fenceMaxSepRun bounds the separator run per gap on the COSMETIC pass only.
 	//
-	// It is not a security boundary of the kind an attacker pads past: exceeding it
-	// does not deliver a clean fence, it declines the cosmetic rewrite and falls to
-	// headPattern, which has no bound and neutralizes the opener at any padding
-	// width. What the bound buys is that the cosmetic pass cannot collapse an
-	// arbitrarily long run of blank lines into a 6-rune placeholder.
+	// It is a FAITHFULNESS parameter, not a security boundary, and the distinction is
+	// structural rather than asserted: exceeding it declines the cosmetic rewrite and
+	// falls to headPattern, whose gaps AND pre-name region are both unbounded and both
+	// admit line breaks, so it neutralizes the opener at any padding width or shape.
+	// What the bound buys is that the cosmetic pass cannot collapse an arbitrarily long
+	// run of separators — blank lines included — into a 6-rune placeholder.
+	//
+	// Note that this is the ONLY thing standing between the cosmetic pass and a
+	// paragraph collapse, and it is sufficient: that pass has no unbounded "any rune"
+	// region anywhere, so bounding the separator run bounds everything it can absorb.
+	// An explicit line-break exclusion would be redundant here and actively harmful —
+	// it would decline the cosmetic rewrite for the ordinary `</引用\n数据>` chunk-join
+	// shape and emit the uglier in-place form for it.
+	//
+	// An earlier revision made the "not a security boundary" claim while headPattern's
+	// pre-name region excluded `\n`, which made the fallback conditional and the claim
+	// false for 32 shapes. TestFenceGuardHeadPassIsTrueFallback now pins the property
+	// the claim depends on.
 	fenceMaxSepRun = 2
 )
 
@@ -166,17 +205,35 @@ var fenceGlobalInvisibleKeep = map[string]bool{
 	"\u2068": true, // FIRST STRONG ISOLATE
 	"\u2069": true, // POP DIRECTIONAL ISOLATE
 	"\u061c": true, // ARABIC LETTER MARK
+	// Legacy bidi embeddings/overrides. Deprecated in favour of the isolates above,
+	// but still present in real stored text, and stripping them reorders the visible
+	// string exactly as stripping LRM/RLM does.
+	"\u202a": true, // LEFT-TO-RIGHT EMBEDDING
+	"\u202b": true, // RIGHT-TO-LEFT EMBEDDING
+	"\u202c": true, // POP DIRECTIONAL FORMATTING
+	"\u202d": true, // LEFT-TO-RIGHT OVERRIDE
+	"\u202e": true, // RIGHT-TO-LEFT OVERRIDE
+	// Invisible mathematical operators carry SEMANTICS rather than layout: U+2061 is
+	// function application and U+2062 an implied multiplication sign, so removing them
+	// changes what a quoted formula MEANS, not how it renders.
+	"\u2061": true, // FUNCTION APPLICATION
+	"\u2062": true, // INVISIBLE TIMES
+	"\u2063": true, // INVISIBLE SEPARATOR
+	"\u2064": true, // INVISIBLE PLUS
 }
 
 // fenceControlFolds collapse the separators that would otherwise let a tag straddle
 // a line or record boundary invisibly.
 //
-// Line and paragraph separators fold to `\n`, NOT to a space. That direction is the
-// whole point: the patterns below exclude line breaks so a fence tag cannot span
-// paragraphs, and folding U+2028/U+2029/U+0085 to a space would make those
-// exclusions unreachable for every terminator except `\n` — a guard whose stated
-// property held for one of nine spellings. Tab and NUL fold to a space because they
-// are not line breaks.
+// Line and paragraph separators fold to `\n`, NOT to a space. Two reasons, and the
+// second is why the direction matters: it keeps a quoted paragraph break a paragraph
+// break instead of silently turning it into prose, and it collapses nine terminator
+// spellings into one so nothing downstream has to enumerate them. Tab and NUL fold to
+// a space because they are not line breaks.
+//
+// Note what is NOT here any more: the delimiter homoglyphs. Folding those globally
+// rewrote legitimate content (〈〉 单书名号, `1⁄2`, `‹bonjour›`, `︿︿`), so they are
+// matched in-pattern instead — see fenceDelimClass and the type docstring.
 var fenceControlFolds = []string{
 	"\r\n", "\n",
 	"\r", "\n",
@@ -189,9 +246,74 @@ var fenceControlFolds = []string{
 	"\x00", " ",
 }
 
-var fenceDelimiterReplacer = strings.NewReplacer(
-	append(append([]string{}, fenceDelimiterFolds...), fenceControlFolds...)...,
+var fenceControlReplacer = strings.NewReplacer(fenceControlFolds...)
+
+// fenceDelimiterFoldMap inverts the generated fenceDelimiterFolds pairs into
+// canonical-delimiter -> {homoglyph runes}. Built once at init.
+var fenceDelimiterFoldMap = func() map[rune][]rune {
+	m := map[rune][]rune{}
+	for i := 0; i+1 < len(fenceDelimiterFolds); i += 2 {
+		from := []rune(fenceDelimiterFolds[i])
+		to := []rune(fenceDelimiterFolds[i+1])
+		if len(from) != 1 || len(to) != 1 {
+			continue
+		}
+		m[to[0]] = append(m[to[0]], from[0])
+	}
+	return m
+}()
+
+// fenceDelimClass renders one canonical delimiter as a character-class BODY holding
+// itself and every generated homoglyph of it, for embedding inside `[...]`.
+//
+// This is the P1-2 mechanism: the delimiter alphabet is matched here rather than
+// folded across the whole text, for exactly the reason the tag-name alphabet always
+// was. See the type docstring for the content that a global fold corrupted.
+func fenceDelimClass(canonical rune) string {
+	var b strings.Builder
+	b.WriteString(regexp.QuoteMeta(string(canonical)))
+	for _, r := range fenceDelimiterFoldMap[canonical] {
+		b.WriteString(regexp.QuoteMeta(string(r)))
+	}
+	return b.String()
+}
+
+// The three delimiter classes, as character-class bodies and as complete classes.
+//
+// The bodies exist separately so they can be composed into NEGATED classes ("any
+// rune that is not an opener or a word rune") as well as positive ones.
+var (
+	fenceOpenBody  = fenceDelimClass('<')
+	fenceCloseBody = fenceDelimClass('>')
+	fenceSlashBody = fenceDelimClass('/')
+
+	fenceOpenClass  = `[` + fenceOpenBody + `]`
+	fenceCloseClass = `[` + fenceCloseBody + `]`
+	fenceSlashClass = `[` + fenceSlashBody + `]`
+
+	// fenceOpenRunes is the set form, used by neutralizeFenceOpeners to rewrite every
+	// opener SPELLING in a head match, not just ASCII `<`. Once openers are no longer
+	// folded to `<` up front, neutralizing only `<` would leave `⟨引用数据` untouched.
+	fenceOpenRunes = func() map[rune]bool {
+		m := map[rune]bool{'<': true}
+		for _, r := range fenceDelimiterFoldMap['<'] {
+			m[r] = true
+		}
+		return m
+	}()
 )
+
+// fenceContainsOpener reports whether s holds any opener spelling. It replaces the
+// `strings.ContainsRune(s, '<')` fast path, which was only correct while every
+// opener homoglyph was folded to ASCII `<` before matching.
+func fenceContainsOpener(s string) bool {
+	for _, r := range s {
+		if fenceOpenRunes[r] {
+			return true
+		}
+	}
+	return false
+}
 
 // fenceTagNameFoldMap inverts the generated fenceTagNameFolds pairs into
 // canonical-rune -> {homoglyph runes}. Built once at init.
@@ -227,21 +349,23 @@ func fenceTagRuneAlternation(r rune) string {
 	return `(?:` + strings.Join(parts, `|`) + `)`
 }
 
-// fenceOpenNeutralized replaces a `<` that would otherwise open a forged fence.
+// fenceOpenNeutralized replaces an opener that would otherwise open a forged fence.
 //
 // It is exactly one rune, which is what lets the head pass rewrite in place instead
 // of deleting, and it is chosen from OUTSIDE the delimiter alphabet: `[` is not a
 // fold source for `<` in fenceDelimiterFolds, so neutralizing can never manufacture
-// a new opener. It also matches the bracket the placeholder already uses.
+// a new opener. That property now covers 31 generated runes rather than 3, so it is
+// asserted mechanically by TestFenceNeutralizerIsNotAnOpener rather than by reading
+// the table. It also matches the bracket the placeholder already uses.
 const fenceOpenNeutralized = "["
 
 // fenceMaxRewritePasses caps the fixpoint loop.
 //
 // The cap is safe only because the head pass converges in a single pass BY
-// CONSTRUCTION: it neutralizes every `<` inside its own match, including the
-// preserved boundary rune, so its output cannot contain a `<` adjacent to a tag name
-// for a later pass to find. The loop therefore exists only for the cosmetic pass's
-// shortening rewrites, where 2 iterations suffice today.
+// CONSTRUCTION: it neutralizes every opener inside its own match, including the
+// preserved boundary rune, so its output cannot contain an opener adjacent to a tag
+// name for a later pass to find. The loop therefore exists only for the cosmetic
+// pass's shortening rewrites, where 2 iterations suffice today.
 //
 // A cap alone would not be a fix. An unbounded-prefix deleting pass combined with a
 // loop bounded by len(s) makes `"<"*N + tagName` take N/9 full scans — O(N²), and
@@ -270,23 +394,38 @@ func newFenceGuard(tagName string) *fenceGuard {
 	// delete prose — the property is structural rather than a number a test has to
 	// defend. The separator run inside each gap stays capped at fenceMaxSepRun, so the
 	// worst this pass can absorb is a handful of blank lines around a real tag.
-	const fenceTagPad = fenceTagGap + `(?:/` + fenceTagGap + `){0,2}`
+	fenceTagPad := fenceTagGap + `(?:` + fenceSlashClass + fenceTagGap + `){0,2}`
 
-	// The head pass's prefix. Unbounded, because this pass deletes nothing: crossing
-	// more text costs one substituted rune, not a clause. Line breaks stay excluded
-	// for a reason unrelated to deletion — a fence tag is a token, and a token does
-	// not span paragraphs.
+	// The head pass's prefix. Fully unbounded, because this pass deletes nothing:
+	// crossing more text costs one substituted rune, not a clause.
+	//
+	// It deliberately does NOT exclude line breaks. An earlier revision excluded `\n`
+	// here while fenceHeadGap (between tag-name runes) admitted it via \p{Cc}, and that
+	// asymmetry was a containment hole, not a safety margin: `<\n\n\n/引用数据>` and
+	// `<\n///引用数据>` were declined by the cosmetic pass (too many separators / too
+	// many solidi) AND unreachable for the head pass, so they shipped byte-identical —
+	// 32 such shapes, two of which the previous hand-written guard had blocked. Worse,
+	// sanitizeRefLine then folded that `\n` to a space and reconstituted a well-formed
+	// single-line fence.
+	//
+	// Nothing is lost by admitting line breaks here. The rule "a fence tag is a token,
+	// and a token does not span paragraphs" exists to stop a pass from COLLAPSING a
+	// paragraph, and this pass cannot collapse anything — it substitutes one rune for
+	// one rune. On the cosmetic pass, which can shorten, the same protection comes from
+	// fenceMaxSepRun bounding every separator run it may absorb.
 	//
 	// Adjacency decides token identity, which is what keeps ordinary text intact:
 	// `<0引用数据` stays as-is (`0` continues the name), while `<0/引用数据>` is a tag.
-	// Excluding `>` throughout stops a stray `<` reaching across an already-closed tag.
-	const fenceHeadPathNoise = `[^` + fenceWordClass + `>\p{Z}\p{Cc}]*`
-	const fenceHeadDelimNoise = `[^` + fenceWordClass + `>` + fenceLineBreak + `]*`
-	const fenceHeadPrefix = `(?:` + fenceHeadPathNoise + `[` + fenceWordClass + `]+/)*` + fenceHeadDelimNoise
+	// Excluding the closer throughout stops a stray opener reaching across an
+	// already-closed tag.
+	fenceHeadPathNoise := `[^` + fenceWordClass + fenceCloseBody + `\p{Z}\p{Cc}]*`
+	fenceHeadDelimNoise := `[^` + fenceWordClass + fenceCloseBody + `]*`
+	fenceHeadPrefix := `(?:` + fenceHeadPathNoise + `[` + fenceWordClass + `]+` + fenceSlashClass + `)*` + fenceHeadDelimNoise
 
 	return &fenceGuard{
-		tagName:     tagName,
-		tagPattern:  regexp.MustCompile(`<` + fenceTagPad + buildName(fenceTagGap) + fenceTagPad + `>`),
+		tagName: tagName,
+		tagPattern: regexp.MustCompile(
+			fenceOpenClass + fenceTagPad + buildName(fenceTagGap) + fenceTagPad + fenceCloseClass),
 		placeholder: "[" + tagName + "]",
 		// The boundary condition is deliberately NEGATIVE — "the tag name is not
 		// continued by another letter or digit" — rather than an allow-list of
@@ -295,13 +434,16 @@ func newFenceGuard(tagName string) *fenceGuard {
 		// these tag names are CJK, the only thing that makes `<引用数据…` a different
 		// TOKEN is a letter/digit continuation.
 		headPattern: regexp.MustCompile(
-			`<` + fenceHeadPrefix + buildName(fenceHeadGap) + `([^` + fenceWordClass + `]|$)`),
+			fenceOpenClass + fenceHeadPrefix + buildName(fenceHeadGap) + `([^` + fenceWordClass + `]|$)`),
 	}
 }
 
-// normalize folds delimiter homoglyphs and strips globally-safe invisibles.
+// normalize folds control separators and strips globally-safe invisibles.
+//
+// It does NOT fold the delimiter alphabet: those are matched in-pattern, because a
+// global fold rewrote legitimate content. See the type docstring.
 func (g *fenceGuard) normalize(s string) string {
-	s = fenceDelimiterReplacer.Replace(s)
+	s = fenceControlReplacer.Replace(s)
 	return fenceGlobalInvisiblePattern.ReplaceAllStringFunc(s, func(m string) string {
 		if fenceGlobalInvisibleKeep[m] {
 			return m
@@ -315,25 +457,25 @@ func (g *fenceGuard) normalize(s string) string {
 // render at single-value sites fold `\n` to a space themselves, AFTER this runs.
 //
 // That ordering is not incidental. Folding line breaks to spaces before the guard
-// leaves the guard's line-break exclusions unable to see anything, so a tag split
-// across a line boundary is neither matched nor bounded.
+// leaves the cosmetic pass's line-break exclusion unable to see anything, so a tag
+// split across a line boundary is not bounded.
 //
 // Budget invariant relied on by callers that pre-compute a rune budget: this can
-// only ever SHORTEN the text. The cosmetic pass's shortest match `<tagName>` is 2
-// runes longer than tagName and maps to a placeholder exactly 2 runes longer;
-// the head pass substitutes one rune for one rune.
+// never LENGTHEN the text. It is not strictly shortening: the cosmetic pass's
+// shortest match `<tagName>` is 6 runes and maps to a placeholder of exactly 6, and
+// the head pass substitutes one rune for one rune. Non-expansion is the property a
+// caller needs and the only one guaranteed.
 //
 // Both passes run to a FIXPOINT. Preserving the boundary rune is what keeps
-// surrounding text intact, but the boundary rune can itself be a `<`, and then the
-// replacement sits next to it as a fresh tag: `<引用数据<引用数据` leaves
+// surrounding text intact, but the boundary rune can itself be an opener, and then
+// the replacement sits next to it as a fresh tag: `<引用数据<引用数据` leaves
 // `引用数据<引用数据` after one pass — an intact tag, and a violation of idempotence.
 // Looping is the structural answer rather than another pattern edit: it terminates
-// because every rewrite strictly shortens or preserves length while strictly
-// reducing the number of `<` runes.
+// because every rewrite strictly reduces the number of opener runes.
 func (g *fenceGuard) neutralize(s string) string {
 	s = g.normalize(s)
 	for i := 0; i < fenceMaxRewritePasses; i++ {
-		if !strings.ContainsRune(s, '<') {
+		if !fenceContainsOpener(s) {
 			return s
 		}
 		next := g.tagPattern.ReplaceAllString(s, g.placeholder)
@@ -348,13 +490,28 @@ func (g *fenceGuard) neutralize(s string) string {
 	return s
 }
 
-// neutralizeFenceOpeners rewrites one head match in place, replacing every `<` it
-// contains with fenceOpenNeutralized and preserving every other rune.
+// neutralizeFenceOpeners rewrites one head match in place, replacing every OPENER
+// SPELLING it contains with fenceOpenNeutralized and preserving every other rune.
 //
 // Replacing ALL of them, not just the leading one, is what makes the pass idempotent
-// in a single application: the match can contain further `<` runes in its prefix or
-// in the preserved boundary rune, and leaving any of them would hand the next pass a
+// in a single application: the match can contain further openers in its prefix or in
+// the preserved boundary rune, and leaving any of them would hand the next pass a
 // fresh candidate — the `<引用数据<引用数据` shape.
+//
+// Accepted collateral damage, recorded as a decision: the preserved boundary rune is
+// rewritten too, so `<引用数据<br>` becomes `[引用数据[br>`. Markup inside untrusted
+// quoted text is not content this product promises to reproduce, and single-pass
+// idempotence is worth more than that markup. TestFenceGuardBoundaryRuneCollateral
+// pins it.
 func neutralizeFenceOpeners(match string) string {
-	return strings.ReplaceAll(match, "<", fenceOpenNeutralized)
+	var b strings.Builder
+	b.Grow(len(match))
+	for _, r := range match {
+		if fenceOpenRunes[r] {
+			b.WriteString(fenceOpenNeutralized)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

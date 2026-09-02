@@ -44,9 +44,11 @@ var fenceDelimiterFolds = []string{
 // onto those runes (rule C). Without this the tag NAME is matched as exact literal
 // runes, and a homoglyph spelling that is visually identical to a real closing
 // fence reaches the model untouched.
-// Derived from Unicode properties; 1 entries; guarded names: 引用数据.
+// Derived from Unicode properties; 3 entries; guarded names: 引用数据.
 var fenceTagNameFolds = []string{
 	"⽤", "用", // U+2F64 KANGXI RADICAL USE [NFKC-name]
+	"據", "据", // U+64DA <CJK Ideograph> [Han-variant]
+	"數", "数", // U+6578 <CJK Ideograph> [Han-variant]
 }
 
 // fenceGeneratedGuardedTagNames is the generator's view of which guards exist.

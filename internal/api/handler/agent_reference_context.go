@@ -36,24 +36,25 @@ var refFenceGuard = newFenceGuard("引用数据")
 // Derived from the guard so the two cannot drift apart.
 var fencePlaceholder = refFenceGuard.placeholder
 
-// sanitizeRef neutralizes untrusted referenced-summary text before it is
-// embedded in the agent's system prompt (SUM-158 blocker 3 — prompt
-// injection). A referenced summary may quote arbitrary chat content authored
-// by other people, so its text must not be able to (a) close the data fence
-// early, or (b) forge the box-drawing / bracket delimiters this builder uses
-// as section boundaries.
+// sanitizeRefLine and sanitizeRefBlock neutralize untrusted referenced-summary text
+// before it is embedded in the agent's system prompt (SUM-158 blocker 3 — prompt
+// injection). A referenced summary may quote arbitrary chat content authored by other
+// people, so its text must not be able to (a) close the data fence early, or
+// (b) forge the box-drawing / bracket delimiters this builder uses as section
+// boundaries.
 //
-// Newline is replaced with space here because sanitizeRef guards
-// single-value render sites where a forged standalone line matters. For true
-// multi-line bodies (body content) use sanitizeRefBlock which preserves
-// newlines so paragraph formatting is not compressed (P2-9).
-func sanitizeRef(s string) string {
-	return sanitizeRefLine(s)
-}
+// The split between them is about newlines only: single-value render sites fold them
+// to a space, fenced block content preserves them.
 
 // refDelimiterReplacer folds the box-drawing and bracket runes this builder uses as
 // its own section boundaries. It is separate from the fence guard: those are this
 // file's layout characters, not fence syntax.
+//
+// Unlike the fence guard's alphabets this IS a global fold, and that is a deliberate
+// asymmetry: `═ ─ 【 】` are the delimiters THIS builder emits to structure its own
+// output, so an occurrence in untrusted text has to stop looking like one wherever it
+// appears — there is no pattern to match it inside. The fence guard's job is the
+// opposite: identify a specific token and leave everything else byte-identical.
 var refDelimiterReplacer = strings.NewReplacer(
 	"═", "=",
 	"─", "-",
@@ -71,9 +72,24 @@ var refDelimiterReplacer = strings.NewReplacer(
 // so on this path the guard's line-break exclusions had nothing left to see and a
 // tag split across a line boundary was neither matched nor bounded. Since quoted
 // chunks are joined with `\n`, that split needed no effort to produce.
+//
+// The guard then runs a SECOND time, after the fold. This is defence in depth
+// against this function manufacturing its own bypass: the `\n`→space rewrite happens
+// after all matching, so any shape the guard declined because of a line break gets
+// turned into a single-line shape that nothing has inspected. An earlier revision
+// shipped exactly that — `<\n///引用数据>` came back as `< ///引用数据>`, a well-formed
+// forged fence which the same function would have neutralized had it been the input.
+// The root cause was a line-break exclusion in the head pass (now removed), but the
+// second call makes the property local: whatever this function emits has been
+// through the guard in the form it emits it, so it cannot depend on the guard and
+// the fold agreeing about line breaks.
+//
+// The second call is close to free — neutralize's first act is an opener scan that
+// returns immediately when there is none, which is the overwhelmingly common case.
 func sanitizeRefLine(s string) string {
 	s = refFenceGuard.neutralize(s)
 	s = strings.ReplaceAll(s, "\n", " ")
+	s = refFenceGuard.neutralize(s)
 	return refDelimiterReplacer.Replace(s)
 }
 
