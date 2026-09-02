@@ -587,21 +587,9 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 		refContext, _ := buildReferencedSummariesContext(ctx, h.db, key.SpaceID, key.UserID, contextValue.ReferencedTaskIDs)
 		system += refContext
 	}
-	var currentPreview *summaryWorkspacePreview
-	if before.CurrentPreview != nil {
-		content, assumptions, decodeErr := decodeWorkspacePreviewPayload(before.CurrentPreview)
-		if decodeErr != nil {
-			return WorkspaceSnapshot{}, decodeErr
-		}
-		currentPreview = &summaryWorkspacePreview{
-			MessageID:       before.CurrentPreview.ID,
-			ResultType:      before.CurrentPreview.ResultType,
-			ScopeVersion:    before.CurrentPreview.ScopeVersion,
-			ArtifactVersion: before.CurrentPreview.ArtifactVersion,
-			SnapshotVersion: before.CurrentPreview.SnapshotVersion,
-			Content:         content,
-			Assumptions:     assumptions,
-		}
+	currentPreview, err := workspacePreviewFromSnapshot(before)
+	if err != nil {
+		return WorkspaceSnapshot{}, err
 	}
 	system += buildSummaryWorkspaceGuidance(contextValue, route, currentPreview)
 
@@ -1895,24 +1883,11 @@ func (w *summaryWorkspaceCoordinator) stateFromSnapshot(ctx context.Context, sna
 		state.SummaryContext.ReferencedTaskIDs = []int64{}
 	}
 
-	if previewRow := snapshot.CurrentPreview; previewRow != nil && previewRow.ID > 0 {
-		previewContent, assumptions, err := decodeWorkspacePreviewPayload(previewRow)
-		if err != nil {
-			return state, err
-		}
-		saved := previewRow.SavedTaskID > 0 ||
-			(snapshot.Session.LatestPreviewMessageID == previewRow.ID && snapshot.Session.LatestPreviewSavedTaskID > 0)
-		state.CurrentPreview = &summaryWorkspacePreview{
-			MessageID:        previewRow.ID,
-			ResultType:       previewRow.ResultType,
-			ScopeVersion:     previewRow.ScopeVersion,
-			ArtifactVersion:  previewRow.ArtifactVersion,
-			SnapshotVersion:  previewRow.SnapshotVersion,
-			Content:          previewContent,
-			Assumptions:      assumptions,
-			AvailableActions: workspaceActionsForResult(previewRow.ResultType, saved),
-		}
+	preview, err := workspacePreviewFromSnapshot(snapshot)
+	if err != nil {
+		return state, err
 	}
+	state.CurrentPreview = preview
 
 	if snapshot.Session.PendingProposalStatus == "pending" && snapshot.Session.PendingProposalJSON != nil && strings.TrimSpace(*snapshot.Session.PendingProposalJSON) != "" {
 		var proposal summaryWorkspaceProposal
@@ -1979,35 +1954,39 @@ func (w *summaryWorkspaceCoordinator) stateFromSnapshot(ctx context.Context, sna
 	return state, nil
 }
 
-func decodeWorkspacePreviewPayload(message *model.AgentMessage) (string, []string, error) {
-	if message == nil || message.ResponsePayload == nil || strings.TrimSpace(*message.ResponsePayload) == "" {
-		return "", nil, errors.New("workspace preview payload is missing")
+func workspacePreviewFromSnapshot(snapshot WorkspaceSnapshot) (*summaryWorkspacePreview, error) {
+	message := snapshot.CurrentPreview
+	if message == nil || message.ID <= 0 {
+		return nil, nil
+	}
+	if message.ResponsePayload == nil || strings.TrimSpace(*message.ResponsePayload) == "" {
+		return nil, errors.New("workspace preview payload is missing")
 	}
 	var payload agent.SummaryResponsePayload
 	if err := json.Unmarshal([]byte(*message.ResponsePayload), &payload); err != nil {
-		return "", nil, fmt.Errorf("decode workspace preview payload: %w", err)
+		return nil, fmt.Errorf("decode workspace preview payload: %w", err)
 	}
 	if payload.Preview == nil || strings.TrimSpace(payload.Preview.Content) == "" {
-		return "", nil, errors.New("workspace preview content is missing")
+		return nil, errors.New("workspace preview content is missing")
 	}
-	return payload.Preview.Content, append([]string{}, payload.Preview.Assumptions...), nil
-}
-
-func latestWorkspaceAssistant(messages []model.AgentMessage) *model.AgentMessage {
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "assistant" && messages[i].ResultType != "" {
-			return &messages[i]
-		}
-	}
-	return nil
+	saved := message.SavedTaskID > 0 ||
+		(snapshot.Session.LatestPreviewMessageID == message.ID && snapshot.Session.LatestPreviewSavedTaskID > 0)
+	return &summaryWorkspacePreview{
+		MessageID:        message.ID,
+		ResultType:       message.ResultType,
+		ScopeVersion:     message.ScopeVersion,
+		ArtifactVersion:  message.ArtifactVersion,
+		SnapshotVersion:  message.SnapshotVersion,
+		Content:          payload.Preview.Content,
+		Assumptions:      append([]string{}, payload.Preview.Assumptions...),
+		AvailableActions: workspaceActionsForResult(message.ResultType, saved),
+	}, nil
 }
 
 func workspaceMessageByID(messages []model.AgentMessage, id int64) *model.AgentMessage {
-	if id <= 0 {
-		return latestWorkspaceAssistant(messages)
-	}
-	for i := range messages {
-		if messages[i].ID == id {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if (id > 0 && messages[i].ID == id) ||
+			(id <= 0 && messages[i].Role == "assistant" && messages[i].ResultType != "") {
 			return &messages[i]
 		}
 	}
@@ -2058,12 +2037,7 @@ func (w *summaryWorkspaceCoordinator) turnFromSnapshot(ctx context.Context, sess
 	// same artifact as state, so replay the current authoritative artifact
 	// instead of combining a historical result with today's state.
 	if !workspaceMessageMatchesState(message, state) {
-		currentMessageID := workspaceCurrentStateMessageID(state)
-		if currentMessageID > 0 {
-			message = workspaceMessageByID(snapshot.Messages, currentMessageID)
-		} else {
-			message = latestWorkspaceAssistant(snapshot.Messages)
-		}
+		message = workspaceMessageByID(snapshot.Messages, workspaceCurrentStateMessageID(state))
 		if !workspaceMessageMatchesState(message, state) {
 			return summaryWorkspaceTurn{}, errors.New("workspace state does not match response message")
 		}
