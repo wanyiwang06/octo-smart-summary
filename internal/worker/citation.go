@@ -254,14 +254,32 @@ func dedupCitations(text string, citations []model.Citation) (string, []model.Ci
 
 	if len(remap) > 0 {
 		// Replace remapped indexes in text.
-		newText = citationRe.ReplaceAllStringFunc(newText, func(match string) string {
-			sub := citationRe.FindStringSubmatch(match)
-			n, _ := strconv.Atoi(sub[1])
-			if target, ok := remap[n]; ok {
-				return fmt.Sprintf("[%d]", target)
+		//
+		// Index-based, not ReplaceAllStringFunc, so the citation.IsCitableAt
+		// guard can be applied: a numeric markdown link label must keep its
+		// number, or `[1](url)` silently becomes `[2](url)` and points the
+		// reader at a source that says something else.
+		var b strings.Builder
+		b.Grow(len(newText))
+		prev := 0
+		for _, m := range citationRe.FindAllStringSubmatchIndex(newText, -1) {
+			if !citation.IsCitableAt(newText, m[0], m[1]) {
+				continue
 			}
-			return match
-		})
+			n, err := strconv.Atoi(newText[m[2]:m[3]])
+			if err != nil {
+				continue
+			}
+			target, ok := remap[n]
+			if !ok {
+				continue
+			}
+			b.WriteString(newText[prev:m[0]])
+			fmt.Fprintf(&b, "[%d]", target)
+			prev = m[1]
+		}
+		b.WriteString(newText[prev:])
+		newText = b.String()
 
 		// Collapse consecutive identical markers: [1][1][1] -> [1]
 		newText = collapseConsecutiveMarkers(newText)
@@ -269,14 +287,37 @@ func dedupCitations(text string, citations []model.Citation) (string, []model.Ci
 
 	// Global dedup: for each [n], keep only the first occurrence.
 	// Runs after remap so duplicates created by remap are also caught.
-	seen := make(map[string]bool)
-	newText = citationRe.ReplaceAllStringFunc(newText, func(match string) string {
-		if seen[match] {
-			return ""
+	//
+	// Guarded by citation.IsCitableAt for the same reason as the remap pass,
+	// and the failure here was worse: a numeric link label occupying the
+	// FIRST occurrence slot made the dedup delete the genuine citation that
+	// followed it, leaving a claim with a backing citation row and no marker.
+	//
+	//	in:  See [1](https://example.com). Conclusion[1]
+	//	out: See [1](https://example.com). Conclusion      <- citation lost
+	seen := make(map[int]bool)
+	{
+		var b strings.Builder
+		b.Grow(len(newText))
+		prev := 0
+		for _, m := range citationRe.FindAllStringSubmatchIndex(newText, -1) {
+			if !citation.IsCitableAt(newText, m[0], m[1]) {
+				continue
+			}
+			n, err := strconv.Atoi(newText[m[2]:m[3]])
+			if err != nil {
+				continue
+			}
+			if !seen[n] {
+				seen[n] = true
+				continue
+			}
+			b.WriteString(newText[prev:m[0]])
+			prev = m[1]
 		}
-		seen[match] = true
-		return match
-	})
+		b.WriteString(newText[prev:])
+		newText = b.String()
+	}
 	newText = multiSpaceRe.ReplaceAllString(newText, " ")
 	newText = emptyLineRe.ReplaceAllString(newText, "")
 	newText = strings.TrimSpace(newText)
@@ -311,8 +352,20 @@ func dedupCitations(text string, citations []model.Citation) (string, []model.Ci
 // preserved: "[1][2][1]" -> "[1][2][1]".
 //
 // Go's regexp engine (RE2) has no backreferences, so we process manually.
+//
+// Only citable markers participate. A numeric markdown link label is not a
+// citation, so `[1] [1](url)` is not a run and neither occurrence moves; a
+// non-citable marker sitting between two identical citable ones also breaks
+// the run, because the text between them is then not whitespace.
 func collapseConsecutiveMarkers(text string) string {
-	locs := citationRe.FindAllStringIndex(text, -1)
+	all := citationRe.FindAllStringIndex(text, -1)
+	locs := make([][]int, 0, len(all))
+	for _, m := range all {
+		if !citation.IsCitableAt(text, m[0], m[1]) {
+			continue
+		}
+		locs = append(locs, m)
+	}
 	if len(locs) < 2 {
 		return text
 	}

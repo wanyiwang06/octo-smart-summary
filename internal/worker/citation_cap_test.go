@@ -425,3 +425,152 @@ func TestMutationUnguardedStripDestroysMarkdownLinks(t *testing.T) {
 	}
 	t.Logf("MUTATION EVIDENCE: unguarded strip -> %q (link destroyed); guarded strip -> %q", old, got)
 }
+
+// dedupCitations must apply the SAME citation.IsCitableAt guard as CapRuns,
+// Numbers, stripOrphanCitations and extractCitationIndexes.
+//
+// It did not, and the global first-occurrence dedup made that far worse than
+// the strip-path bug fixed above. A numeric markdown link label occupying the
+// FIRST occurrence slot caused the dedup to delete the genuine citation that
+// followed it:
+//
+//	in:  See [1](https://example.com). Conclusion[1]
+//	out: See [1](https://example.com). Conclusion      <- citation lost
+//
+// The body then ends with a backed citation row and zero citable markers, so
+// the claim silently loses its provenance — and dedup runs BEFORE strip and
+// cap in finalizeCitations, so the damage reaches the persisted body.
+func TestDedupCitationsPreservesMarkdownLinks(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		rows []model.Citation
+		want string
+	}{
+		{
+			name: "link label precedes the genuine citation with the same number",
+			in:   "See [1](https://example.com). Conclusion[1]",
+			rows: []model.Citation{{Index: 1, Sender: "a", Content: "x"}},
+			want: "See [1](https://example.com). Conclusion[1]",
+		},
+		{
+			name: "link label follows the genuine citation with the same number",
+			in:   "Conclusion[1]. See [1](https://example.com)",
+			rows: []model.Citation{{Index: 1, Sender: "a", Content: "x"}},
+			want: "Conclusion[1]. See [1](https://example.com)",
+		},
+		{
+			// The blank line collapses via the pre-existing emptyLineRe pass
+			// (pinned by TestDedupCitations_GlobalDuplicate_EmptyLineCleanup),
+			// which is unrelated to the guard. What matters here is that the
+			// reference definition did not consume the first-occurrence slot
+			// and both `[1]` forms survive.
+			name: "reference definition does not consume the first-occurrence slot",
+			in:   "Conclusion[1]\n\n[1]: https://example.com/doc",
+			rows: []model.Citation{{Index: 1, Sender: "a", Content: "x"}},
+			want: "Conclusion[1]\n[1]: https://example.com/doc",
+		},
+		{
+			name: "genuine repeats are still deduplicated",
+			in:   "结论一[1]，结论二[1]",
+			rows: []model.Citation{{Index: 1, Sender: "a", Content: "x"}},
+			want: "结论一[1]，结论二",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := dedupCitations(tc.in, tc.rows)
+			if got != tc.want {
+				t.Errorf("dedupCitations:\n got: %q\nwant: %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The remap pass must not renumber a markdown link label. Rewriting
+// `[1](url)` to `[2](url)` does not merely mangle syntax — it repoints the
+// reader at a different source, which is worse than deleting the link.
+func TestDedupCitationsRemapDoesNotRenumberLinkLabels(t *testing.T) {
+	const in = "See [1](https://example.com) and [2] plus [1]"
+	// Identical (sender, content) => index 2 is remapped onto index 1.
+	rows := []model.Citation{
+		{Index: 1, Sender: "a", Content: "same"},
+		{Index: 2, Sender: "a", Content: "same"},
+	}
+
+	got, _ := dedupCitations(in, rows)
+
+	if !strings.Contains(got, "[1](https://example.com)") {
+		t.Errorf("remap pass rewrote the markdown link label: %q", got)
+	}
+	// The genuine markers: [2] remaps to [1] and is the first CITABLE
+	// occurrence, so it survives; the later duplicate [1] is deduplicated.
+	if want := "See [1](https://example.com) and [1] plus"; got != want {
+		t.Errorf("dedupCitations:\n got: %q\nwant: %q", got, want)
+	}
+	if n := citation.Numbers(got); len(n) != 1 || n[0] != 1 {
+		t.Errorf("expected exactly citable marker [1] to survive, got %v in %q", n, got)
+	}
+}
+
+// collapseConsecutiveMarkers must only collapse CITABLE runs. `[1] [1](url)`
+// is a citation followed by a link that happens to share the number, not a
+// repeated marker, so neither occurrence may be removed.
+func TestCollapseConsecutiveMarkersSkipsLinkLabels(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{
+			name: "citation followed by a same-numbered link label",
+			in:   "结论[1] [1](https://example.com)",
+			want: "结论[1] [1](https://example.com)",
+		},
+		{
+			name: "link label followed by a same-numbered citation",
+			in:   "[1](https://example.com) [1]",
+			want: "[1](https://example.com) [1]",
+		},
+		{
+			name: "genuine consecutive repeats still collapse",
+			in:   "结论[1][1][1]",
+			want: "结论[1]",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := collapseConsecutiveMarkers(tc.in); got != tc.want {
+				t.Errorf("collapseConsecutiveMarkers:\n got: %q\nwant: %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Mutation evidence: the pre-fix dedup, reproduced inline, must destroy the
+// genuine citation. Without this the tests above could pass against an
+// implementation that never had the bug.
+func TestMutationUnguardedDedupEatsGenuineCitation(t *testing.T) {
+	const in = "See [1](https://example.com). Conclusion[1]"
+
+	// Pre-fix global dedup: keyed on the raw match, no IsCitableAt guard.
+	preFix := func(text string) string {
+		seen := map[string]bool{}
+		return citationRe.ReplaceAllStringFunc(text, func(match string) string {
+			if seen[match] {
+				return ""
+			}
+			seen[match] = true
+			return match
+		})
+	}
+
+	old := preFix(in)
+	if len(citation.Numbers(old)) != 0 {
+		t.Fatalf("MUTATION CHECK FAILED: the unguarded dedup kept a citable marker "+
+			"in %q, so this test does not pin the bug", old)
+	}
+
+	got, _ := dedupCitations(in, []model.Citation{{Index: 1, Sender: "a", Content: "x"}})
+	if n := citation.Numbers(got); len(n) != 1 || n[0] != 1 {
+		t.Fatalf("guarded dedup still lost the citation: %q (citable=%v)", got, n)
+	}
+	t.Logf("MUTATION EVIDENCE: unguarded dedup -> %q (citable markers %v); guarded dedup -> %q (citable markers %v)",
+		old, citation.Numbers(old), got, citation.Numbers(got))
+}
