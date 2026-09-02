@@ -42,11 +42,14 @@ type TaskHandler struct {
 	imDB                *gorm.DB
 	workerTriggerURL    string
 	customTemplateLimit int
+	// attentionCache serves the polling endpoint only. See attention.go for
+	// the TTL and the no-invalidation rationale.
+	attentionCache *attentionCache
 }
 
 // NewTaskHandler creates a new TaskHandler.
 func NewTaskHandler(db, imDB *gorm.DB, workerTriggerURL string) *TaskHandler {
-	return &TaskHandler{db: db, imDB: imDB, workerTriggerURL: workerTriggerURL, customTemplateLimit: defaultCustomTemplateLimit}
+	return &TaskHandler{db: db, imDB: imDB, workerTriggerURL: workerTriggerURL, customTemplateLimit: defaultCustomTemplateLimit, attentionCache: newAttentionCache()}
 }
 
 func (h *TaskHandler) SetCustomTemplateLimit(limit int) {
@@ -75,6 +78,38 @@ func (h *TaskHandler) schedulePendingInvitationExpr(taskAlias string) string {
  COLUMNS(user_id VARCHAR(64) PATH '$.user_id', confirmed BOOL PATH '$.confirmed' DEFAULT 'false' ON EMPTY)) sc
  WHERE ss.id=` + taskAlias + `.schedule_id AND ss.deleted_at IS NULL AND ss.is_active=1
  AND ss.confirm_policy=1 AND sc.user_id=? AND sc.confirmed=false)`
+}
+
+// pendingSubmitStatusGuard excludes terminally-dead tasks from the
+// pending-submission signal, for the given summary_task alias.
+//
+// The raw predicate (personal worker_status=Completed AND submitted_at IS NULL
+// AND roster > 1) has no notion of the task's own lifecycle, and two ordinary
+// paths strand a task while a participant's personal result still matches it:
+//
+//  1. the stuck-task reaper flips Processing -> Failed once retry_count is
+//     exhausted (worker/scheduler.go), which is exactly the outcome of the
+//     situation this signal exists to prevent — metaCompletionReady blocks
+//     aggregation until every accepted participant is terminal, so one member
+//     who never submits stalls the task until the reaper kills it;
+//  2. CancelSummary writes status=Cancelled and nothing else.
+//
+// Neither touches summary_personal_result, so the member who *did* generate
+// their summary would keep a red dot — and a non-zero space-level
+// attention_count — for a task nobody can revive (Regenerate and Delete are
+// both creator-gated). A badge that cannot return to zero destroys the
+// credibility of the whole signal, so gate it server-side.
+//
+// Completed is deliberately NOT excluded: a personal-only regenerate on a
+// finished task intentionally leaves submitted_at NULL and waits for an
+// explicit submit (worker/personal_processor.go), so the dot is correct there.
+//
+// The constants are inlined rather than bound as parameters on purpose. Every
+// call site lives in hand-assembled SQL whose arguments are positional; adding
+// two placeholders in four statements is precisely the hazard the ordering
+// comment in ListSummaries warns about.
+func pendingSubmitStatusGuard(taskAlias string) string {
+	return fmt.Sprintf(" AND %s.status NOT IN (%d,%d)", taskAlias, model.StatusFailed, model.StatusCancelled)
 }
 
 // R11 Q2 (owner decision 2026-08-14, option 1): a task whose origin was
@@ -585,7 +620,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 				// yet started, pending task invitations, and pending schedule invitations.
 				// Apply it before pagination to keep totals and pages accurate.
 				statusPendingExpr := h.schedulePendingInvitationExpr("summary_task")
-				whereSQL += " AND (status = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ? AND status = ?) OR EXISTS (SELECT 1 FROM summary_personal_result wait_pr WHERE wait_pr.task_id = summary_task.id AND wait_pr.user_id = ? AND wait_pr.worker_status = ? AND wait_pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id = summary_task.id) > 1) OR " + statusPendingExpr + ")"
+				whereSQL += " AND (status = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ? AND status = ?) OR EXISTS (SELECT 1 FROM summary_personal_result wait_pr WHERE wait_pr.task_id = summary_task.id AND wait_pr.user_id = ? AND wait_pr.worker_status = ? AND wait_pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id = summary_task.id) > 1" + pendingSubmitStatusGuard("summary_task") + ") OR " + statusPendingExpr + ")"
 				args = append(args, v, userID, model.ParticipantPending, userID, model.PersonalStatusCompleted)
 				if h.db.Dialector.Name() == "mysql" {
 					args = append(args, userID)
@@ -658,22 +693,25 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	}
 
 	// Attention is caller-specific. Compute it only after schedule folding, then
-	// sort before pagination. A pending invitation outranks unread content; team
-	// and personal cursors are compared independently because their ids belong to
-	// different tables.
-	attentionJoins := `
- LEFT JOIN summary_user_read sur ON sur.task_id = sub.id AND sur.user_id = ?
- LEFT JOIN summary_result cr ON cr.id = sub.current_result_id AND cr.task_id = sub.id
- LEFT JOIN summary_personal_result pr ON pr.task_id = sub.id AND pr.user_id = ?
- LEFT JOIN summary_personal_result_version pv ON pv.id = pr.current_version_id AND pv.task_id = sub.id AND pv.user_id = ?
- LEFT JOIN summary_participant me ON me.task_id = sub.id AND me.user_id = ?`
+	// sort before pagination. A pending invitation outranks a pending submission,
+	// which outranks unread content; team and personal cursors are compared
+	// independently because their ids belong to different tables.
+	//
+	// All three signals feed needs_attention (the per-card red dot) and
+	// attention_count (the sidebar badge). has_pending_submission is deliberately
+	// NOT cleared by MarkSummaryRead: opening the detail page marks the content
+	// read, but the participant still owes the team an explicit /submit, so the
+	// dot survives until submitted_at is set.
+	// Shared with the attention-count query (attention.go) so the per-card dots
+	// and the badge are computed over identical rows.
+	attentionJoins := attentionJoinsSQL
 	// Schedule-level confirmation lives in participant_config rather than
 	// summary_participant. Expand the V5 roster so these invitations share the
 	// same attention/red-dot semantics as ordinary task invitations.
 	schedulePendingExpr := h.schedulePendingInvitationExpr("sub")
 	attentionSelect := `,
  CASE WHEN me.status = ? OR ` + schedulePendingExpr + ` THEN 1 ELSE 0 END AS has_pending_invitation,
- CASE WHEN pr.worker_status = ? AND pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id = sub.id) > 1 THEN 1 ELSE 0 END AS has_pending_submission,
+ CASE WHEN pr.worker_status = ? AND pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id = sub.id) > 1` + pendingSubmitStatusGuard("sub") + ` THEN 1 ELSE 0 END AS has_pending_submission,
  CASE WHEN (sub.current_result_id IS NOT NULL AND (sur.last_read_team_result_id IS NULL OR sur.last_read_team_result_id <> sub.current_result_id))
         OR (pr.current_version_id IS NOT NULL AND (sur.last_read_personal_version_id IS NULL OR sur.last_read_personal_version_id <> pr.current_version_id))
       THEN 1 ELSE 0 END AS is_unread,
@@ -683,7 +721,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 	      THEN CASE WHEN cr.generated_at >= pv.generated_at THEN cr.generated_at ELSE pv.generated_at END
 	      ELSE COALESCE(cr.generated_at, pv.generated_at, sub.created_at) END AS activity_at`
 	pageSQL := "SELECT sub.*" + attentionSelect + " FROM (" + innerSQL + ") sub" + attentionJoins +
-		" WHERE sub.rn = 1 ORDER BY has_pending_invitation DESC, is_unread DESC, activity_at DESC, " + orderClause + ", sub.id DESC LIMIT ? OFFSET ?"
+		" WHERE sub.rn = 1 ORDER BY has_pending_invitation DESC, has_pending_submission DESC, is_unread DESC, activity_at DESC, " + orderClause + ", sub.id DESC LIMIT ? OFFSET ?"
 	pageArgs := []interface{}{model.ParticipantPending}
 	if h.db.Dialector.Name() == "mysql" {
 		pageArgs = append(pageArgs, userID)
@@ -909,7 +947,7 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 			"is_unread":                    attention.IsUnread,
 			"has_pending_invitation":       attention.HasPendingInvitation,
 			"has_pending_submission":       attention.HasPendingSubmission,
-			"needs_attention":              attention.IsUnread || attention.HasPendingInvitation,
+			"needs_attention":              attention.IsUnread || attention.HasPendingInvitation || attention.HasPendingSubmission,
 			"current_result_id":            attention.ListCurrentResultID,
 			"current_personal_version_id":  attention.CurrentPersonalVersionID,
 			"activity_at":                  attention.ActivityAt,
@@ -919,30 +957,31 @@ func (h *TaskHandler) ListSummaries(c *gin.Context) {
 		})
 	}
 
-	// Counts deliberately ignore the current list filters: the navigation badge
-	// represents all cards that require this user's attention in the space.
-	countInner := "SELECT *, ROW_NUMBER() OVER (PARTITION BY (CASE WHEN schedule_id IS NULL THEN CONCAT('t', id) ELSE CONCAT('s', schedule_id) END) ORDER BY id DESC) AS rn FROM summary_task WHERE space_id = ? AND deleted_at IS NULL AND (creator_id = ? OR id IN (SELECT task_id FROM summary_participant WHERE user_id = ?) OR " + scheduleVisibilityExpr + ")"
-	attentionCountSQL := "SELECT COALESCE(SUM(has_invite),0) pending_invitation_count, COALESCE(SUM(unread),0) unread_count, COALESCE(SUM(CASE WHEN has_invite=1 OR unread=1 THEN 1 ELSE 0 END),0) attention_count FROM (SELECT CASE WHEN me.status=? OR " + schedulePendingExpr + " THEN 1 ELSE 0 END has_invite, CASE WHEN (sub.current_result_id IS NOT NULL AND (sur.last_read_team_result_id IS NULL OR sur.last_read_team_result_id<>sub.current_result_id)) OR (pr.current_version_id IS NOT NULL AND (sur.last_read_personal_version_id IS NULL OR sur.last_read_personal_version_id<>pr.current_version_id)) THEN 1 ELSE 0 END unread FROM (" + countInner + ") sub" + attentionJoins + " WHERE sub.rn=1) attention"
-	var counts struct {
-		AttentionCount         int64 `gorm:"column:attention_count"`
-		UnreadCount            int64 `gorm:"column:unread_count"`
-		PendingInvitationCount int64 `gorm:"column:pending_invitation_count"`
-	}
-	countArgs := []interface{}{model.ParticipantPending}
-	if h.db.Dialector.Name() == "mysql" {
-		countArgs = append(countArgs, userID)
-	}
-	countArgs = append(countArgs, spaceID, userID, userID)
-	if h.db.Dialector.Name() == "mysql" {
-		countArgs = append(countArgs, userID)
-	}
-	countArgs = append(countArgs, userID, userID, userID, userID)
-	if err := h.db.Raw(attentionCountSQL, countArgs...).Scan(&counts).Error; err != nil {
+	// The badge numbers come from the shared helper (attention.go), which owns
+	// the only copy of the attention statistics SQL. Keeping a second copy here
+	// would let the list badge and the polled badge drift apart.
+	//
+	// This path deliberately does NOT read the cache — it has just executed the
+	// full page query anyway, so a cache read could only serve a staler answer
+	// than the rows being rendered right next to it, which is exactly the
+	// inconsistency (dots say one thing, badge another) worth avoiding. It DOES
+	// populate the cache: the value was computed by the same SQL, so it is no
+	// staler than any other write, and it makes the polls that follow a list
+	// load cheap.
+	counts, err := h.attentionCounts(spaceID, userID)
+	if err != nil {
 		log.Printf("list summaries attention count query failed: %v", err)
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "failed to list summaries"})
 		return
 	}
-	ok(c, gin.H{"total": total, "items": items, "attention_count": counts.AttentionCount, "unread_count": counts.UnreadCount, "pending_invitation_count": counts.PendingInvitationCount})
+	// Only the human surface writes the badge cache. A bot ListSummaries
+	// computes the same value (same owner UID, same server-resolved space),
+	// but letting it overwrite the human entry makes it an extra trigger for
+	// stale-set races and couples two independently-authenticated surfaces.
+	if !c.GetBool("bot_request") {
+		h.attentionCachePut(attentionCacheKey{userID: userID, spaceID: spaceID}, counts)
+	}
+	ok(c, gin.H{"total": total, "items": items, "attention_count": counts.AttentionCount, "unread_count": counts.UnreadCount, "pending_invitation_count": counts.PendingInvitationCount, "pending_submission_count": counts.PendingSubmissionCount})
 }
 
 type markSummaryReadRequest struct {
@@ -1002,13 +1041,19 @@ func (h *TaskHandler) MarkSummaryRead(c *gin.Context) {
 		ReadTeamID        *int64 `gorm:"column:read_team_id"`
 		ReadPersonalID    *int64 `gorm:"column:read_personal_id"`
 		PendingInvitation bool   `gorm:"column:pending_invitation"`
+		PendingSubmission bool   `gorm:"column:pending_submission"`
 	}
 	schedulePendingExpr := h.schedulePendingInvitationExpr("t")
+	// pending_submission mirrors the list projection. Marking content read must
+	// NOT clear it: the participant has seen their personal summary but still
+	// owes the team an explicit /submit. Returning it here keeps the client's
+	// optimistic needs_attention recompute from dropping the dot on read.
 	stateSQL := `SELECT t.current_result_id AS current_team_id,
  pr.current_version_id AS current_personal_id,
  sur.last_read_team_result_id AS read_team_id,
  sur.last_read_personal_version_id AS read_personal_id,
- CASE WHEN p.status = ? OR ` + schedulePendingExpr + ` THEN 1 ELSE 0 END AS pending_invitation
+ CASE WHEN p.status = ? OR ` + schedulePendingExpr + ` THEN 1 ELSE 0 END AS pending_invitation,
+ CASE WHEN pr.worker_status = ? AND pr.submitted_at IS NULL AND (SELECT COUNT(*) FROM summary_participant wait_sp WHERE wait_sp.task_id = t.id) > 1` + pendingSubmitStatusGuard("t") + ` THEN 1 ELSE 0 END AS pending_submission
  FROM summary_task t
  LEFT JOIN summary_personal_result pr ON pr.task_id=t.id AND pr.user_id=?
  LEFT JOIN summary_user_read sur ON sur.task_id=t.id AND sur.user_id=?
@@ -1018,6 +1063,7 @@ func (h *TaskHandler) MarkSummaryRead(c *gin.Context) {
 	if h.db.Dialector.Name() == "mysql" {
 		stateArgs = append(stateArgs, userID)
 	}
+	stateArgs = append(stateArgs, model.PersonalStatusCompleted)
 	stateArgs = append(stateArgs, userID, userID, userID, taskID)
 	if err := h.db.Raw(stateSQL, stateArgs...).Scan(&state).Error; err != nil {
 		log.Printf("mark summary read state query failed: %v", err)
@@ -1030,7 +1076,8 @@ func (h *TaskHandler) MarkSummaryRead(c *gin.Context) {
 	ok(c, gin.H{
 		"task_id": taskID, "team_result_id": req.TeamResultID, "personal_version_id": req.PersonalVersionID,
 		"is_unread": isUnread, "has_pending_invitation": state.PendingInvitation,
-		"needs_attention": isUnread || state.PendingInvitation,
+		"has_pending_submission": state.PendingSubmission,
+		"needs_attention":        isUnread || state.PendingInvitation || state.PendingSubmission,
 	})
 }
 
