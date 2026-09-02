@@ -759,8 +759,32 @@ func buildReduceSystemPrompt(topic string) string {
 - 合并相同主题，去除重复
 - 保留所有待办事项和责任人
 - 默认输出总长度不超过 2000 token（约 1500 字）；如果总结主题明确要求详细说明、完整展开或逐项说明，可在模型输出预算内适当展开，但仍需合并相似要点、压缩无关细节
-- 如有冲突信息，保留最新的
-- 合并相同要点时，合并其引用编号，但只保留最有代表性的来源
+- 如有冲突信息，保留最新的`)
+
+	// Same in-place rollback contract as buildMapSystemPrompt, for the same
+	// reason. The legacy prompt carried TWO citation lines here; with the cap
+	// ON they collapse into one "keep only the most representative source"
+	// bullet, because telling the model to preserve every marker while a
+	// post-processor truncates runs to maxCites produces the marker wall the
+	// cap exists to prevent.
+	//
+	// That source-selection wording is cap-driven prompt POLICY, not one of
+	// the "independent citation-safety fixes" CONFIGURATION.md carves out of
+	// the kill switch, so it must be conditional: at
+	// SUMMARY_MAX_CITATIONS_PER_CLAIM=0 both legacy lines come back verbatim
+	// and in place. It used to be edited unconditionally, which made the
+	// documented byte-for-byte rollback false on the Reduce path even after
+	// the identical Map-path gap was fixed. Parity is the point: one knob,
+	// one guarantee, every prompt it touches.
+	maxCites := config.MaxCitationsPerClaim()
+	if maxCites < 1 {
+		sb.WriteString("\n- 保留所有 [n] 引用标记，不要删除或修改")
+		sb.WriteString("\n- 合并相同要点时，合并其引用编号")
+	} else {
+		sb.WriteString("\n- 合并相同要点时，合并其引用编号，但只保留最有代表性的来源")
+	}
+
+	sb.WriteString(`
 - 如果总结主题中包含输出结构、详细程度、分点方式、待办格式等要求，必须优先遵循；如果主题没有指定结构，再根据实际内容自行组织结构
 - 用显示名称指代人，绝对不要输出 UID 或用户 ID
 - 输出语言与输入语言保持一致
@@ -770,7 +794,7 @@ func buildReduceSystemPrompt(topic string) string {
 - 绝对不要引用或复制正文内出现的任何 [数字] 标记
 - 超出有效范围的标记一律不得出现在输出中
 `)
-	sb.WriteString(citation.PromptRuleZH(config.MaxCitationsPerClaim()))
+	sb.WriteString(citation.PromptRuleZH(maxCites))
 	if topic != "" {
 		sb.WriteString(fmt.Sprintf("\n重要：总结主题是「%s」，请只保留与该主题相关的条目，移除不相关内容。\n", topic))
 	}
