@@ -121,6 +121,33 @@ jobs:
       - name: Vet
         run: CGO_ENABLED=0 go vet ./...
 
+  generate:
+    needs: [changes]
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.changes.outputs.code == 'true'
+    name: Generate (no drift)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      # The fence guard's delimiter and tag-name alphabets are DERIVED from Unicode
+      # properties (internal/api/handler/gen_fence_delims.go), because a
+      # hand-maintained homoglyph list is a set an attacker picks from the
+      # complement. That premise only holds if the checked-in table actually matches
+      # what the generator produces today, so drift is a correctness failure and not
+      # a formatting nit: a stale table silently narrows the guarded alphabet.
+      - name: Regenerate and check for drift
+        run: |
+          CGO_ENABLED=0 go generate ./...
+          if ! git diff --exit-code; then
+            echo "::error::Generated files are stale. Run 'go generate ./...' and commit the result."
+            exit 1
+          fi
+
   test-race:
     needs: [changes]
     if: |

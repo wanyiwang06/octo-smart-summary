@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"regexp"
 	"strings"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -21,88 +20,86 @@ const (
 	refDataClose = "</引用数据>"
 )
 
-// fencePlaceholder is the non-empty replacement for stripped fence tags.
+// refFenceGuard neutralizes forged <引用数据> tags. See fence_guard.go for the
+// alphabet derivation and for why containment is carried by an in-place pass.
+//
+// The hand-written predecessor folded ＜ ＞ ／ and then matched the tag literally,
+// which left every other angle-bracket homoglyph (⟨⟩ 〈〉 ﹤﹥), the doubled solidus,
+// the attribute tail and NBSP-inside-the-name reaching the model byte-identical.
+var refFenceGuard = newFenceGuard("引用数据")
+
+// fencePlaceholder is the non-empty replacement for neutralized fence tags.
 // Using a placeholder (not "") prevents split-token reassembly attacks
 // where deleting a fence tag splices neighbours together to form a new
-// copy of the same token (P1-2 fix).
-const fencePlaceholder = "[引用数据]"
+// copy of the same token.
+//
+// Derived from the guard so the two cannot drift apart.
+var fencePlaceholder = refFenceGuard.placeholder
 
-var (
-	refInvisiblePattern = regexp.MustCompile(`[\p{Cf}\x{00ad}]`)
-	refFenceTagPattern  = regexp.MustCompile(`<[\s\p{Zs}]*/?[\s\p{Zs}]*引用数据[\s\p{Zs}]*>`)
+// sanitizeRefLine and sanitizeRefBlock neutralize untrusted referenced-summary text
+// before it is embedded in the agent's system prompt (SUM-158 blocker 3 — prompt
+// injection). A referenced summary may quote arbitrary chat content authored by other
+// people, so its text must not be able to (a) close the data fence early, or
+// (b) forge the box-drawing / bracket delimiters this builder uses as section
+// boundaries.
+//
+// The split between them is about newlines only: single-value render sites fold them
+// to a space, fenced block content preserves them.
+
+// refDelimiterReplacer folds the box-drawing and bracket runes this builder uses as
+// its own section boundaries. It is separate from the fence guard: those are this
+// file's layout characters, not fence syntax.
+//
+// Unlike the fence guard's alphabets this IS a global fold, and that is a deliberate
+// asymmetry: `═ ─ 【 】` are the delimiters THIS builder emits to structure its own
+// output, so an occurrence in untrusted text has to stop looking like one wherever it
+// appears — there is no pattern to match it inside. The fence guard's job is the
+// opposite: identify a specific token and leave everything else byte-identical.
+var refDelimiterReplacer = strings.NewReplacer(
+	"═", "=",
+	"─", "-",
+	"【", "[",
+	"】", "]",
 )
-
-// sanitizeRef neutralizes untrusted referenced-summary text before it is
-// embedded in the agent's system prompt (SUM-158 blocker 3 — prompt
-// injection). A referenced summary may quote arbitrary chat content authored
-// by other people, so its text must not be able to (a) close the data fence
-// early, or (b) forge the box-drawing / bracket delimiters this builder uses
-// as section boundaries.
-//
-// Fence-like syntax is normalized before structural matching: full-width
-// angle/slash characters and control separators are folded first, then any
-// opening/closing tag with optional whitespace is replaced by a non-empty
-// placeholder. This ordering prevents normalization from manufacturing a
-// near-tag after the fence check has already run.
-//
-// Newline is replaced with space here because sanitizeRef guards
-// single-value render sites where a forged standalone line matters. For true
-// multi-line bodies (body content) use sanitizeRefBlock which preserves
-// newlines so paragraph formatting is not compressed (P2-9).
-func sanitizeRef(s string) string {
-	return sanitizeRefLine(s)
-}
-
-func normalizeRefFenceSyntax(s string, preserveNewline bool) string {
-	replacements := []string{
-		"＜", "<",
-		"＞", ">",
-		"／", "/",
-		"\r", " ",
-		"\t", " ",
-		"\x00", " ",
-		"\v", " ",
-		"\f", " ",
-		"\u0085", " ",
-		"\u2028", " ",
-		"\u2029", " ",
-	}
-	if !preserveNewline {
-		replacements = append(replacements, "\n", " ")
-	}
-	s = strings.NewReplacer(replacements...).Replace(s)
-	// Format/invisible characters can visually splice or split the tag name
-	// (for example 引用\u200b数据). Remove them before structural matching.
-	s = refInvisiblePattern.ReplaceAllString(s, "")
-	return refFenceTagPattern.ReplaceAllString(s, fencePlaceholder)
-}
 
 // sanitizeRefLine sanitizes text rendered at single-value sites (bullets,
 // labels, metadata fields). Newlines are replaced with space to prevent
 // line-break manipulation (P2-9).
+//
+// Ordering is load-bearing: the guard runs FIRST, on text whose line breaks are
+// still intact, and only then are they folded to spaces. The predecessor did it the
+// other way round — normalizeRefFenceSyntax folded `\n` to a space before matching —
+// so on this path the guard's line-break exclusions had nothing left to see and a
+// tag split across a line boundary was neither matched nor bounded. Since quoted
+// chunks are joined with `\n`, that split needed no effort to produce.
+//
+// The guard then runs a SECOND time, after the fold. This is defence in depth
+// against this function manufacturing its own bypass: the `\n`→space rewrite happens
+// after all matching, so any shape the guard declined because of a line break gets
+// turned into a single-line shape that nothing has inspected. An earlier revision
+// shipped exactly that — `<\n///引用数据>` came back as `< ///引用数据>`, a well-formed
+// forged fence which the same function would have neutralized had it been the input.
+// The root cause was a line-break exclusion in the head pass (now removed), but the
+// second call makes the property local: whatever this function emits has been
+// through the guard in the form it emits it, so it cannot depend on the guard and
+// the fold agreeing about line breaks.
+//
+// The second call is close to free — neutralize's first act is an opener scan that
+// returns immediately when there is none, which is the overwhelmingly common case.
 func sanitizeRefLine(s string) string {
-	s = normalizeRefFenceSyntax(s, false)
-	s = strings.NewReplacer(
-		"═", "=",
-		"─", "-",
-		"【", "[",
-		"】", "]",
-	).Replace(s)
-	return s
+	s = refFenceGuard.neutralize(s)
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = refFenceGuard.neutralize(s)
+	return refDelimiterReplacer.Replace(s)
 }
 
 // sanitizeRefBlock sanitizes text that appears INSIDE the data fence (body
 // content, citations). Newlines are PRESERVED so paragraph formatting is
-// not compressed (P2-9 fix). CR/NUL/tab are still neutralized to space.
+// not compressed (P2-9 fix). NUL/tab are still neutralized to space, and CR /
+// U+2028 / U+2029 / U+0085 are normalized to `\n` rather than to a space, so a
+// paragraph break stays a paragraph break instead of silently becoming prose.
 func sanitizeRefBlock(s string) string {
-	s = normalizeRefFenceSyntax(s, true)
-	s = strings.NewReplacer(
-		"═", "=",
-		"─", "-",
-		"【", "[",
-		"】", "]",
-	).Replace(s)
-	return s
+	return refDelimiterReplacer.Replace(refFenceGuard.neutralize(s))
 }
 
 // sanitizeCitationsForReference sanitizes untrusted string fields before JSON
