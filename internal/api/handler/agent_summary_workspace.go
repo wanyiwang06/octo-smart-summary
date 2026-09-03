@@ -311,11 +311,19 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	route := deriveWorkspaceRoute(contextValue, intent, explicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent, begin.Snapshot, validation.participantsValid, validation.sourcesValid, validation.referencesValid)
 
 	var snapshot WorkspaceSnapshot
+	// The chat contract accepts request ids the workflow idempotency-key
+	// pattern rejects (chat: ^[A-Za-z0-9_-]{1,128}$ vs workflow:
+	// ^[A-Za-z0-9][A-Za-z0-9._:-]*$) — a leading "_" or "-" passed straight
+	// through hit 40005 on every retry (review 5087701899 P1). Derive the
+	// key from the request id the way the confirm path already does
+	// (workspaceMutationRequestID), so every chat-valid request id yields a
+	// valid, deterministic idempotency key.
+	workflowIdempotencyKey := workspaceMutationRequestID("turn", req.RequestID)
 	switch route {
 	case service.SummaryRoutePersonalWorkflow:
-		snapshot, err = h.completeWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req.RequestID, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin), service.SummaryWorkflowPersonal)
+		snapshot, err = h.completeWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, workflowIdempotencyKey, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin), service.SummaryWorkflowPersonal)
 	case service.SummaryRouteTeamWorkflow:
-		snapshot, err = h.completeWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req.RequestID, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin), service.SummaryWorkflowTeam)
+		snapshot, err = h.completeWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, workflowIdempotencyKey, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin), service.SummaryWorkflowTeam)
 	case service.SummaryRouteTeamConfirmation:
 		snapshot, err = h.completeWorkspaceProposal(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req, contextValue)
 	case service.SummaryRouteAgentPreview, service.SummaryRouteAgentRevision, service.SummaryRouteExplanation:

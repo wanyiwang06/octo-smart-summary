@@ -7,9 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 )
+
+// citationMarkerRE matches numbered citation markers ([1], [2], ...) in
+// preview content. Same shape as the handler-side authority
+// (internal/api/handler/agent_summary_citations.go citationMarkerRE).
+var citationMarkerRE = regexp.MustCompile(`\[(\d+)\]`)
 
 const (
 	SummaryResultClarification        = "clarification"
@@ -88,7 +95,8 @@ type allowedSummaryResultTypesContextKey struct{}
 type summaryCitationTrackingContextKey struct{}
 
 type summaryCitationTrackingState struct {
-	hasEvidence atomic.Bool
+	hasEvidence   atomic.Bool
+	evidenceCount atomic.Int64
 }
 
 // WithAllowedSummaryResultTypes constrains which result types the terminal tool
@@ -121,7 +129,33 @@ func markSummaryCitationEvidence(ctx context.Context, messageCount int) {
 	}
 	if state, ok := ctx.Value(summaryCitationTrackingContextKey{}).(*summaryCitationTrackingState); ok && state != nil {
 		state.hasEvidence.Store(true)
+		// Max is correct even across concurrent fetches: the marker space is
+		// [1, largest persisted evidence window].
+		for {
+			current := state.evidenceCount.Load()
+			if int64(messageCount) <= current || state.evidenceCount.CompareAndSwap(current, int64(messageCount)) {
+				break
+			}
+		}
 	}
+}
+
+// citationMarkersWithinEvidence reports whether every [N] marker in content
+// refers to an index in [1, evidenceCount] (the persisted evidence window) and
+// at least one marker exists. Bounding by the evidence pool is what stops a
+// stray prose "[1]" from spoofing coverage (review 5087740714 blocker 4).
+func citationMarkersWithinEvidence(content string, evidenceCount int64) bool {
+	markers := citationMarkerRE.FindAllStringSubmatch(content, -1)
+	if len(markers) == 0 {
+		return false
+	}
+	for _, marker := range markers {
+		index, err := strconv.ParseInt(marker[1], 10, 64)
+		if err != nil || index < 1 || index > evidenceCount {
+			return false
+		}
+	}
+	return true
 }
 
 // EmitSummaryResponseTool returns the only successful termination mechanism
@@ -209,7 +243,13 @@ func EmitSummaryResponseTool() (Tool, TerminalHandler) {
 		tracking, _ := ctx.Value(summaryCitationTrackingContextKey{}).(*summaryCitationTrackingState)
 		if tracking != nil && tracking.hasEvidence.Load() &&
 			(payload.ResultType == SummaryResultAgentPreview || payload.ResultType == SummaryResultAgentRevision) &&
-			(payload.Preview == nil || !strings.Contains(payload.Preview.Content, "[1]")) {
+			(payload.Preview == nil || !citationMarkersWithinEvidence(payload.Preview.Content, tracking.evidenceCount.Load())) {
+			// Evidence-bounded marker guard (review 5087740714 blocker 4):
+			// every [N] must refer to an index inside the persisted evidence
+			// window, and at least one marker must exist. This accepts a
+			// legitimate preview citing only [2]/[3] and rejects prose whose
+			// "[1]" is not citation syntax at all. Marker shape matches the
+			// handler-side authority citationMarkerRE.
 			return TerminalOutcome{}, errors.New("preview.content must include citation markers such as [1] for chat-backed summaries")
 		}
 		return TerminalOutcome{

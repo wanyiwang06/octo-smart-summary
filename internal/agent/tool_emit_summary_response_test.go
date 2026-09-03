@@ -74,6 +74,33 @@ func TestEmitSummaryResponseRequiresCitationForChatBackedPreview(t *testing.T) {
 	}
 }
 
+// Review 5087740714 blocker 4: the guard must accept markers other than [1]
+// and must not accept a bare prose "[1]" as citation coverage.
+func TestEmitSummaryResponseCitationGuardAcceptsAnyMarkerNumber(t *testing.T) {
+	_, handler := EmitSummaryResponseTool()
+	ctx := WithSummaryCitationTracking(context.Background())
+	// Evidence window of 3 messages: markers [1]..[3] are all valid citations.
+	markSummaryCitationEvidence(ctx, 3)
+
+	// A preview citing only [2] and [3] is legitimate — previously rejected.
+	higherOnly := json.RawMessage(`{"result_type":"agent_preview","reply":"ready","execution_target":"agent_preview","preview":{"content":"chat-backed body [2] and [3]","version":1}}`)
+	if _, err := handler(ctx, higherOnly); err != nil {
+		t.Fatalf("preview citing [2]/[3] without [1] must be accepted: %v", err)
+	}
+}
+
+func TestEmitSummaryResponseCitationGuardRejectsUnbackedLiteralMarker(t *testing.T) {
+	_, handler := EmitSummaryResponseTool()
+	ctx := WithSummaryCitationTracking(context.Background())
+	// Evidence window of 1: marker [2] exceeds the pool, so "see [2]" is a
+	// fabricated citation even though it matches the marker shape.
+	markSummaryCitationEvidence(ctx, 1)
+	prose := json.RawMessage(`{"result_type":"agent_preview","reply":"ready","execution_target":"agent_preview","preview":{"content":"details in [2] beyond the window","version":1}}`)
+	if _, err := handler(ctx, prose); err == nil || !strings.Contains(err.Error(), "must include citation markers") {
+		t.Fatalf("marker beyond the evidence window must not count as coverage: %v", err)
+	}
+}
+
 func TestEmitSummaryResponseAllowsUncitedPreviewForQuietChat(t *testing.T) {
 	_, handler := EmitSummaryResponseTool()
 	ctx := WithSummaryCitationTracking(context.Background())
