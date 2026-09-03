@@ -59,17 +59,16 @@ func ListChannelsTool() (Tool, Handler) {
 		// request scope accepts it, while a closed UI scope remains unexpandable.
 		summaryDB, imDB, _, _ := GetSummaryDeps()
 
-		options := []pipeline.ChannelQueryOption{pipeline.WithIncludeArchived(req.IncludeArchived)}
+		options := []pipeline.ChannelQueryOption{
+			pipeline.WithIncludeArchived(req.IncludeArchived),
+			pipeline.WithSpaceID(WorkspaceSpaceID(ctx)),
+		}
 		if !req.IncludeArchived {
 			options = append(options, pipeline.WithSelectedThreads(SelectedArchivedChannelIDs(ctx)))
 		}
 		channels, err := pipeline.GetUserChannels(ctx, uid, imDB, options...)
 		if err != nil {
 			return "", fmt.Errorf("get user channels: %w", err)
-		}
-		channels, err = FilterChannelsForWorkspace(ctx, uid, imDB, channels)
-		if err != nil {
-			return "", fmt.Errorf("filter channels for workspace: %w", err)
 		}
 		channels = RestrictDiscoveredChannels(ctx, channels)
 		scopeCommitted := false

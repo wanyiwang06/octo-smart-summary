@@ -10,7 +10,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
 // citationMarkerRE matches numbered citation markers ([1], [2], ...) in
@@ -95,8 +97,15 @@ type allowedSummaryResultTypesContextKey struct{}
 type summaryCitationTrackingContextKey struct{}
 
 type summaryCitationTrackingState struct {
-	hasEvidence   atomic.Bool
-	evidenceCount atomic.Int64
+	mu                  sync.RWMutex
+	evidenceKeys        map[summaryCitationEvidenceKey]struct{}
+	citationWindowKnown bool
+	citationWindowMax   int64
+}
+
+type summaryCitationEvidenceKey struct {
+	channelID  string
+	messageSeq int64
 }
 
 // WithAllowedSummaryResultTypes constrains which result types the terminal tool
@@ -120,24 +129,58 @@ func WithAllowedSummaryResultTypes(ctx context.Context, resultTypes ...string) c
 // a citation. When evidence exists, an uncited terminal preview is rejected and
 // the Agent loop gets a chance to repair it.
 func WithSummaryCitationTracking(ctx context.Context) context.Context {
-	return context.WithValue(ctx, summaryCitationTrackingContextKey{}, &summaryCitationTrackingState{})
+	return context.WithValue(ctx, summaryCitationTrackingContextKey{}, &summaryCitationTrackingState{
+		evidenceKeys: make(map[summaryCitationEvidenceKey]struct{}),
+	})
 }
 
-func markSummaryCitationEvidence(ctx context.Context, messageCount int) {
-	if messageCount <= 0 {
+func markSummaryCitationEvidence(ctx context.Context, messages []pipeline.Message) {
+	if len(messages) == 0 {
 		return
 	}
 	if state, ok := ctx.Value(summaryCitationTrackingContextKey{}).(*summaryCitationTrackingState); ok && state != nil {
-		state.hasEvidence.Store(true)
-		// Max is correct even across concurrent fetches: the marker space is
-		// [1, largest persisted evidence window].
-		for {
-			current := state.evidenceCount.Load()
-			if int64(messageCount) <= current || state.evidenceCount.CompareAndSwap(current, int64(messageCount)) {
-				break
-			}
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		for _, message := range messages {
+			state.evidenceKeys[summaryCitationEvidenceKey{
+				channelID:  message.ChannelID,
+				messageSeq: message.MessageSeq,
+			}] = struct{}{}
 		}
 	}
+}
+
+// setSummaryCitationWindow records the exact marker space exposed to the model
+// by summarize_chunk. It supersedes the fetched-message fallback because a
+// frozen manifest may exclude post-freeze evidence or reuse older session rows.
+func setSummaryCitationWindow(ctx context.Context, messages []pipeline.Message) {
+	state, ok := ctx.Value(summaryCitationTrackingContextKey{}).(*summaryCitationTrackingState)
+	if !ok || state == nil {
+		return
+	}
+	var maxIndex int64
+	for _, message := range messages {
+		if int64(message.CitationIndex) > maxIndex {
+			maxIndex = int64(message.CitationIndex)
+		}
+	}
+	state.mu.Lock()
+	state.citationWindowKnown = true
+	state.citationWindowMax = maxIndex
+	state.mu.Unlock()
+}
+
+func summaryCitationEvidenceWindow(ctx context.Context) (bool, int64) {
+	state, ok := ctx.Value(summaryCitationTrackingContextKey{}).(*summaryCitationTrackingState)
+	if !ok || state == nil {
+		return false, 0
+	}
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	if state.citationWindowKnown {
+		return len(state.evidenceKeys) > 0, state.citationWindowMax
+	}
+	return len(state.evidenceKeys) > 0, int64(len(state.evidenceKeys))
 }
 
 // citationMarkersWithinEvidence reports whether every [N] marker in content
@@ -240,10 +283,10 @@ func EmitSummaryResponseTool() (Tool, TerminalHandler) {
 				return TerminalOutcome{}, fmt.Errorf("result_type %q is not allowed for this request", payload.ResultType)
 			}
 		}
-		tracking, _ := ctx.Value(summaryCitationTrackingContextKey{}).(*summaryCitationTrackingState)
-		if tracking != nil && tracking.hasEvidence.Load() &&
+		hasEvidence, evidenceCount := summaryCitationEvidenceWindow(ctx)
+		if hasEvidence &&
 			(payload.ResultType == SummaryResultAgentPreview || payload.ResultType == SummaryResultAgentRevision) &&
-			(payload.Preview == nil || !citationMarkersWithinEvidence(payload.Preview.Content, tracking.evidenceCount.Load())) {
+			(payload.Preview == nil || !citationMarkersWithinEvidence(payload.Preview.Content, evidenceCount)) {
 			// Evidence-bounded marker guard (review 5087740714 blocker 4):
 			// every [N] must refer to an index inside the persisted evidence
 			// window, and at least one marker must exist. This accepts a

@@ -1399,12 +1399,7 @@ func (w *summaryWorkspaceCoordinator) findMostRecentAuthorizedChannel(ctx contex
 	if w == nil || w.imDB == nil {
 		return summaryWorkspaceChannel{}, errors.New("IM database not available")
 	}
-	channels, err := pipeline.GetUserChannels(ctx, actorID, w.imDB)
-	if err != nil {
-		return summaryWorkspaceChannel{}, err
-	}
-	discoveryCtx := agent.WithWorkspaceSpaceID(ctx, spaceID)
-	channels, err = agent.FilterChannelsForWorkspace(discoveryCtx, actorID, w.imDB, channels)
+	channels, err := pipeline.GetUserChannels(ctx, actorID, w.imDB, pipeline.WithSpaceID(spaceID))
 	if err != nil {
 		return summaryWorkspaceChannel{}, err
 	}

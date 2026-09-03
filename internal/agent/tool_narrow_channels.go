@@ -50,13 +50,9 @@ func NarrowChannelsByTopicTool() (Tool, Handler) {
 
 		summaryDB, imDB, _, cfg := GetSummaryDeps()
 
-		accessible, err := pipeline.GetUserChannels(ctx, uid, imDB)
+		accessible, err := pipeline.GetUserChannels(ctx, uid, imDB, pipeline.WithSpaceID(WorkspaceSpaceID(ctx)))
 		if err != nil {
 			return "", fmt.Errorf("get user channels: %w", err)
-		}
-		accessible, err = FilterChannelsForWorkspace(ctx, uid, imDB, accessible)
-		if err != nil {
-			return "", fmt.Errorf("filter channels for workspace: %w", err)
 		}
 		accessible = RestrictDiscoveredChannels(ctx, accessible)
 		requested := make(map[string]struct{}, len(req.ChannelIDs))

@@ -310,6 +310,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 		if v2 {
 			globalPool = applyFrozenManifest(ctx, uid, sessionID, runID, globalPool)
 		}
+		setSummaryCitationWindow(ctx, globalPool)
 
 		// Build a map from (channel_id, message_seq) to CitationIndex
 		citationMap := make(map[string]int)

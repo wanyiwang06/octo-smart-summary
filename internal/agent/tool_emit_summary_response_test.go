@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
 func TestEmitSummaryResponseSeparatesReplyFromPreview(t *testing.T) {
@@ -56,7 +58,7 @@ func TestEmitSummaryResponseHonorsContextAllowlist(t *testing.T) {
 func TestEmitSummaryResponseRequiresCitationForChatBackedPreview(t *testing.T) {
 	_, handler := EmitSummaryResponseTool()
 	ctx := WithSummaryCitationTracking(context.Background())
-	markSummaryCitationEvidence(ctx, 1)
+	markSummaryCitationEvidence(ctx, citationTestMessages("chat", 1, 1))
 
 	withoutCitation := json.RawMessage(`{"result_type":"agent_preview","reply":"ready","execution_target":"agent_preview","preview":{"content":"chat-backed body","version":1}}`)
 	if _, err := handler(ctx, withoutCitation); err == nil || !strings.Contains(err.Error(), "must include citation markers") {
@@ -80,7 +82,7 @@ func TestEmitSummaryResponseCitationGuardAcceptsAnyMarkerNumber(t *testing.T) {
 	_, handler := EmitSummaryResponseTool()
 	ctx := WithSummaryCitationTracking(context.Background())
 	// Evidence window of 3 messages: markers [1]..[3] are all valid citations.
-	markSummaryCitationEvidence(ctx, 3)
+	markSummaryCitationEvidence(ctx, citationTestMessages("chat", 1, 3))
 
 	// A preview citing only [2] and [3] is legitimate — previously rejected.
 	higherOnly := json.RawMessage(`{"result_type":"agent_preview","reply":"ready","execution_target":"agent_preview","preview":{"content":"chat-backed body [2] and [3]","version":1}}`)
@@ -94,11 +96,43 @@ func TestEmitSummaryResponseCitationGuardRejectsUnbackedLiteralMarker(t *testing
 	ctx := WithSummaryCitationTracking(context.Background())
 	// Evidence window of 1: marker [2] exceeds the pool, so "see [2]" is a
 	// fabricated citation even though it matches the marker shape.
-	markSummaryCitationEvidence(ctx, 1)
+	markSummaryCitationEvidence(ctx, citationTestMessages("chat", 1, 1))
 	prose := json.RawMessage(`{"result_type":"agent_preview","reply":"ready","execution_target":"agent_preview","preview":{"content":"details in [2] beyond the window","version":1}}`)
 	if _, err := handler(ctx, prose); err == nil || !strings.Contains(err.Error(), "must include citation markers") {
 		t.Fatalf("marker beyond the evidence window must not count as coverage: %v", err)
 	}
+}
+
+func TestEmitSummaryResponseCitationGuardCombinesDistinctEvidenceHandles(t *testing.T) {
+	_, handler := EmitSummaryResponseTool()
+	ctx := WithSummaryCitationTracking(context.Background())
+	markSummaryCitationEvidence(ctx, citationTestMessages("chat-a", 1, 2))
+	markSummaryCitationEvidence(ctx, citationTestMessages("chat-b", 1, 2))
+
+	args := json.RawMessage(`{"result_type":"agent_preview","reply":"ready","execution_target":"agent_preview","preview":{"content":"cross-channel body [4]","version":1}}`)
+	if _, err := handler(ctx, args); err != nil {
+		t.Fatalf("global citation marker [4] rejected after two evidence handles: %v", err)
+	}
+}
+
+func TestEmitSummaryResponseCitationGuardUsesFrozenWindow(t *testing.T) {
+	_, handler := EmitSummaryResponseTool()
+	ctx := WithSummaryCitationTracking(context.Background())
+	markSummaryCitationEvidence(ctx, citationTestMessages("chat", 1, 3))
+	setSummaryCitationWindow(ctx, []pipeline.Message{{ChannelID: "chat", MessageSeq: 1, CitationIndex: 1}})
+
+	args := json.RawMessage(`{"result_type":"agent_preview","reply":"ready","execution_target":"agent_preview","preview":{"content":"post-freeze body [2]","version":1}}`)
+	if _, err := handler(ctx, args); err == nil || !strings.Contains(err.Error(), "must include citation markers") {
+		t.Fatalf("marker outside frozen citation window accepted: %v", err)
+	}
+}
+
+func citationTestMessages(channelID string, firstSeq int64, count int) []pipeline.Message {
+	messages := make([]pipeline.Message, count)
+	for i := range messages {
+		messages[i] = pipeline.Message{ChannelID: channelID, MessageSeq: firstSeq + int64(i)}
+	}
+	return messages
 }
 
 func TestEmitSummaryResponseAllowsUncitedPreviewForQuietChat(t *testing.T) {
