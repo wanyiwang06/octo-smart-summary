@@ -381,7 +381,7 @@ func (h *AgentChatHandler) completeWorkspaceResponse(
 	if err != nil {
 		return WorkspaceSnapshot{}, err
 	}
-	return h.workspace.store.CompleteTurn(ctx, WorkspaceTurnCompletion{
+	return h.workspace.store.CompleteTurn(context.WithoutCancel(ctx), WorkspaceTurnCompletion{
 		Key:             key,
 		TurnID:          turnID,
 		Attempt:         attempt,
@@ -562,7 +562,11 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	if openScopeAgent {
 		ctx = agent.WithDiscoverableChannelScope(ctx, allowedChannels)
 	} else {
-		ctx = agent.WithAllowedChannelScope(ctx, allowedChannels)
+		// Explicit uid: this runs before the per-tool wrapper injects
+		// ContextKeyUID, so the context-based variant leaves DM ids
+		// un-canonicalised and the allowlist denies the caller's own DM
+		// selection (review 5087701899 P1).
+		ctx = agent.WithAllowedChannelScopeForUser(ctx, key.UserID, allowedChannels)
 	}
 	if contextValue.TimeRange != nil {
 		start, startErr := time.Parse(time.RFC3339, contextValue.TimeRange.Start)
@@ -676,7 +680,11 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	if resolvedRunID == "" {
 		resolvedRunID = beginRunID(messages)
 	}
-	snapshot, err := h.workspace.store.CompleteTurn(ctx, WorkspaceTurnCompletion{
+	// Commit-critical write: context.WithoutCancel so a client disconnect
+	// (tab close / proxy drop) cannot roll back the finished turn and orphan
+	// a created workflow task (review 5087701899 P1). FinishRunning below
+	// already uses the same pattern.
+	snapshot, err := h.workspace.store.CompleteTurn(context.WithoutCancel(ctx), WorkspaceTurnCompletion{
 		Key:             key,
 		TurnID:          turnID,
 		Attempt:         attempt,

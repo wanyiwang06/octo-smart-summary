@@ -197,13 +197,23 @@ func (s *mutableChannelScope) addLocked(channels []ChannelScope, uid string) {
 	}
 }
 
+// WithAllowedChannelScopeForUser is WithAllowedChannelScope with the uid
+// passed explicitly instead of read from context. The production call site
+// (materializeWorkspaceAgentContext) runs before the per-tool wrapper injects
+// ContextKeyUID, so the context read yields "" and DM ids stay un-canonicalised
+// — the allowlist then rejects the caller's own DM selection at tool time
+// (yujiawei review 5087701899 P1). key.UserID is already in hand there.
+func WithAllowedChannelScopeForUser(ctx context.Context, uid string, channels []ChannelScope) context.Context {
+	return context.WithValue(ctx, contextKeyAllowedChannelScope{}, newMutableChannelScope(channels, false, uid))
+}
+
 // WithAllowedChannelScope restricts channel-reading tools to the exact set
 // already authorised by the application layer. Calling it with an empty slice
 // intentionally installs an empty allowlist; absence of the value keeps legacy
 // Agent profiles unchanged.
 func WithAllowedChannelScope(ctx context.Context, channels []ChannelScope) context.Context {
 	uid, _ := ctx.Value(ContextKeyUID).(string)
-	return context.WithValue(ctx, contextKeyAllowedChannelScope{}, newMutableChannelScope(channels, false, uid))
+	return WithAllowedChannelScopeForUser(ctx, uid, channels)
 }
 
 // WithDiscoverableChannelScope installs an initially-empty allowlist that may
