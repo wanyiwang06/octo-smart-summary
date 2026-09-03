@@ -703,7 +703,32 @@ func (s *AgentWorkspaceStore) ReconcileWorkflow(ctx context.Context, in Workspac
 		// cancelled, and deleted workflows clear workflow_task_id, so checking the
 		// task/scope tuple first would make every later history poll fail instead
 		// of replaying the already-persisted terminal state.
+		//
+		// Review 5087701899 P0 fix: a terminal message alone must not block a
+		// later ClearWorkflow. DeleteSummary soft-deletes the task while
+		// session.workflow_task_id keeps pointing at it; the next History poll
+		// folds "deleted" with ClearWorkflow=true, and the short-circuit below
+		// used to swallow that — bricking chat/confirm renders forever. When
+		// the incoming reconcile clears the pointer, apply that clear even if
+		// a terminal message already exists; only skip the (redundant)
+		// artifact write.
 		if session.WorkflowTerminalMessageID > 0 {
+			if !in.ClearWorkflow {
+				var err error
+				snapshot, err = loadWorkspaceSnapshotTx(tx, in.Key)
+				return err
+			}
+			now := timezone.Now()
+			if err := tx.Model(&model.AgentSummarySession{}).Where("id = ?", session.ID).Updates(map[string]interface{}{
+				"workflow_task_id":            0,
+				"workflow_scope":              "",
+				"workflow_scope_version":      0,
+				"workflow_started_message_id": 0,
+				"expires_at":                  summaryWorkspaceExpiresAt(now),
+				"updated_at":                  now,
+			}).Error; err != nil {
+				return err
+			}
 			var err error
 			snapshot, err = loadWorkspaceSnapshotTx(tx, in.Key)
 			return err

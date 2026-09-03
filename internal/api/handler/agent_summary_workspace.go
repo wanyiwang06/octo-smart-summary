@@ -1906,11 +1906,30 @@ func (w *summaryWorkspaceCoordinator) stateFromSnapshot(ctx context.Context, sna
 	}
 
 	if snapshot.Session.WorkflowTaskID > 0 {
+		// Deleted-completed-workflow tolerance (review 5087701899 P0): the
+		// folded task can be soft-deleted by DeleteSummary (task.go) while
+		// session.workflow_task_id still points at it. Render the same
+		// terminal fold workspaceWorkflowTerminalState already produces
+		// instead of hard-erroring every chat/confirm/replay render.
 		var task model.SummaryTask
-		if err := w.db.WithContext(ctx).
-			Where("id = ? AND space_id = ? AND creator_id = ? AND deleted_at IS NULL", snapshot.Session.WorkflowTaskID, snapshot.Session.SpaceID, snapshot.Session.UserID).
-			Take(&task).Error; err != nil {
-			return state, fmt.Errorf("load workspace workflow task: %w", err)
+		taskErr := w.db.WithContext(ctx).Unscoped().
+			Where("id = ? AND space_id = ? AND creator_id = ?", snapshot.Session.WorkflowTaskID, snapshot.Session.SpaceID, snapshot.Session.UserID).
+			Take(&task).Error
+		if taskErr != nil {
+			if errors.Is(taskErr, gorm.ErrRecordNotFound) {
+				// Row hard-gone: fold the terminal error artifact without a
+				// task_id so the client stops treating the session as wedged.
+				state.Workflow = w.terminalWorkflowFold(snapshot, workspaceResultError, "总结任务已删除或不可用。", 0, false)
+				return state, nil
+			}
+			return state, fmt.Errorf("load workspace workflow task: %w", taskErr)
+		}
+		if task.DeletedAt != nil {
+			// Soft-deleted (the P0 repro): expose the terminal error fold.
+			// History reconciliation clears the pointer; this keeps chat and
+			// confirm renders alive until that lands.
+			state.Workflow = w.terminalWorkflowFold(snapshot, workspaceResultError, "总结任务已删除。", snapshot.Session.WorkflowTerminalMessageID, false)
+			return state, nil
 		}
 		resultType := workspaceResultWorkflowStarted
 		messageID := snapshot.Session.WorkflowStartedMessageID
@@ -1950,8 +1969,52 @@ func (w *summaryWorkspaceCoordinator) stateFromSnapshot(ctx context.Context, sna
 				state.Workflow.ParticipantCount = &participantCount
 			}
 		}
+	} else if snapshot.Session.WorkflowTerminalMessageID > 0 {
+		// Pointer cleared but a terminal workflow artifact remains (the
+		// delete-then-heal flow): expose the persisted terminal message as
+		// the authoritative workflow state so replays of earlier turns
+		// still match (turnFromSnapshot's strict-adapter check).
+		for i := range snapshot.Messages {
+			message := snapshot.Messages[i]
+			if message.ID != snapshot.Session.WorkflowTerminalMessageID {
+				continue
+			}
+			state.Workflow = &summaryWorkspaceWorkflow{
+				MessageID:        message.ID,
+				ResultType:       message.ResultType,
+				ScopeVersion:     message.ScopeVersion,
+				Scope:            snapshot.Session.WorkflowScope,
+				Saved:            message.SavedTaskID > 0,
+				AvailableActions: workspaceActionsForResult(message.ResultType, message.SavedTaskID > 0),
+			}
+			break
+		}
 	}
 	return state, nil
+}
+
+// terminalWorkflowFold builds the terminal workflow artifact used when the
+// folded task is deleted or missing, mirroring the shape stateFromSnapshot
+// produces for reconciled terminal states (strict-adapter safe).
+func (w *summaryWorkspaceCoordinator) terminalWorkflowFold(snapshot WorkspaceSnapshot, resultType, reply string, messageID int64, saved bool) *summaryWorkspaceWorkflow {
+	if messageID <= 0 {
+		// No persisted artifact to attach; keep the client's view consistent
+		// by exposing the error fold on the started message if one exists.
+		messageID = snapshot.Session.WorkflowStartedMessageID
+	}
+	if messageID <= 0 {
+		return nil
+	}
+	return &summaryWorkspaceWorkflow{
+		MessageID:        messageID,
+		ResultType:       resultType,
+		ScopeVersion:     snapshot.Session.WorkflowScopeVersion,
+		TaskID:           snapshot.Session.WorkflowTaskID,
+		Status:           -1,
+		Scope:            snapshot.Session.WorkflowScope,
+		Saved:            saved,
+		AvailableActions: workspaceActionsForResult(resultType, saved),
+	}
 }
 
 func workspacePreviewFromSnapshot(snapshot WorkspaceSnapshot) (*summaryWorkspacePreview, error) {
