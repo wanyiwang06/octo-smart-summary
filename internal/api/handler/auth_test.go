@@ -401,11 +401,17 @@ func setupReadRouter(h *TaskHandler) *gin.Engine {
 }
 
 func markReadRequest(r *gin.Engine, taskID int64, userID string, body string) *httptest.ResponseRecorder {
+	return markReadRequestWithSpace(r, taskID, userID, "space1", body)
+}
+
+// markReadRequestWithSpace is the Space-explicit form. The MySQL integration
+// tests seed into their own space, so they cannot use the "space1" default.
+func markReadRequestWithSpace(r *gin.Engine, taskID int64, userID, spaceID, body string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/v1/summaries/%d/read", taskID), bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Token", userID)
-	req.Header.Set("X-Space-Id", "space1")
+	req.Header.Set("X-Space-Id", spaceID)
 	r.ServeHTTP(w, req)
 	return w
 }
