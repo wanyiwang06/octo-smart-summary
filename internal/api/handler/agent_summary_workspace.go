@@ -189,7 +189,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "message 过长"})
 		return
 	}
-	if !sessionIDPattern.MatchString(req.SessionID) {
+	if !summaryWorkspaceSessionIDPattern.MatchString(req.SessionID) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 非法"})
 		return
 	}
@@ -755,7 +755,7 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 		return
 	}
 	sessionID := c.Param("session")
-	if !sessionIDPattern.MatchString(sessionID) {
+	if !summaryWorkspaceSessionIDPattern.MatchString(sessionID) {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 非法"})
 		return
 	}

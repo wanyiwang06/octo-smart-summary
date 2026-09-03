@@ -84,6 +84,17 @@ const (
 // 既防注入/异常键，也与 DB varchar(128) 对齐。
 var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
+// summaryWorkspaceSessionIDPattern constrains session ids on the summary
+// workspace routes only. The workspace stores session ids in
+// utf8mb4_0900_bin columns (agent_summary_session / agent_summary_turn) while
+// agent_message keeps the table-default utf8mb4_unicode_ci, so a case-variant
+// id would share one message pool on fresh installs: transcript bleed across
+// sessions and the expiry sweep deleting a live session's messages
+// (yujiawei review 5087701899 P1, owner decision 2026-09-03: reject rather
+// than normalise). Client session ids are minted lowercase; a workspace
+// request carrying an uppercase id is a caller bug and fails fast with 400.
+var summaryWorkspaceSessionIDPattern = regexp.MustCompile(`^[a-z0-9_-]{1,128}$`)
+
 // requestIDPattern 约束客户端生成的 request_id（V2 幂等键，可选）。与
 // session_id 同字符集、同 1..128 长——它流入 uk_run_request 的 VARCHAR(128)
 // 唯一键；严格模式 MySQL 会拒绝超长值。仅 V2 开启时校验，flag-off
@@ -823,6 +834,14 @@ func (h *AgentChatHandler) History(c *gin.Context) {
 	if strings.TrimSpace(c.Query("profile")) == summaryWorkspaceProfile {
 		if h == nil || h.workspace == nil || h.workspace.store == nil {
 			c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50300, Message: "summary workspace is not configured"})
+			return
+		}
+		// Workspace route: lowercase-only session ids (collation divergence
+		// guard, see summaryWorkspaceSessionIDPattern). The generic pattern
+		// above already ran; this rejects case variants the workspace tables
+		// would store byte-exact while agent_message matches case-insensitively.
+		if !summaryWorkspaceSessionIDPattern.MatchString(sessionID) {
+			c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "session_id 非法"})
 			return
 		}
 		h.handleSummaryWorkspaceHistory(c, sessionID, uid)
