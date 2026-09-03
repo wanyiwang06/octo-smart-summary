@@ -1818,9 +1818,23 @@ func (w *summaryWorkspaceCoordinator) validateTeamScope(ctx context.Context, cha
 		return false, teamScopeReasonParticipantMissing, nil
 	}
 	var count int64
-	err := w.imDB.WithContext(ctx).Table("group_member").
-		Where("group_no IN ? AND uid IN ? AND status = 1 AND is_deleted = 0", groupIDs, ids).
-		Distinct("uid").Count(&count).Error
+	// Intersect semantics (owner decision 2026-09-03, Jerry-Xin review
+	// 5087740714 blocker 3): every participant must be a member of EVERY
+	// selected group, matching what the worker's IntersectParticipantChannels
+	// actually fetches. The previous union check (Distinct uid over
+	// group_no IN all-groups) accepted configurations the worker then failed
+	// deterministically, and under union a participant would receive summary
+	// content from groups they are not in.
+	//
+	// COUNT(*) over the GROUP BY subquery — GORM's Count() chained with
+	// Group() returns the first group's row count, not the number of
+	// qualifying groups.
+	err := w.imDB.WithContext(ctx).Raw(
+		`SELECT COUNT(*) FROM (
+			SELECT uid FROM group_member
+			WHERE group_no IN ? AND uid IN ? AND status = 1 AND is_deleted = 0
+			GROUP BY uid HAVING COUNT(DISTINCT group_no) = ?
+		)`, groupIDs, ids, len(groupIDs)).Scan(&count).Error
 	if err != nil {
 		return false, teamScopeReasonNone, err
 	}
