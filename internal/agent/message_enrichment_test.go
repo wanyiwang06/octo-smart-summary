@@ -323,15 +323,20 @@ func TestEnrichMessagesWithMetadata_SenderIsBotUnion(t *testing.T) {
 		t.Fatalf("failed to create robot table: %v", err)
 	}
 
-	// Three users covering all three legs of the union:
-	//   u_human — user row with robot=0, absent from robot table  ⇒ false
-	//   u_flagged — user row with robot=1                          ⇒ true (leg 1)
-	//   u_system — user row with robot=0, present in robot table   ⇒ true (leg 2)
+	// Four users covering all legs of the union PLUS the empty-name bot
+	// regression that motivated the fix (PR #237 review, P1 blocking):
+	//   u_human       — user row with robot=0, absent from robot table     ⇒ false
+	//   u_flagged     — user row with robot=1                                ⇒ true (leg 1)
+	//   u_system      — user row with robot=0, present in robot table       ⇒ true (leg 2)
+	//   u_bot_noname  — user row with robot=1 AND name='' (programmatically
+	//                   provisioned bot); must NOT be filtered out at SQL
+	//                   layer or the classification silently drops.         ⇒ true (leg 3)
 	_, err = sqlDB.Exec(`
 		INSERT INTO user (uid, name, robot) VALUES
-		('u_human',   '张三', 0),
-		('u_flagged', 'CI机器人', 1),
-		('u_system',  'BotFather', 0)
+		('u_human',      '张三',      0),
+		('u_flagged',    'CI机器人',   1),
+		('u_system',     'BotFather', 0),
+		('u_bot_noname', '',          1)
 	`)
 	if err != nil {
 		t.Fatalf("failed to seed user rows: %v", err)
@@ -345,6 +350,7 @@ func TestEnrichMessagesWithMetadata_SenderIsBotUnion(t *testing.T) {
 		{SenderUID: "u_human", ChannelID: "g", Content: "hi"},
 		{SenderUID: "u_flagged", ChannelID: "g", Content: "PR merged"},
 		{SenderUID: "u_system", ChannelID: "g", Content: "system notice"},
+		{SenderUID: "u_bot_noname", ChannelID: "g", Content: "auto post"},
 	}
 	channels := []pipeline.ChannelInfo{
 		{ChannelID: "g", ChannelType: 2, ChannelName: "test"},
@@ -353,9 +359,10 @@ func TestEnrichMessagesWithMetadata_SenderIsBotUnion(t *testing.T) {
 	enrichMessagesWithMetadata(context.Background(), messages, "g", channels, db)
 
 	want := map[string]bool{
-		"u_human":   false,
-		"u_flagged": true,
-		"u_system":  true,
+		"u_human":      false,
+		"u_flagged":    true,
+		"u_system":     true,
+		"u_bot_noname": true,
 	}
 	for i, msg := range messages {
 		expected, ok := want[msg.SenderUID]

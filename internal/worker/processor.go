@@ -897,15 +897,21 @@ func (p *Processor) batchResolveUserNames(messages []pipeline.Message) (map[stri
 	}
 	var rows []userRow
 	if err := p.imDB.Raw("SELECT uid, name, robot FROM `user` WHERE uid IN ?", uids).Scan(&rows).Error; err != nil {
+		// Fall through to the robot table query below instead of an
+		// early return: the two SQLs are independent and the fail-open
+		// design (documented in PR #237) requires either leg to keep
+		// working when the other fails. Aligns with the agent-side
+		// resolver in agent/message_enrichment.go (PR #237 review by
+		// Jerry-Xin, P2 non-blocking).
 		log.Printf("[processor] batch resolve user names: %v", err)
-		return nameMap, botSet
-	}
-	for _, r := range rows {
-		if r.Name != "" {
-			nameMap[r.UID] = r.Name
-		}
-		if r.Robot == 1 {
-			botSet[r.UID] = true
+	} else {
+		for _, r := range rows {
+			if r.Name != "" {
+				nameMap[r.UID] = r.Name
+			}
+			if r.Robot == 1 {
+				botSet[r.UID] = true
+			}
 		}
 	}
 

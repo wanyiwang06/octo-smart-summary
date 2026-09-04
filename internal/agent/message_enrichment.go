@@ -72,13 +72,20 @@ func enrichMessagesWithMetadata(
 		}
 		var rows []userRow
 		if err := imDB.WithContext(ctx).Raw(
-			"SELECT uid, name, robot FROM `user` WHERE uid IN ? AND name != ''",
+			"SELECT uid, name, robot FROM `user` WHERE uid IN ?",
 			uids,
 		).Scan(&rows).Error; err != nil {
 			log.Printf("[agent] enrich: batch resolve user names failed: %v", err)
 		} else {
 			for _, r := range rows {
-				nameMap[r.UID] = r.Name
+				// Bot classification must NOT depend on name presence:
+				// programmatically provisioned bots can have an empty
+				// name row but still be robot=1. Gating botSet on the
+				// name filter caused an agent-vs-worker mismatch (see
+				// PR #237 review by Jerry-Xin, P1 blocking).
+				if r.Name != "" {
+					nameMap[r.UID] = r.Name
+				}
 				if r.Robot == 1 {
 					botSet[r.UID] = true
 				}
