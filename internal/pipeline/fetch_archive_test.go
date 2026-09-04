@@ -177,10 +177,12 @@ func seedSpaceScopedChannels(db *gorm.DB) {
 		(11, 'thread-a', 'Space A thread', 'grp-a', 1, 1, 'user1', 20),
 		(12, 'thread-b', 'Space B thread', 'grp-b', 1, 1, 'user1', 10)`)
 	db.Exec(`INSERT INTO conversation_extra (uid, channel_id, channel_type, updated_at) VALUES
-		('user1', 'user1@peer-a', 1, 30),
-		('user1', 'user1@peer-b', 1, 20),
-		('user1', 'user1@peer-inactive', 1, 10)`)
+		('user1', 'peer-a', 1, 30),
+		('user1', 'peer-b', 1, 20),
+		('user1', 'peer-inactive', 1, 10),
+		('user1', 'user1', 1, 5)`)
 	db.Exec(`INSERT INTO space_member (space_id, uid, status) VALUES
+		('space-a', 'user1', 1),
 		('space-a', 'peer-a', 1),
 		('space-b', 'peer-b', 1),
 		('space-a', 'peer-inactive', 0)`)
@@ -215,7 +217,7 @@ func TestGetUserChannels_WithSpaceID_FiltersGroupsThreadsAndDMPeers(t *testing.T
 	if _, ok := byID["grp-b____thread-b"]; ok {
 		t.Fatalf("cross-Space thread leaked: %+v", channels)
 	}
-	if !dmPeers["peer-a"] || dmPeers["peer-b"] || dmPeers["peer-inactive"] {
+	if !dmPeers["peer-a"] || !dmPeers["user1"] || dmPeers["peer-b"] || dmPeers["peer-inactive"] {
 		t.Fatalf("DM peers must be active members of space-a, got %v", dmPeers)
 	}
 }

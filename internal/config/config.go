@@ -197,6 +197,19 @@ type Config struct {
 }
 
 func Load() *Config {
+	defaultTimeRangeDays := envInt("DEFAULT_TIME_RANGE_DAYS", 31)
+	if defaultTimeRangeDays <= 0 {
+		log.Printf("[config] invalid DEFAULT_TIME_RANGE_DAYS=%d, preserving legacy default 31", defaultTimeRangeDays)
+		defaultTimeRangeDays = 31
+	}
+	maxTimeRangeDefault := 90
+	if defaultTimeRangeDays > maxTimeRangeDefault {
+		// MAX_TIME_RANGE_DAYS is new. When it is unset, do not make a
+		// previously valid legacy default crash-loop the API and worker.
+		maxTimeRangeDefault = defaultTimeRangeDays
+	}
+	maxTimeRangeDays := envInt("MAX_TIME_RANGE_DAYS", maxTimeRangeDefault)
+
 	return &Config{
 		MySQLDSN:   envStr("MYSQL_DSN", ""),
 		IMMySQLDSN: envStr("IM_MYSQL_DSN", ""),
@@ -264,8 +277,8 @@ func Load() *Config {
 		EnableIntentShortcut: envBool("ENABLE_INTENT_SHORTCUT", true),
 
 		MaxSafetyLimit:       envInt("MAX_SAFETY_LIMIT", 100000),
-		DefaultTimeRangeDays: envInt("DEFAULT_TIME_RANGE_DAYS", 31),
-		MaxTimeRangeDays:     envInt("MAX_TIME_RANGE_DAYS", 90),
+		DefaultTimeRangeDays: defaultTimeRangeDays,
+		MaxTimeRangeDays:     maxTimeRangeDays,
 
 		SkipMapReduceThreshold: envInt("SKIP_MAP_REDUCE_THRESHOLD", 0),
 		KimiAPIKey:             envStr("KIMI_API_KEY", ""),

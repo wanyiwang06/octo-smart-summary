@@ -62,6 +62,7 @@ func setupAgentImDB(t *testing.T) *gorm.DB {
 	db.Exec(`CREATE TABLE thread_member (thread_id INTEGER NOT NULL, uid TEXT NOT NULL)`)
 	db.Exec(`CREATE TABLE group_member (group_no TEXT NOT NULL, uid TEXT NOT NULL, is_deleted INTEGER DEFAULT 0, role INTEGER DEFAULT 0)`)
 	db.Exec(`CREATE TABLE conversation_extra (uid TEXT, channel_id TEXT, channel_type INTEGER, updated_at INTEGER DEFAULT 0)`)
+	db.Exec(`CREATE TABLE space_member (space_id TEXT NOT NULL, uid TEXT NOT NULL, status INTEGER DEFAULT 1)`)
 	return db
 }
 
@@ -257,12 +258,14 @@ func TestPeekChannelTool_AccessControl(t *testing.T) {
 func TestChannelReadToolsAcceptLogicalDMID(t *testing.T) {
 	db := setupAgentImDB(t)
 	db.Exec(`INSERT INTO conversation_extra (uid, channel_id, channel_type, updated_at) VALUES ('user-dm', 'peer-dm', 1, 1)`)
+	db.Exec(`INSERT INTO space_member (space_id, uid, status) VALUES ('space-a', 'peer-dm', 1)`)
 
 	SetSummaryDeps(nil, db, nil, config.Config{MsgTableCount: 1, MaxMessagesPerChannel: 10})
 	defer SetSummaryDeps(nil, nil, nil, config.Config{})
 
 	ctx := context.WithValue(context.Background(), ContextKeyUID, "user-dm")
 	ctx = context.WithValue(ctx, ContextKeySessionID, "logical-dm-session")
+	ctx = WithWorkspaceSpaceID(ctx, "space-a")
 	ctx = WithAllowedChannelScope(ctx, []ChannelScope{{ChannelID: "peer-dm", ChannelType: 1}})
 
 	_, fetch := FetchChannelTool()

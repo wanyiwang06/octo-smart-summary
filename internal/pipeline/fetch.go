@@ -182,7 +182,8 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, opts ...Cha
 	if q.spaceID != "" && len(dms) > 0 {
 		peerSet := make(map[string]struct{}, len(dms))
 		for _, d := range dms {
-			if peerUID := strings.TrimSpace(getPeerUID(d.ChannelID, uid)); peerUID != "" {
+			normalized := NormalizeDMChannelID(d.ChannelID, uid, model.ChannelTypeDM)
+			if peerUID := strings.TrimSpace(getPeerUID(normalized, uid)); peerUID != "" {
 				peerSet[peerUID] = struct{}{}
 			}
 		}
@@ -207,14 +208,14 @@ func GetUserChannels(ctx context.Context, uid string, imDB *gorm.DB, opts ...Cha
 		}
 	}
 	for _, d := range dms {
-		peerUID := getPeerUID(d.ChannelID, uid)
+		normalized := NormalizeDMChannelID(d.ChannelID, uid, model.ChannelTypeDM)
+		peerUID := getPeerUID(normalized, uid)
 		if q.spaceID != "" && !activeSpacePeers[peerUID] {
 			continue
 		}
-		normalized := NormalizeDMChannelID(d.ChannelID, uid, 1)
 		channels = append(channels, ChannelInfo{
 			ChannelID:   normalized,
-			ChannelType: 1,
+			ChannelType: model.ChannelTypeDM,
 			ChannelName: fmt.Sprintf("私聊-%s", peerUID),
 			PeerUID:     peerUID,
 		})
@@ -306,9 +307,6 @@ func getPeerUID(channelID, selfUID string) string {
 		return ""
 	}
 	if parts[0] == selfUID {
-		if parts[1] == selfUID {
-			return ""
-		}
 		return parts[1]
 	}
 	if parts[1] == selfUID {

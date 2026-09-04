@@ -41,7 +41,7 @@ func newSummaryWorkspaceIMValidationDB(t *testing.T) *gorm.DB {
 	if err := db.Exec(`INSERT INTO group_member VALUES ('group-a','actor',1,0,0),('group-a','member',1,0,0),('group-a','inactive',0,0,0),('group-c','actor',1,0,0),('group-c','member-b',1,0,0),('group-b','actor',1,0,0)`).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Exec(`INSERT INTO conversation_extra VALUES ('peer-in@actor','actor',1,2),('peer-out@actor','actor',1,1)`).Error; err != nil {
+	if err := db.Exec(`INSERT INTO conversation_extra VALUES ('peer-in','actor',1,2),('peer-out','actor',1,1)`).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Exec(`INSERT INTO space_member VALUES ('space-a','actor',1),('space-a','member',1),('space-a','member-b',1),('space-a','peer-in',1),('space-b','peer-out',1)`).Error; err != nil {

@@ -17,7 +17,7 @@ func TestGetPeerUIDRequiresActorParticipation(t *testing.T) {
 		{name: "actor second", channelID: "peer@actor", selfUID: "actor", want: "peer"},
 		{name: "malformed", channelID: "peer", selfUID: "actor", want: ""},
 		{name: "actor absent", channelID: "peer-a@peer-b", selfUID: "actor", want: ""},
-		{name: "self dm", channelID: "actor@actor", selfUID: "actor", want: ""},
+		{name: "self dm", channelID: "actor@actor", selfUID: "actor", want: "actor"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -25,6 +25,20 @@ func TestGetPeerUIDRequiresActorParticipation(t *testing.T) {
 				t.Fatalf("getPeerUID(%q, %q) = %q, want %q", tt.channelID, tt.selfUID, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDMSourceCoverageUsesCanonicalIDFromBareConversationPeer(t *testing.T) {
+	canonical := NormalizeDMChannelID("peer", "actor", 1)
+	channels := []ChannelInfo{{ChannelID: canonical, ChannelType: 1, PeerUID: "peer"}}
+	sources := []map[string]interface{}{{"source_id": "peer", "source_type": 3}}
+
+	if err := validateExplicitSourceCoverage(channels, sources, "actor"); err != nil {
+		t.Fatalf("legacy/team source coverage rejected a discovered DM: %v", err)
+	}
+	filtered := filterAvailableSpecifiedSources(channels, sources, "actor")
+	if len(filtered) != 1 {
+		t.Fatalf("participant source subset dropped a discovered DM: %#v", filtered)
 	}
 }
 

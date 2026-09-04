@@ -116,6 +116,32 @@ func TestValidateSummaryTimeRanges(t *testing.T) {
 	}
 }
 
+func TestLoadPreservesLegacyTimeRangeConfiguration(t *testing.T) {
+	t.Run("zero default falls back instead of crash looping", func(t *testing.T) {
+		t.Setenv("DEFAULT_TIME_RANGE_DAYS", "0")
+		t.Setenv("MAX_TIME_RANGE_DAYS", "")
+		cfg := Load()
+		if cfg.DefaultTimeRangeDays != 31 || cfg.MaxTimeRangeDays != 90 {
+			t.Fatalf("ranges=(%d,%d), want (31,90)", cfg.DefaultTimeRangeDays, cfg.MaxTimeRangeDays)
+		}
+		if err := ValidateSummaryTimeRanges(cfg.DefaultTimeRangeDays, cfg.MaxTimeRangeDays); err != nil {
+			t.Fatalf("normalized legacy config must validate: %v", err)
+		}
+	})
+
+	t.Run("unset max expands around an existing larger default", func(t *testing.T) {
+		t.Setenv("DEFAULT_TIME_RANGE_DAYS", "120")
+		t.Setenv("MAX_TIME_RANGE_DAYS", "")
+		cfg := Load()
+		if cfg.DefaultTimeRangeDays != 120 || cfg.MaxTimeRangeDays != 120 {
+			t.Fatalf("ranges=(%d,%d), want (120,120)", cfg.DefaultTimeRangeDays, cfg.MaxTimeRangeDays)
+		}
+		if err := ValidateSummaryTimeRanges(cfg.DefaultTimeRangeDays, cfg.MaxTimeRangeDays); err != nil {
+			t.Fatalf("legacy config with unset new ceiling must validate: %v", err)
+		}
+	})
+}
+
 func TestResolveSkipMapReduceThreshold(t *testing.T) {
 	tests := []struct {
 		name      string

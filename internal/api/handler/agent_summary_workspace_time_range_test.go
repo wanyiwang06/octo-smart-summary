@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +27,11 @@ func TestSummaryWorkspaceRequestedPresetTimeRange(t *testing.T) {
 		{name: "last range wins", message: "不要最近一个月，时间范围改成最近七天", label: "最近 7 天", days: 7, ok: true},
 		{name: "negated trailing range is ignored", message: "时间范围改成最近七天，不要最近一个月", label: "最近 7 天", days: 7, ok: true},
 		{name: "informal selection ignores negated range", message: "最近七天就好，别用最近一个月", label: "最近 7 天", days: 7, ok: true},
+		{name: "negation may precede the range command", message: "请不要把时间范围改成最近一个月", ok: false},
+		{name: "negative expansion is ignored", message: "无需把时间范围扩大到一个月", ok: false},
+		{name: "natural affirmative before range", message: "总结最近一个月的进展", label: "最近一个月", days: 30, ok: true},
+		{name: "bare range is an explicit follow up", message: "最近一个月", label: "最近一个月", days: 30, ok: true},
+		{name: "reference mention is not a range change", message: "参考最近一个月的总结，按选择器范围生成", ok: false},
 		{name: "unsupported three day range is not guessed", message: "最近三天的总结", ok: false},
 		{name: "unsupported two week range is not guessed", message: "最近两周的总结", ok: false},
 		{name: "unsupported ninety day range is not guessed", message: "最近90天的总结", ok: false},
@@ -75,6 +81,48 @@ func TestMaterializeWorkspaceAgentContextKeepsExplicitPickerRange(t *testing.T) 
 	}
 	if got.TimeRange == nil || got.TimeRange.Label != contextValue.TimeRange.Label {
 		t.Fatalf("time range=%#v, want explicit picker range %#v", got.TimeRange, contextValue.TimeRange)
+	}
+}
+
+func TestMaterializeWorkspaceAgentContextLetsExplicitFollowUpReplacePersistedRange(t *testing.T) {
+	now := time.Date(2026, 9, 4, 16, 30, 0, 0, time.UTC)
+	coordinator := &summaryWorkspaceCoordinator{now: func() time.Time { return now }}
+	contextValue := emptySummaryWorkspaceContext()
+	contextValue.SelectedChannels = []summaryWorkspaceChannel{{ChatID: "group-a", ChatType: "group", Name: "A群"}}
+	contextValue.TimeRange = &summaryWorkspaceTimeRange{
+		Start: now.AddDate(0, 0, -29).Format(time.RFC3339),
+		End:   now.Format(time.RFC3339),
+		Label: "最近一个月",
+	}
+
+	got, _, err := coordinator.materializeWorkspaceAgentContext(
+		t.Context(), "space-a", "actor", contextValue, WorkspaceSnapshot{},
+		"时间范围改成最近七天", service.SummaryIntentRevise, summaryWorkspaceInputUser,
+	)
+	if err != nil {
+		t.Fatalf("materialize context: %v", err)
+	}
+	if got.TimeRange == nil || got.TimeRange.Label != "最近 7 天" {
+		t.Fatalf("time range=%#v, want 最近 7 天", got.TimeRange)
+	}
+}
+
+func TestMaterializeWorkspaceAgentContextMaterializesTeamDefaultRange(t *testing.T) {
+	now := time.Date(2026, 9, 4, 16, 30, 0, 0, time.UTC)
+	coordinator := &summaryWorkspaceCoordinator{now: func() time.Time { return now }}
+	contextValue := emptySummaryWorkspaceContext()
+	contextValue.SelectedChannels = []summaryWorkspaceChannel{{ChatID: "group-a", ChatType: "group", Name: "A群"}}
+	contextValue.Participants = []summaryWorkspaceParticipant{{UserID: "member", UserName: "成员"}}
+
+	got, _, err := coordinator.materializeWorkspaceAgentContext(
+		t.Context(), "space-a", "actor", contextValue, WorkspaceSnapshot{},
+		"总结本周进展", service.SummaryIntentGenerate, summaryWorkspaceInputUser,
+	)
+	if err != nil {
+		t.Fatalf("materialize context: %v", err)
+	}
+	if got.TimeRange == nil || !strings.HasSuffix(got.TimeRange.Label, "（默认）") {
+		t.Fatalf("time range=%#v, want materialized team default", got.TimeRange)
 	}
 }
 

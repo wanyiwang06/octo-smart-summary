@@ -1301,7 +1301,6 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 	intent service.SummaryIntent,
 	inputOrigin string,
 ) (summaryWorkspaceContext, bool, error) {
-	submittedTimeRange := contextValue.TimeRange
 	effective, err := hydrateSummaryWorkspaceContextFromPreview(contextValue, before.CurrentPreview, actorID)
 	if err != nil {
 		return contextValue, false, err
@@ -1312,8 +1311,7 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 	if w != nil && w.now != nil {
 		now = w.now()
 	}
-	if inputOrigin == summaryWorkspaceInputUser && intent != service.SummaryIntentExplain &&
-		summaryWorkspaceAllowsNaturalLanguageTimeRange(submittedTimeRange, before.CurrentPreview) {
+	if inputOrigin == summaryWorkspaceInputUser && intent != service.SummaryIntentExplain {
 		if requestedRange, ok := summaryWorkspaceRequestedPresetTimeRange(message, now); ok {
 			contextValue.TimeRange = requestedRange
 		}
@@ -1338,9 +1336,7 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 		return contextValue, true, nil
 	}
 
-	if len(contextValue.Participants) == 0 {
-		contextValue = materializeSummaryWorkspaceDefaultTimeRange(contextValue, now)
-	}
+	contextValue = materializeSummaryWorkspaceDefaultTimeRange(contextValue, now)
 	return contextValue, false, nil
 }
 
@@ -1421,42 +1417,33 @@ func summaryWorkspaceRequestedPresetTimeRange(message string, now time.Time) (*s
 }
 
 func summaryWorkspaceRangeMentionIsExplicit(message string, index, length int) bool {
-	clauseStart := strings.LastIndexAny(message[:index], "，,。；;！？!?") + 1
+	clauseStart := 0
+	if delimiter := strings.LastIndexAny(message[:index], "，,。；;！？!?"); delimiter >= 0 {
+		_, width := utf8.DecodeRuneInString(message[delimiter:])
+		clauseStart = delimiter + width
+	}
 	clauseEnd := len(message)
 	if relative := strings.IndexAny(message[index+length:], "，,。；;！？!?"); relative >= 0 {
 		clauseEnd = index + length + relative
 	}
 	prefix := message[clauseStart:index]
 	suffix := message[index+length : clauseEnd]
+	clause := message[clauseStart:clauseEnd]
 	for _, negation := range []string{"不要", "别用", "不用", "不使用", "无需", "别按", "不要用"} {
-		if strings.HasSuffix(prefix, negation) || strings.HasPrefix(suffix, negation) {
+		if strings.Contains(prefix, negation) || strings.HasPrefix(suffix, negation) {
 			return false
 		}
+	}
+	if containsAny(clause, "参考", "对照", "提到", "提及") {
+		return false
 	}
 	if containsAny(prefix, "时间范围", "时间窗口", "取数范围", "统计范围", "扩大到", "扩展到", "调整为", "改为", "改成") {
 		return true
 	}
-	if strings.HasSuffix(prefix, "按") || strings.HasSuffix(prefix, "用") || strings.HasSuffix(prefix, "看") {
+	if containsAny(prefix, "总结", "汇总", "生成") || strings.HasSuffix(prefix, "按") || strings.HasSuffix(prefix, "用") || strings.HasSuffix(prefix, "看") {
 		return true
 	}
-	return containsAny(suffix, "重新总结", "总结", "生成", "就好", "即可", "为准")
-}
-
-func summaryWorkspaceAllowsNaturalLanguageTimeRange(submitted *summaryWorkspaceTimeRange, preview *model.AgentMessage) bool {
-	if submitted == nil || strings.HasSuffix(strings.TrimSpace(submitted.Label), "（默认）") {
-		return true
-	}
-	if preview == nil || preview.ResponsePayload == nil || strings.TrimSpace(*preview.ResponsePayload) == "" {
-		return false
-	}
-	var payload agent.SummaryResponsePayload
-	if err := json.Unmarshal([]byte(*preview.ResponsePayload), &payload); err != nil ||
-		payload.Preview == nil || payload.Preview.EffectiveScope == nil || payload.Preview.EffectiveScope.TimeRange == nil {
-		return false
-	}
-	effective := payload.Preview.EffectiveScope.TimeRange
-	return submitted.Start == effective.Start && submitted.End == effective.End &&
-		strings.TrimSpace(submitted.Label) == strings.TrimSpace(effective.Label)
+	return strings.TrimSpace(prefix) == "" || containsAny(suffix, "重新总结", "总结", "生成", "就好", "即可", "为准")
 }
 
 func materializeSummaryWorkspaceDefaultTimeRange(contextValue summaryWorkspaceContext, now time.Time) summaryWorkspaceContext {

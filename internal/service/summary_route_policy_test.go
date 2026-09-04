@@ -21,16 +21,15 @@ func TestDeriveSummaryRoute(t *testing.T) {
 			want: SummaryRouteTeamWorkflow,
 		},
 		{
-			name: "explicit team start rejects explanation intent",
+			name: "explicit team start trusts the action over free form intent",
 			in: SummaryRouteInput{
 				Action:               SummaryActionStartTeamWorkflow,
 				Intent:               SummaryIntentExplain,
-				HasExplicitRunIntent: true,
 				HasRequirement:       true,
 				HasOtherParticipants: true,
 				ParticipantsValid:    true,
 			},
-			want: SummaryRouteClarification,
+			want: SummaryRouteTeamWorkflow,
 		},
 		{
 			name: "explicit team start still validates requirements",

@@ -75,8 +75,7 @@ func DeriveSummaryRoute(in SummaryRouteInput) SummaryRoute {
 	case SummaryActionStartTeamWorkflow:
 		if in.HasHardMissingData || !in.HasOtherParticipants || !in.ParticipantsValid ||
 			(in.HasSelectedSource && !in.HasValidSource) ||
-			(!in.HasSelectedTemplate && !in.HasRequirement) ||
-			in.Intent != SummaryIntentGenerate || !in.HasExplicitRunIntent {
+			(!in.HasSelectedTemplate && !in.HasRequirement) {
 			return SummaryRouteClarification
 		}
 		return SummaryRouteTeamWorkflow
