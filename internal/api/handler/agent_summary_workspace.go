@@ -1819,11 +1819,12 @@ func (w *summaryWorkspaceCoordinator) validateTeamScope(ctx context.Context, cha
 		return false, teamScopeReasonParticipantMissing, nil
 	}
 	var count int64
-	// Unified-workspace team summaries intentionally use union membership: each
-	// participant must be an active member of at least one selected group. The
-	// creator's access to every selected group is validated separately by
-	// validateSources. Cross-group visibility is therefore an explicit product
-	// rule rather than an accidental consequence of worker-side intersection.
+	// Unified-workspace team summaries use union membership only for participant
+	// eligibility: each participant must be an active member of at least one
+	// selected group. The personal worker later narrows the selected sources to
+	// that participant's own accessible subset; this check does not grant
+	// cross-group visibility. The creator's access to every selected group is
+	// validated separately by validateSources.
 	err := w.imDB.WithContext(ctx).Raw(
 		`SELECT COUNT(DISTINCT uid) FROM group_member
 		 WHERE group_no IN ? AND uid IN ? AND status = 1 AND is_deleted = 0`,

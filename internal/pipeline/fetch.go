@@ -450,6 +450,28 @@ func ApplySourceConstraints(userChannels []ChannelInfo, specifiedSources []map[s
 	return result
 }
 
+func filterAvailableSpecifiedSources(userChannels []ChannelInfo, specifiedSources []map[string]interface{}, selfUID string) []map[string]interface{} {
+	if len(specifiedSources) == 0 {
+		return specifiedSources
+	}
+	available := make(map[string]struct{}, len(userChannels))
+	for _, channel := range userChannels {
+		available[channel.ChannelID] = struct{}{}
+	}
+	filtered := make([]map[string]interface{}, 0, len(specifiedSources))
+	for _, source := range specifiedSources {
+		id, _ := source["source_id"].(string)
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		id = NormalizeDMChannelID(id, selfUID, mapFrontendSourceType(sourceType(source)))
+		if _, ok := available[id]; ok {
+			filtered = append(filtered, source)
+		}
+	}
+	return filtered
+}
+
 func validateExplicitSourceCoverage(userChannels []ChannelInfo, specifiedSources []map[string]interface{}, selfUID string) error {
 	return validateExplicitSourceCoverageWithMessage(userChannels, specifiedSources, selfUID, "explicit summary source is unavailable in the current space")
 }
@@ -971,14 +993,6 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	pipelineStart := time.Now()
 	originalStart, originalEnd := timeStart, timeEnd
 
-	// Convert specifiedSources to string slice for shortcut detection
-	var sourceIDs []string
-	for _, src := range specifiedSources {
-		if id, ok := src["source_id"].(string); ok && id != "" {
-			sourceIDs = append(sourceIDs, id)
-		}
-	}
-
 	// Layer 1: channel discovery (needed before intent recognition for memberMap)
 	l1Start := time.Now()
 	selectedThreads := selectedThreadChannelIDs(specifiedSources)
@@ -992,8 +1006,26 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	}
 	log.Printf("[pipeline-personal] Layer 1 (channel discovery) took %dms (%d channels)",
 		time.Since(l1Start).Milliseconds(), len(userChannels))
-	if err := validateExplicitSourceCoverage(userChannels, specifiedSources, creatorUID); err != nil {
+	if channelScopeOpts != nil && channelScopeOpts.ParticipantSourceSubset {
+		requestedSourceCount := len(specifiedSources)
+		specifiedSources = filterAvailableSpecifiedSources(userChannels, specifiedSources, creatorUID)
+		if requestedSourceCount > 0 && len(specifiedSources) == 0 {
+			return nil, nil, errors.New("no selected summary source is available to this participant")
+		}
+		if len(specifiedSources) != requestedSourceCount {
+			log.Printf("[pipeline-personal] participant source scope reduced from %d to %d source(s)", requestedSourceCount, len(specifiedSources))
+		}
+	} else if err := validateExplicitSourceCoverage(userChannels, specifiedSources, creatorUID); err != nil {
 		return nil, nil, err
+	}
+
+	// Convert the effective specifiedSources to a string slice for shortcut
+	// detection. Participant-subset mode may have removed inaccessible sources.
+	var sourceIDs []string
+	for _, src := range specifiedSources {
+		if id, ok := src["source_id"].(string); ok && id != "" {
+			sourceIDs = append(sourceIDs, id)
+		}
 	}
 
 	// Layer 1.5: legacy workflows require every participant to share every

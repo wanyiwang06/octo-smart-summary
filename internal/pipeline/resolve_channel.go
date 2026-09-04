@@ -21,10 +21,14 @@ type ChannelScopeOptions struct {
 	// it. Empty preserves the legacy unscoped discovery behavior.
 	SpaceID string
 	// ParticipantSourceUnion keeps creator-authorised explicit sources when a
-	// unified-workspace team summary allows participants drawn from the union of
-	// the selected groups. Legacy workflows leave this false and retain the
-	// existing all-participants channel intersection.
+	// unified-workspace task-level summary allows participants drawn from the
+	// union of the selected groups. It does not grant those sources to each
+	// participant's personal result.
 	ParticipantSourceUnion bool
+	// ParticipantSourceSubset narrows explicit sources to the subset currently
+	// accessible to the participant executing a personal result. It never adds
+	// sources and fails when the participant has no selected source left.
+	ParticipantSourceSubset bool
 }
 
 // ChannelScopeRule represents a single channel scope constraint rule.

@@ -247,6 +247,76 @@ func TestResolveAndFetch_NoSources_TeamWorkflowStaysInsideTaskSpace(t *testing.T
 	}
 }
 
+func TestResolveAndFetch_WorkspacePersonalKeepsOnlyParticipantSources(t *testing.T) {
+	db := setupPipelineImDB(t)
+	if err := db.Exec(`INSERT INTO "group" (group_no, name, space_id, status, creator, updated_at) VALUES
+		('group-a', 'Group A', 'space-a', 1, 'creator', 20),
+		('group-b', 'Group B', 'space-a', 1, 'creator', 10)`).Error; err != nil {
+		t.Fatalf("seed groups: %v", err)
+	}
+	if err := db.Exec(`INSERT INTO group_member (group_no, uid, is_deleted, role) VALUES
+		('group-a', 'member-a', 0, 0),
+		('group-b', 'member-b', 0, 0)`).Error; err != nil {
+		t.Fatalf("seed memberships: %v", err)
+	}
+
+	sources := []map[string]interface{}{
+		{"source_id": "group-a", "source_type": 1, "source_name": "Group A"},
+		{"source_id": "group-b", "source_type": 1, "source_name": "Group B"},
+	}
+	start := time.Now().Add(-24 * time.Hour)
+	end := time.Now().Add(time.Hour)
+
+	if _, _, err := ResolveAndFetchMessagesForPersonal(
+		context.Background(), "member-a", nil, nil, sources, "",
+		start, end, db, echoOctoClient("member-a"), "batch", nil, nil,
+		1, 0, 2, 1, &ChannelScopeOptions{SpaceID: "space-a"}, nil,
+	); err == nil {
+		t.Fatal("strict explicit-source coverage unexpectedly accepted group-b for member-a")
+	}
+
+	messages, _, err := ResolveAndFetchMessagesForPersonal(
+		context.Background(), "member-a", nil, nil, sources, "",
+		start, end, db, echoOctoClient("member-a"), "batch", nil, nil,
+		1, 0, 2, 1, &ChannelScopeOptions{SpaceID: "space-a", ParticipantSourceSubset: true}, nil,
+	)
+	if err != nil {
+		t.Fatalf("participant-subset fetch: %v", err)
+	}
+	if len(messages) == 0 {
+		t.Fatal("participant-subset fetch returned no messages")
+	}
+	for _, message := range messages {
+		if message.ChannelID != "group-a" {
+			t.Fatalf("participant received inaccessible source %q; want only group-a", message.ChannelID)
+		}
+	}
+}
+
+func TestResolveAndFetch_WorkspacePersonalRejectsNoAccessibleSelectedSource(t *testing.T) {
+	db := setupPipelineImDB(t)
+	if err := db.Exec(`INSERT INTO "group" (group_no, name, space_id, status, creator, updated_at) VALUES
+		('group-b', 'Group B', 'space-a', 1, 'creator', 10)`).Error; err != nil {
+		t.Fatalf("seed group: %v", err)
+	}
+	if err := db.Exec(`INSERT INTO group_member (group_no, uid, is_deleted, role) VALUES
+		('group-b', 'member-b', 0, 0)`).Error; err != nil {
+		t.Fatalf("seed membership: %v", err)
+	}
+
+	start := time.Now().Add(-24 * time.Hour)
+	end := time.Now().Add(time.Hour)
+	_, _, err := ResolveAndFetchMessagesForPersonal(
+		context.Background(), "member-a", nil, nil,
+		[]map[string]interface{}{{"source_id": "group-b", "source_type": 1, "source_name": "Group B"}}, "",
+		start, end, db, echoOctoClient("member-a"), "batch", nil, nil,
+		1, 0, 2, 1, &ChannelScopeOptions{SpaceID: "space-a", ParticipantSourceSubset: true}, nil,
+	)
+	if err == nil || err.Error() != "no selected summary source is available to this participant" {
+		t.Fatalf("error = %v, want no accessible selected-source error", err)
+	}
+}
+
 func TestGetUserChannels_SelectedArchivedRetained(t *testing.T) {
 	db := setupPipelineImDB(t)
 	seedPipelineThreads(db, time.Now().Unix())

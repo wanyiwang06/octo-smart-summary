@@ -65,3 +65,19 @@ func TestValidateExplicitSourceCoverageAcceptsAllSources(t *testing.T) {
 		t.Fatalf("validateExplicitSourceCoverage() error = %v", err)
 	}
 }
+
+func TestFilterAvailableSpecifiedSourcesKeepsParticipantSubset(t *testing.T) {
+	channels := []ChannelInfo{{ChannelID: "group-a"}}
+	sources := []map[string]interface{}{
+		{"source_id": "group-a", "source_type": 1, "source_name": "A"},
+		{"source_id": "group-b", "source_type": 1, "source_name": "B"},
+	}
+
+	got := filterAvailableSpecifiedSources(channels, sources, "member-a")
+	if len(got) != 1 || got[0]["source_id"] != "group-a" {
+		t.Fatalf("filtered sources = %#v, want only group-a", got)
+	}
+	if len(sources) != 2 {
+		t.Fatalf("input sources mutated: len = %d, want 2", len(sources))
+	}
+}

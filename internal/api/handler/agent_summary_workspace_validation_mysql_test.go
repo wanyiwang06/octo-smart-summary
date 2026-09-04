@@ -11,7 +11,9 @@ import (
 	"gorm.io/gorm"
 )
 
-// This test pins the production MySQL dialect for the participant-union query.
+// This test pins the production MySQL dialect for the participant-eligibility
+// union query. Personal-result source access is narrowed separately by the
+// worker.
 // SQLite accepted the previous derived-table query without an alias, masking a
 // production-only failure. A connection-local temporary table keeps the test
 // isolated from the real IM schema.

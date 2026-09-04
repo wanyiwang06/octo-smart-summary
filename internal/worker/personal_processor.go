@@ -722,8 +722,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 
 	// Fetch messages via personal pipeline (Layer 0-5)
 	channelScopeOpts := &pipeline.ChannelScopeOptions{
-		Enabled: p.cfg.ChannelScopeEnabled,
-		SpaceID: task.SpaceID,
+		Enabled:                 p.cfg.ChannelScopeEnabled,
+		SpaceID:                 task.SpaceID,
+		ParticipantSourceSubset: task.AgentSessionID != "",
 	}
 
 	fetchStart := time.Now()
@@ -1182,6 +1183,8 @@ func sanitizeErrorForUser(errMsg string) string {
 		return "所选聊天不属于当前空间或你已失去访问权限，请重新选择"
 	case strings.Contains(errMsg, "explicit summary source is not shared by every participant"):
 		return "所选聊天并非所有参与者都可访问，请调整聊天或参与者"
+	case strings.Contains(errMsg, "no selected summary source is available to this participant"):
+		return "你已无法访问任何所选聊天，无法生成个人总结"
 	default:
 		// Do not leak raw internal errors (may contain DSN, IPs, stack traces).
 		// Raw error is already logged by the caller via log.Printf.
