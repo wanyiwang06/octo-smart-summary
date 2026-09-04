@@ -283,7 +283,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	if err != nil {
 		if errors.Is(err, errSummaryWorkspaceNoRecentChannel) {
 			reply := "所选时间范围内没有找到可总结的聊天消息，请选择一个聊天或调整时间范围。"
-			snapshot, completeErr := h.completeWorkspaceConversation(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req, workspaceResultClarification, reply)
+			snapshot, completeErr := h.completeWorkspaceConversation(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req, workspaceResultClarification, reply, &contextValue)
 			if completeErr != nil {
 				failTurn("RECENT_SOURCE_PERSIST_FAILED")
 				responder.failService(completeErr, "summary workspace failed")
@@ -328,9 +328,9 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	workflowIdempotencyKey := workspaceMutationRequestID("turn", req.RequestID)
 	switch route {
 	case service.SummaryRoutePersonalWorkflow:
-		snapshot, err = h.completeWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, workflowIdempotencyKey, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin), service.SummaryWorkflowPersonal)
+		snapshot, err = h.completeWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, workflowIdempotencyKey, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin), service.SummaryWorkflowPersonal, false)
 	case service.SummaryRouteTeamWorkflow:
-		snapshot, err = h.completeWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, workflowIdempotencyKey, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin), service.SummaryWorkflowTeam)
+		snapshot, err = h.completeWorkspaceWorkflow(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, workflowIdempotencyKey, req.Message, req.ScopeVersion, contextValue, summaryWorkspaceExecutionRequirement(contextValue, req.Message, req.InputOrigin), service.SummaryWorkflowTeam, false)
 	case service.SummaryRouteTeamConfirmation:
 		snapshot, err = h.completeWorkspaceProposal(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req, contextValue)
 	case service.SummaryRouteAgentPreview, service.SummaryRouteAgentRevision, service.SummaryRouteExplanation:
@@ -346,7 +346,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		} else if len(contextValue.SelectedChannels) > 0 && !validation.sourcesValid {
 			reply = "当前会话不可访问，请重新选择会话。"
 		}
-		snapshot, err = h.completeWorkspaceConversation(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req, workspaceResultClarification, reply)
+		snapshot, err = h.completeWorkspaceConversation(c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt, req, workspaceResultClarification, reply, &contextValue)
 	}
 	if err != nil {
 		failTurn("TURN_FAILED")
@@ -388,29 +388,41 @@ func (h *AgentChatHandler) completeWorkspaceResponse(
 	attempt int,
 	userMessage string,
 	scopeVersion int,
+	effectiveContext *summaryWorkspaceContext,
 	response agent.SummaryResponsePayload,
 	proposal *WorkspaceProposalMutation,
 	workflow *WorkspaceWorkflowMutation,
 ) (WorkspaceSnapshot, error) {
+	var effectiveScopeJSON []byte
+	var effectiveScopeHash string
+	if effectiveContext != nil {
+		var err error
+		effectiveScopeJSON, effectiveScopeHash, err = marshalSummaryWorkspaceContext(*effectiveContext)
+		if err != nil {
+			return WorkspaceSnapshot{}, err
+		}
+	}
 	payload, err := json.Marshal(response)
 	if err != nil {
 		return WorkspaceSnapshot{}, err
 	}
 	return h.workspace.store.CompleteTurn(context.WithoutCancel(ctx), WorkspaceTurnCompletion{
-		Key:             key,
-		TurnID:          turnID,
-		Attempt:         attempt,
-		Messages:        workspaceConversationMessages(userMessage, response.Reply, scopeVersion, response.ResultType, payload),
-		ResultType:      response.ResultType,
-		ResponsePayload: payload,
-		ScopeVersion:    scopeVersion,
-		Proposal:        proposal,
-		Workflow:        workflow,
+		Key:                key,
+		TurnID:             turnID,
+		Attempt:            attempt,
+		Messages:           workspaceConversationMessages(userMessage, response.Reply, scopeVersion, response.ResultType, payload),
+		ResultType:         response.ResultType,
+		ResponsePayload:    payload,
+		ScopeVersion:       scopeVersion,
+		EffectiveScopeJSON: effectiveScopeJSON,
+		EffectiveScopeHash: effectiveScopeHash,
+		Proposal:           proposal,
+		Workflow:           workflow,
 	})
 }
 
-func (h *AgentChatHandler) completeWorkspaceConversation(ctx context.Context, key WorkspaceSessionKey, turnID int64, attempt int, req agentChatRequest, resultType, reply string) (WorkspaceSnapshot, error) {
-	return h.completeWorkspaceResponse(ctx, key, turnID, attempt, req.Message, req.ScopeVersion, agent.SummaryResponsePayload{
+func (h *AgentChatHandler) completeWorkspaceConversation(ctx context.Context, key WorkspaceSessionKey, turnID int64, attempt int, req agentChatRequest, resultType, reply string, effectiveContext *summaryWorkspaceContext) (WorkspaceSnapshot, error) {
+	return h.completeWorkspaceResponse(ctx, key, turnID, attempt, req.Message, req.ScopeVersion, effectiveContext, agent.SummaryResponsePayload{
 		ResultType: resultType,
 		Reply:      reply,
 	}, nil, nil)
@@ -428,6 +440,8 @@ func (h *AgentChatHandler) completeWorkspaceProposal(ctx context.Context, key Wo
 	}
 	if contextValue.TimeRange != nil {
 		proposal.TimeRangeLabel = contextValue.TimeRange.Label
+		timeRange := *contextValue.TimeRange
+		proposal.TimeRange = &timeRange
 	} else {
 		proposal.TimeRangeLabel = "最近 7 天"
 	}
@@ -436,7 +450,7 @@ func (h *AgentChatHandler) completeWorkspaceProposal(ctx context.Context, key Wo
 		return WorkspaceSnapshot{}, err
 	}
 	reply := fmt.Sprintf("已整理好协作要求，将邀请 %d 位参与者。请确认后发起协作。", len(contextValue.Participants))
-	return h.completeWorkspaceResponse(ctx, key, turnID, attempt, req.Message, req.ScopeVersion, agent.SummaryResponsePayload{
+	return h.completeWorkspaceResponse(ctx, key, turnID, attempt, req.Message, req.ScopeVersion, &contextValue, agent.SummaryResponsePayload{
 		ResultType:      workspaceResultWorkflowConfirm,
 		Reply:           reply,
 		ExecutionTarget: "team_workflow",
@@ -460,6 +474,7 @@ func (h *AgentChatHandler) completeWorkspaceWorkflow(
 	contextValue summaryWorkspaceContext,
 	requirement string,
 	target service.SummaryWorkflowTarget,
+	confirmsProposal bool,
 ) (WorkspaceSnapshot, error) {
 	timeRange, err := workspaceWorkflowTimeRange(contextValue)
 	if err != nil {
@@ -515,7 +530,7 @@ func (h *AgentChatHandler) completeWorkspaceWorkflow(
 		saved = true
 		terminal = true
 	}
-	return h.completeWorkspaceResponse(ctx, key, turnID, attempt, userMessage, scopeVersion, agent.SummaryResponsePayload{
+	return h.completeWorkspaceResponse(ctx, key, turnID, attempt, userMessage, scopeVersion, &contextValue, agent.SummaryResponsePayload{
 		ResultType:      resultType,
 		Reply:           reply,
 		ExecutionTarget: string(target),
@@ -524,7 +539,7 @@ func (h *AgentChatHandler) completeWorkspaceWorkflow(
 			Status: strconv.Itoa(created.Task.Status),
 			Saved:  saved,
 		},
-	}, nil, &WorkspaceWorkflowMutation{TaskID: created.Task.ID, Scope: workflowScope, Terminal: terminal})
+	}, nil, &WorkspaceWorkflowMutation{TaskID: created.Task.ID, Scope: workflowScope, Terminal: terminal, ConfirmsProposal: confirmsProposal})
 }
 
 func workspacePersistAgentMessages(messages []agent.Message, resultType string, payload json.RawMessage, scopeVersion, snapshotVersion, parentMessageID int) []WorkspacePersistMessage {
@@ -692,6 +707,10 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	if err != nil {
 		return WorkspaceSnapshot{}, err
 	}
+	effectiveScopeJSON, effectiveScopeHash, err := marshalSummaryWorkspaceContext(contextValue)
+	if err != nil {
+		return WorkspaceSnapshot{}, err
+	}
 	resolvedRunID := runID
 	if resolvedRunID == "" {
 		resolvedRunID = beginRunID(messages)
@@ -701,16 +720,18 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	// a created workflow task (review 5087701899 P1). FinishRunning below
 	// already uses the same pattern.
 	snapshot, err := h.workspace.store.CompleteTurn(context.WithoutCancel(ctx), WorkspaceTurnCompletion{
-		Key:             key,
-		TurnID:          turnID,
-		Attempt:         attempt,
-		RunID:           resolvedRunID,
-		Messages:        workspacePersistAgentMessages(messages, payload.ResultType, canonicalPayload, req.ScopeVersion, snapshotVersion, parentMessageID),
-		ResultType:      payload.ResultType,
-		ResponsePayload: canonicalPayload,
-		ScopeVersion:    req.ScopeVersion,
-		SnapshotVersion: snapshotVersion,
-		ParentMessageID: int64(parentMessageID),
+		Key:                key,
+		TurnID:             turnID,
+		Attempt:            attempt,
+		RunID:              resolvedRunID,
+		Messages:           workspacePersistAgentMessages(messages, payload.ResultType, canonicalPayload, req.ScopeVersion, snapshotVersion, parentMessageID),
+		ResultType:         payload.ResultType,
+		ResponsePayload:    canonicalPayload,
+		ScopeVersion:       req.ScopeVersion,
+		SnapshotVersion:    snapshotVersion,
+		ParentMessageID:    int64(parentMessageID),
+		EffectiveScopeJSON: effectiveScopeJSON,
+		EffectiveScopeHash: effectiveScopeHash,
 	})
 	if err != nil {
 		return WorkspaceSnapshot{}, err
@@ -895,12 +916,17 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 		c.JSON(http.StatusConflict, apiResponse{Code: 40901, Message: "协作参与者已变化，请重新生成提案"})
 		return
 	}
-	contextValue.Participants = append([]summaryWorkspaceParticipant(nil), proposal.Participants...)
+	contextValue, err = applySummaryWorkspaceProposalScope(contextValue, proposal, uid)
+	if err != nil {
+		failTurn("PROPOSAL_SCOPE_INVALID")
+		c.JSON(http.StatusConflict, apiResponse{Code: 40901, Message: "协作时间范围已失效，请重新生成提案"})
+		return
+	}
 	workflowIdempotencyKey := workspaceMutationRequestID("workflow", fmt.Sprintf("%s:%d", req.ProposalToken, proposalVersion))
 	snapshot, err := h.completeWorkspaceWorkflow(
 		c.Request.Context(), key, begin.Turn.ID, begin.Turn.Attempt,
 		workflowIdempotencyKey, "确认并发起协作", req.ScopeVersion, contextValue, proposal.Requirement,
-		service.SummaryWorkflowTeam,
+		service.SummaryWorkflowTeam, true,
 	)
 	if err != nil {
 		failTurn("WORKFLOW_CREATE_FAILED")
@@ -919,6 +945,19 @@ func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: turn})
+}
+
+func applySummaryWorkspaceProposalScope(contextValue summaryWorkspaceContext, proposal summaryWorkspaceProposal, actorID string) (summaryWorkspaceContext, error) {
+	contextValue.Participants = append([]summaryWorkspaceParticipant(nil), proposal.Participants...)
+	if proposal.TimeRange != nil {
+		timeRange := *proposal.TimeRange
+		contextValue.TimeRange = &timeRange
+	}
+	normalized, err := normalizeSummaryWorkspaceContext(contextValue)
+	if err != nil {
+		return contextValue, err
+	}
+	return canonicalizeSummaryWorkspaceContextForActor(normalized, actorID), nil
 }
 
 func sameSummaryWorkspaceParticipants(left, right []summaryWorkspaceParticipant) bool {
@@ -1245,7 +1284,7 @@ func mergeSummaryWorkspaceAssumptions(existing []string, context summaryWorkspac
 	merged := make([]string, 0, len(existing)+3)
 	for _, assumption := range existing {
 		trimmed := strings.TrimSpace(assumption)
-		if trimmed == "" || strings.HasPrefix(strings.ReplaceAll(trimmed, " ", ""), "时间范围") {
+		if trimmed == "" || strings.HasPrefix(strings.ReplaceAll(trimmed, " ", ""), "时间范围使用") {
 			continue
 		}
 		merged = appendUniqueStrings(merged, trimmed)
@@ -1262,6 +1301,7 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 	intent service.SummaryIntent,
 	inputOrigin string,
 ) (summaryWorkspaceContext, bool, error) {
+	submittedTimeRange := contextValue.TimeRange
 	effective, err := hydrateSummaryWorkspaceContextFromPreview(contextValue, before.CurrentPreview, actorID)
 	if err != nil {
 		return contextValue, false, err
@@ -1272,7 +1312,8 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 	if w != nil && w.now != nil {
 		now = w.now()
 	}
-	if inputOrigin == summaryWorkspaceInputUser && intent != service.SummaryIntentExplain {
+	if inputOrigin == summaryWorkspaceInputUser && intent != service.SummaryIntentExplain &&
+		summaryWorkspaceAllowsNaturalLanguageTimeRange(submittedTimeRange, before.CurrentPreview) {
 		if requestedRange, ok := summaryWorkspaceRequestedPresetTimeRange(message, now); ok {
 			contextValue.TimeRange = requestedRange
 		}
@@ -1327,11 +1368,22 @@ func summaryWorkspaceRequestedPresetTimeRange(message string, now time.Time) (*s
 		label string
 	}
 	best := matchedPreset{index: -1}
+	consider := func(pattern string, days int, label string) {
+		for offset := 0; offset < len(normalized); {
+			relative := strings.Index(normalized[offset:], pattern)
+			if relative < 0 {
+				return
+			}
+			index := offset + relative
+			if index > best.index && summaryWorkspaceRangeMentionIsExplicit(normalized, index, len(pattern)) {
+				best = matchedPreset{index: index, days: days, label: label}
+			}
+			offset = index + len(pattern)
+		}
+	}
 	for _, preset := range summaryWorkspacePresetTimeRanges {
 		for _, pattern := range preset.patterns {
-			if index := strings.LastIndex(normalized, pattern); index > best.index {
-				best = matchedPreset{index: index, days: preset.days, label: preset.label}
-			}
+			consider(pattern, preset.days, preset.label)
 		}
 	}
 
@@ -1349,9 +1401,7 @@ func summaryWorkspaceRequestedPresetTimeRange(message string, now time.Time) (*s
 			{patterns: []string{"30天", "三十天", "一个月"}, days: 30, label: "最近一个月"},
 		} {
 			for _, pattern := range candidate.patterns {
-				if index := strings.LastIndex(normalized, pattern); index > best.index {
-					best = matchedPreset{index: index, days: candidate.days, label: candidate.label}
-				}
+				consider(pattern, candidate.days, candidate.label)
 			}
 		}
 	}
@@ -1368,6 +1418,45 @@ func summaryWorkspaceRequestedPresetTimeRange(message string, now time.Time) (*s
 		End:   end.Format(time.RFC3339Nano),
 		Label: best.label,
 	}, true
+}
+
+func summaryWorkspaceRangeMentionIsExplicit(message string, index, length int) bool {
+	clauseStart := strings.LastIndexAny(message[:index], "，,。；;！？!?") + 1
+	clauseEnd := len(message)
+	if relative := strings.IndexAny(message[index+length:], "，,。；;！？!?"); relative >= 0 {
+		clauseEnd = index + length + relative
+	}
+	prefix := message[clauseStart:index]
+	suffix := message[index+length : clauseEnd]
+	for _, negation := range []string{"不要", "别用", "不用", "不使用", "无需", "别按", "不要用"} {
+		if strings.HasSuffix(prefix, negation) || strings.HasPrefix(suffix, negation) {
+			return false
+		}
+	}
+	if containsAny(prefix, "时间范围", "时间窗口", "取数范围", "统计范围", "扩大到", "扩展到", "调整为", "改为", "改成") {
+		return true
+	}
+	if strings.HasSuffix(prefix, "按") || strings.HasSuffix(prefix, "用") || strings.HasSuffix(prefix, "看") {
+		return true
+	}
+	return containsAny(suffix, "重新总结", "总结", "生成", "就好", "即可", "为准")
+}
+
+func summaryWorkspaceAllowsNaturalLanguageTimeRange(submitted *summaryWorkspaceTimeRange, preview *model.AgentMessage) bool {
+	if submitted == nil || strings.HasSuffix(strings.TrimSpace(submitted.Label), "（默认）") {
+		return true
+	}
+	if preview == nil || preview.ResponsePayload == nil || strings.TrimSpace(*preview.ResponsePayload) == "" {
+		return false
+	}
+	var payload agent.SummaryResponsePayload
+	if err := json.Unmarshal([]byte(*preview.ResponsePayload), &payload); err != nil ||
+		payload.Preview == nil || payload.Preview.EffectiveScope == nil || payload.Preview.EffectiveScope.TimeRange == nil {
+		return false
+	}
+	effective := payload.Preview.EffectiveScope.TimeRange
+	return submitted.Start == effective.Start && submitted.End == effective.End &&
+		strings.TrimSpace(submitted.Label) == strings.TrimSpace(effective.Label)
 }
 
 func materializeSummaryWorkspaceDefaultTimeRange(contextValue summaryWorkspaceContext, now time.Time) summaryWorkspaceContext {

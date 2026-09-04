@@ -12,11 +12,25 @@ func TestDeriveSummaryRoute(t *testing.T) {
 			name: "explicit team start bypasses confirmation",
 			in: SummaryRouteInput{
 				Action:               SummaryActionStartTeamWorkflow,
+				Intent:               SummaryIntentGenerate,
+				HasExplicitRunIntent: true,
 				HasRequirement:       true,
 				HasOtherParticipants: true,
 				ParticipantsValid:    true,
 			},
 			want: SummaryRouteTeamWorkflow,
+		},
+		{
+			name: "explicit team start rejects explanation intent",
+			in: SummaryRouteInput{
+				Action:               SummaryActionStartTeamWorkflow,
+				Intent:               SummaryIntentExplain,
+				HasExplicitRunIntent: true,
+				HasRequirement:       true,
+				HasOtherParticipants: true,
+				ParticipantsValid:    true,
+			},
+			want: SummaryRouteClarification,
 		},
 		{
 			name: "explicit team start still validates requirements",

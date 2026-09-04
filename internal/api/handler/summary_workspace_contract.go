@@ -101,6 +101,7 @@ type summaryWorkspaceProposal struct {
 	Requirement      string                        `json:"requirement"`
 	TemplateLabel    string                        `json:"template_label,omitempty"`
 	TimeRangeLabel   string                        `json:"time_range_label,omitempty"`
+	TimeRange        *summaryWorkspaceTimeRange    `json:"time_range,omitempty"`
 	AvailableActions []string                      `json:"available_actions"`
 }
 

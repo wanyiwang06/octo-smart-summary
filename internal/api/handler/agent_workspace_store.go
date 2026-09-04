@@ -76,24 +76,27 @@ type WorkspaceProposalMutation struct {
 }
 
 type WorkspaceWorkflowMutation struct {
-	TaskID   int64
-	Scope    string
-	Terminal bool
+	TaskID           int64
+	Scope            string
+	Terminal         bool
+	ConfirmsProposal bool
 }
 
 type WorkspaceTurnCompletion struct {
-	Key             WorkspaceSessionKey
-	TurnID          int64
-	Attempt         int
-	RunID           string
-	Messages        []WorkspacePersistMessage
-	ResultType      string
-	ResponsePayload json.RawMessage
-	ScopeVersion    int
-	SnapshotVersion int
-	ParentMessageID int64
-	Proposal        *WorkspaceProposalMutation
-	Workflow        *WorkspaceWorkflowMutation
+	Key                WorkspaceSessionKey
+	TurnID             int64
+	Attempt            int
+	RunID              string
+	Messages           []WorkspacePersistMessage
+	ResultType         string
+	ResponsePayload    json.RawMessage
+	ScopeVersion       int
+	SnapshotVersion    int
+	ParentMessageID    int64
+	EffectiveScopeJSON []byte
+	EffectiveScopeHash string
+	Proposal           *WorkspaceProposalMutation
+	Workflow           *WorkspaceWorkflowMutation
 }
 
 type WorkspaceTurnFailure struct {
@@ -152,16 +155,18 @@ func (s *AgentWorkspaceStore) BeginTurn(ctx context.Context, in WorkspaceBeginTu
 		if err != nil {
 			return err
 		}
-		if in.ScopeVersion < session.ScopeVersion || (in.ScopeVersion == session.ScopeVersion && session.ScopeHash != "" && session.ScopeHash != in.ScopeHash) {
-			return ErrWorkspaceScopeConflict
-		}
-
 		existing, hasExisting, err := lockWorkspaceRequestTurn(tx, in)
 		if err != nil {
 			return err
 		}
 		if hasExisting && existing.Status == "completed" {
+			if in.ScopeVersion != session.ScopeVersion {
+				return ErrWorkspaceScopeConflict
+			}
 			return finishWorkspaceBegin(tx, in.Key, WorkspaceTurnReplay, existing, &result)
+		}
+		if in.ScopeVersion < session.ScopeVersion || (in.ScopeVersion == session.ScopeVersion && session.ScopeHash != "" && session.ScopeHash != in.ScopeHash) {
+			return ErrWorkspaceScopeConflict
 		}
 		if running, found, err := lockRunningWorkspaceTurn(tx, session.ActiveTurnID, existing, hasExisting, now); err != nil {
 			return err
@@ -410,6 +415,13 @@ func (s *AgentWorkspaceStore) CompleteTurn(ctx context.Context, in WorkspaceTurn
 			"expires_at":     summaryWorkspaceExpiresAt(now),
 			"updated_at":     now,
 		}
+		if len(in.EffectiveScopeJSON) > 0 || strings.TrimSpace(in.EffectiveScopeHash) != "" {
+			if len(in.EffectiveScopeJSON) == 0 || !json.Valid(in.EffectiveScopeJSON) || strings.TrimSpace(in.EffectiveScopeHash) == "" {
+				return errors.New("workspace effective scope is incomplete")
+			}
+			updates["scope_json"] = string(in.EffectiveScopeJSON)
+			updates["scope_hash"] = in.EffectiveScopeHash
+		}
 		if in.ResultType == workspaceResultAgentPreview || in.ResultType == workspaceResultAgentRevision {
 			updates["artifact_version"] = artifactVersion
 			updates["latest_preview_message_id"] = responseMessageID
@@ -441,7 +453,7 @@ func (s *AgentWorkspaceStore) CompleteTurn(ctx context.Context, in WorkspaceTurn
 			updates["workflow_task_id"] = in.Workflow.TaskID
 			updates["workflow_scope"] = in.Workflow.Scope
 			updates["workflow_scope_version"] = in.ScopeVersion
-			if in.Workflow.Scope == "team" {
+			if in.Workflow.Scope == "team" && in.Workflow.ConfirmsProposal {
 				updates["pending_proposal_status"] = "confirmed"
 				updates["pending_proposal_task_id"] = in.Workflow.TaskID
 			} else {

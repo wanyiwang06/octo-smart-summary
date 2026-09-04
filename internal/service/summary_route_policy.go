@@ -13,8 +13,9 @@ const (
 )
 
 // SummaryAction is the trusted UI action attached to a request. Chat asks the
-// policy to derive a route; confirmation must satisfy persisted-state guards
-// before a side effect is allowed.
+// policy to derive a route. Direct team starts still require an explicit
+// generate intent, while proposal confirmation must satisfy persisted-state
+// guards before a side effect is allowed.
 type SummaryAction string
 
 const (
@@ -57,8 +58,10 @@ type SummaryRouteInput struct {
 }
 
 // DeriveSummaryRoute applies the server-side routing boundary for the unified
-// entry. Team impact has priority over personal execution; only a generate
-// intent can start or propose a workflow.
+// entry. Team impact has priority over personal execution. A direct team start
+// may bypass proposal confirmation only when the trusted UI action is paired
+// with an explicit generate intent; confirmation keeps the persisted proposal
+// guards.
 func DeriveSummaryRoute(in SummaryRouteInput) SummaryRoute {
 	switch in.Action {
 	case SummaryActionConfirmWorkflow:
@@ -72,7 +75,8 @@ func DeriveSummaryRoute(in SummaryRouteInput) SummaryRoute {
 	case SummaryActionStartTeamWorkflow:
 		if in.HasHardMissingData || !in.HasOtherParticipants || !in.ParticipantsValid ||
 			(in.HasSelectedSource && !in.HasValidSource) ||
-			(!in.HasSelectedTemplate && !in.HasRequirement) {
+			(!in.HasSelectedTemplate && !in.HasRequirement) ||
+			in.Intent != SummaryIntentGenerate || !in.HasExplicitRunIntent {
 			return SummaryRouteClarification
 		}
 		return SummaryRouteTeamWorkflow

@@ -287,7 +287,7 @@ func TestAgentWorkspaceStoreCompletionClearsMutuallyExclusiveArtifacts(t *testin
 			},
 		},
 		{
-			name:       "workflow clears preview",
+			name:       "direct team workflow clears preview and unrelated proposal",
 			resultType: workspaceResultWorkflowStarted,
 			workflow:   &WorkspaceWorkflowMutation{TaskID: 99, Scope: "team"},
 			assert: func(t *testing.T, session model.AgentSummarySession) {
@@ -296,6 +296,19 @@ func TestAgentWorkspaceStoreCompletionClearsMutuallyExclusiveArtifacts(t *testin
 				}
 				if session.WorkflowTaskID != 99 || session.WorkflowStartedMessageID == 0 {
 					t.Fatalf("workflow reference was not recorded: %#v", session)
+				}
+				if session.PendingProposalStatus != "" || session.PendingProposalJSON != nil || session.PendingProposalTaskID != 0 {
+					t.Fatalf("direct workflow retained unrelated proposal state: %#v", session)
+				}
+			},
+		},
+		{
+			name:       "confirmed team workflow binds proposal",
+			resultType: workspaceResultWorkflowStarted,
+			workflow:   &WorkspaceWorkflowMutation{TaskID: 101, Scope: "team", ConfirmsProposal: true},
+			assert: func(t *testing.T, session model.AgentSummarySession) {
+				if session.PendingProposalStatus != "confirmed" || session.PendingProposalTaskID != 101 {
+					t.Fatalf("confirmed workflow did not bind proposal: %#v", session)
 				}
 			},
 		},
@@ -405,6 +418,59 @@ func TestAgentWorkspaceStoreActiveLeaseBlocksScopeMutation(t *testing.T) {
 		ResultType: workspaceResultClarification, ResponsePayload: payload, ScopeVersion: 1,
 	}); err != nil {
 		t.Fatalf("original lease owner could not complete: %v", err)
+	}
+}
+
+func TestAgentWorkspaceStorePersistsEffectiveScopeAndReplaysOriginalRequest(t *testing.T) {
+	db := newWorkspaceStoreTestDB(t)
+	store := NewAgentWorkspaceStore(db)
+	key := WorkspaceSessionKey{SpaceID: "space-1", UserID: "user-1", SessionID: "session-effective-scope"}
+	original := emptySummaryWorkspaceContext()
+	original.TimeRange = &summaryWorkspaceTimeRange{
+		Start: "2026-08-29T00:00:00+08:00",
+		End:   "2026-09-04T23:59:59+08:00",
+		Label: "最近 7 天（默认）",
+	}
+	begin := beginWorkspaceTurnForTest(t, store, key, "request-effective-scope", 1, original)
+	effective := original
+	effective.TimeRange = &summaryWorkspaceTimeRange{
+		Start: "2026-08-06T00:00:00+08:00",
+		End:   "2026-09-04T23:59:59+08:00",
+		Label: "最近一个月",
+	}
+	effectiveJSON, effectiveHash, err := marshalSummaryWorkspaceContext(effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := json.RawMessage(`{"result_type":"clarification","reply":"ok"}`)
+	snapshot, err := store.CompleteTurn(context.Background(), WorkspaceTurnCompletion{
+		Key: key, TurnID: begin.Turn.ID, Attempt: begin.Turn.Attempt,
+		Messages:           workspaceConversationMessages("扩大到一个月", "ok", 1, workspaceResultClarification, payload),
+		ResultType:         workspaceResultClarification,
+		ResponsePayload:    payload,
+		ScopeVersion:       1,
+		EffectiveScopeJSON: effectiveJSON,
+		EffectiveScopeHash: effectiveHash,
+	})
+	if err != nil {
+		t.Fatalf("complete turn: %v", err)
+	}
+	var stored summaryWorkspaceContext
+	if err := json.Unmarshal([]byte(snapshot.Session.ScopeJSON), &stored); err != nil {
+		t.Fatalf("decode stored scope: %v", err)
+	}
+	if stored.TimeRange == nil || stored.TimeRange.Label != "最近一个月" || snapshot.Session.ScopeHash != effectiveHash {
+		t.Fatalf("stored scope=%#v hash=%q", stored.TimeRange, snapshot.Session.ScopeHash)
+	}
+
+	replay := beginWorkspaceTurnForTest(t, store, key, "request-effective-scope", 1, original)
+	if replay.Disposition != WorkspaceTurnReplay {
+		t.Fatalf("replay disposition=%s, want %s", replay.Disposition, WorkspaceTurnReplay)
+	}
+
+	next := beginWorkspaceTurnForTest(t, store, key, "request-after-effective-scope", 1, effective)
+	if next.Disposition != WorkspaceTurnAcquired {
+		t.Fatalf("next disposition=%s, want %s", next.Disposition, WorkspaceTurnAcquired)
 	}
 }
 
@@ -631,7 +697,7 @@ func TestAgentWorkspaceStoreProposalConfirmationReplayAndStaleGuard(t *testing.T
 		Key: key, TurnID: begin.Turn.ID, Attempt: begin.Turn.Attempt,
 		Messages:   workspaceConversationMessages("确认并发起协作", "已发起", 1, workspaceResultWorkflowStarted, completedPayload),
 		ResultType: workspaceResultWorkflowStarted, ResponsePayload: completedPayload, ScopeVersion: 1,
-		Workflow: &WorkspaceWorkflowMutation{TaskID: 42, Scope: "team"},
+		Workflow: &WorkspaceWorkflowMutation{TaskID: 42, Scope: "team", ConfirmsProposal: true},
 	}); err != nil {
 		t.Fatalf("complete confirmation: %v", err)
 	}
@@ -778,7 +844,7 @@ func TestSummaryWorkspaceCompletedReplayUsesCurrentArtifact(t *testing.T) {
 			Key: key, TurnID: confirmation.Turn.ID, Attempt: confirmation.Turn.Attempt,
 			Messages:   workspaceConversationMessages("确认并发起协作", "已发起", 1, workspaceResultWorkflowStarted, workflowPayload),
 			ResultType: workspaceResultWorkflowStarted, ResponsePayload: workflowPayload, ScopeVersion: 1,
-			Workflow: &WorkspaceWorkflowMutation{TaskID: task.ID, Scope: "team"},
+			Workflow: &WorkspaceWorkflowMutation{TaskID: task.ID, Scope: "team", ConfirmsProposal: true},
 		})
 		if err != nil {
 			t.Fatalf("complete confirmation: %v", err)
