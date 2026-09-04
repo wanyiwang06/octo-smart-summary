@@ -173,7 +173,7 @@ func TestSummaryWorkspaceValidateSourcesEnforcesSpaceAndDMMembership(t *testing.
 	}
 }
 
-func TestSummaryWorkspaceValidateTeamScopeRequiresEveryParticipantInEveryGroup(t *testing.T) {
+func TestSummaryWorkspaceValidateTeamScopeAllowsParticipantUnionAcrossGroups(t *testing.T) {
 	imDB := newSummaryWorkspaceIMValidationDB(t)
 	coordinator := &summaryWorkspaceCoordinator{imDB: imDB}
 	ctx := context.Background()
@@ -183,26 +183,22 @@ func TestSummaryWorkspaceValidateTeamScopeRequiresEveryParticipantInEveryGroup(t
 	if err != nil || !valid || reason != teamScopeReasonNone {
 		t.Fatalf("shared group valid=%t reason=%q err=%v", valid, reason, err)
 	}
-	// Intersect semantics (review 5087740714 blocker 3, owner decision
-	// 2026-09-03): {member} is only in group-a; member-b is only in group-c.
-	// The old union check accepted this pair over {group-a, group-c} but the
-	// worker's IntersectParticipantChannels then failed the fetch.
-	valid, reason, err = coordinator.validateTeamScope(ctx,
-		[]summaryWorkspaceChannel{{ChatID: "group-a", ChatType: "group", Name: "A群"}, {ChatID: "group-c", ChatType: "group", Name: "C群"}},
-		[]summaryWorkspaceParticipant{{UserID: "member"}, {UserID: "member-b"}},
-	)
-	if err != nil || valid || reason != teamScopeReasonParticipantMissing {
-		t.Fatalf("split-membership pair must be rejected under intersect semantics: valid=%t reason=%q err=%v", valid, reason, err)
-	}
-	// Both participants are members of BOTH groups: accepted.
-	seedExtraMembership(t, imDB, "group-a", "member-b")
-	seedExtraMembership(t, imDB, "group-c", "member")
+	// Union semantics: member belongs only to group-a and member-b belongs only
+	// to group-c. Both are valid participants for the combined source set.
 	valid, reason, err = coordinator.validateTeamScope(ctx,
 		[]summaryWorkspaceChannel{{ChatID: "group-a", ChatType: "group", Name: "A群"}, {ChatID: "group-c", ChatType: "group", Name: "C群"}},
 		[]summaryWorkspaceParticipant{{UserID: "member"}, {UserID: "member-b"}},
 	)
 	if err != nil || !valid || reason != teamScopeReasonNone {
-		t.Fatalf("all-members-in-all-groups valid=%t reason=%q err=%v", valid, reason, err)
+		t.Fatalf("split-membership pair must pass under union semantics: valid=%t reason=%q err=%v", valid, reason, err)
+	}
+	// A participant outside every selected group is rejected.
+	valid, reason, err = coordinator.validateTeamScope(ctx,
+		[]summaryWorkspaceChannel{{ChatID: "group-a", ChatType: "group", Name: "A群"}, {ChatID: "group-c", ChatType: "group", Name: "C群"}},
+		[]summaryWorkspaceParticipant{{UserID: "member"}, {UserID: "outside"}},
+	)
+	if err != nil || valid || reason != teamScopeReasonParticipantMissing {
+		t.Fatalf("participant outside group union valid=%t reason=%q err=%v", valid, reason, err)
 	}
 	valid, reason, err = coordinator.validateTeamScope(ctx, []summaryWorkspaceChannel{{ChatID: "peer-in", ChatType: "direct", Name: "私聊"}}, participants)
 	if err != nil || valid || reason != teamScopeReasonSourceType {

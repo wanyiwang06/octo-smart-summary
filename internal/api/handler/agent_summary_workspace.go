@@ -299,6 +299,11 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		responder.fail(http.StatusInternalServerError, 50000, "查找最近聊天失败", true)
 		return
 	}
+	// A revision can hydrate selected channels from the previous preview. Once
+	// materialized, that scope is closed just like an explicit selection; do not
+	// leave the Agent in discoverable mode based on the pre-hydration request.
+	openScopeAgent = len(contextValue.SelectedChannels) == 0 && len(contextValue.Participants) == 0 &&
+		len(contextValue.ReferencedTaskIDs) == 0 && summaryWorkspaceUserRequirement(req.Message, req.InputOrigin) != ""
 
 	validation, lookupErr := h.workspace.validateWorkspaceScope(c.Request.Context(), spaceID, uid, contextValue)
 	if lookupErr != nil {
@@ -469,6 +474,7 @@ func (h *AgentChatHandler) completeWorkspaceWorkflow(
 		OriginChannelID:   originID,
 		OriginChannelType: originType,
 		IdempotencyKey:    idempotencyKey,
+		AgentSessionID:    summaryWorkspaceAgentSessionID(key.SpaceID, key.SessionID, scopeVersion),
 	}
 	workflowScope := "personal"
 	startedReply := "已开始生成总结，完成后会自动保存。"
@@ -1813,23 +1819,15 @@ func (w *summaryWorkspaceCoordinator) validateTeamScope(ctx context.Context, cha
 		return false, teamScopeReasonParticipantMissing, nil
 	}
 	var count int64
-	// Intersect semantics (owner decision 2026-09-03, Jerry-Xin review
-	// 5087740714 blocker 3): every participant must be a member of EVERY
-	// selected group, matching what the worker's IntersectParticipantChannels
-	// actually fetches. The previous union check (Distinct uid over
-	// group_no IN all-groups) accepted configurations the worker then failed
-	// deterministically, and under union a participant would receive summary
-	// content from groups they are not in.
-	//
-	// COUNT(*) over the GROUP BY subquery — GORM's Count() chained with
-	// Group() returns the first group's row count, not the number of
-	// qualifying groups.
+	// Unified-workspace team summaries intentionally use union membership: each
+	// participant must be an active member of at least one selected group. The
+	// creator's access to every selected group is validated separately by
+	// validateSources. Cross-group visibility is therefore an explicit product
+	// rule rather than an accidental consequence of worker-side intersection.
 	err := w.imDB.WithContext(ctx).Raw(
-		`SELECT COUNT(*) FROM (
-			SELECT uid FROM group_member
-			WHERE group_no IN ? AND uid IN ? AND status = 1 AND is_deleted = 0
-			GROUP BY uid HAVING COUNT(DISTINCT group_no) = ?
-		)`, groupIDs, ids, len(groupIDs)).Scan(&count).Error
+		`SELECT COUNT(DISTINCT uid) FROM group_member
+		 WHERE group_no IN ? AND uid IN ? AND status = 1 AND is_deleted = 0`,
+		groupIDs, ids).Scan(&count).Error
 	if err != nil {
 		return false, teamScopeReasonNone, err
 	}
@@ -1942,18 +1940,19 @@ func (w *summaryWorkspaceCoordinator) stateFromSnapshot(ctx context.Context, sna
 			Take(&task).Error
 		if taskErr != nil {
 			if errors.Is(taskErr, gorm.ErrRecordNotFound) {
-				// Row hard-gone: fold the terminal error artifact without a
-				// task_id so the client stops treating the session as wedged.
-				state.Workflow = w.terminalWorkflowFold(snapshot, workspaceResultError, "总结任务已删除或不可用。", 0, false)
+				// A workflow state may only carry workflow_started/completed.
+				// Deleted/missing tasks are represented as a top-level error turn
+				// by turnFromSnapshot, or persisted as an error message by History
+				// reconciliation, so leave state.workflow empty here.
 				return state, nil
 			}
 			return state, fmt.Errorf("load workspace workflow task: %w", taskErr)
 		}
 		if task.DeletedAt != nil {
-			// Soft-deleted (the P0 repro): expose the terminal error fold.
-			// History reconciliation clears the pointer; this keeps chat and
-			// confirm renders alive until that lands.
-			state.Workflow = w.terminalWorkflowFold(snapshot, workspaceResultError, "总结任务已删除。", snapshot.Session.WorkflowTerminalMessageID, false)
+			// Keep the wire contract strict: state.workflow does not accept an
+			// error result type. turnFromSnapshot returns a top-level error until
+			// History reconciliation persists the terminal error and clears the
+			// dangling pointer.
 			return state, nil
 		}
 		resultType := workspaceResultWorkflowStarted
@@ -2004,6 +2003,9 @@ func (w *summaryWorkspaceCoordinator) stateFromSnapshot(ctx context.Context, sna
 			if message.ID != snapshot.Session.WorkflowTerminalMessageID {
 				continue
 			}
+			if message.ResultType != workspaceResultWorkflowStarted && message.ResultType != workspaceResultWorkflowCompleted {
+				break
+			}
 			state.Workflow = &summaryWorkspaceWorkflow{
 				MessageID:        message.ID,
 				ResultType:       message.ResultType,
@@ -2018,28 +2020,19 @@ func (w *summaryWorkspaceCoordinator) stateFromSnapshot(ctx context.Context, sna
 	return state, nil
 }
 
-// terminalWorkflowFold builds the terminal workflow artifact used when the
-// folded task is deleted or missing, mirroring the shape stateFromSnapshot
-// produces for reconciled terminal states (strict-adapter safe).
-func (w *summaryWorkspaceCoordinator) terminalWorkflowFold(snapshot WorkspaceSnapshot, resultType, reply string, messageID int64, saved bool) *summaryWorkspaceWorkflow {
-	if messageID <= 0 {
-		// No persisted artifact to attach; keep the client's view consistent
-		// by exposing the error fold on the started message if one exists.
-		messageID = snapshot.Session.WorkflowStartedMessageID
+func (w *summaryWorkspaceCoordinator) deletedWorkflowReply(ctx context.Context, snapshot WorkspaceSnapshot) (string, bool, error) {
+	if snapshot.Session.WorkflowTaskID <= 0 {
+		return "", false, nil
 	}
-	if messageID <= 0 {
-		return nil
+	var task model.SummaryTask
+	err := w.db.WithContext(ctx).Unscoped().
+		Where("id = ? AND space_id = ? AND creator_id = ?", snapshot.Session.WorkflowTaskID, snapshot.Session.SpaceID, snapshot.Session.UserID).
+		Take(&task).Error
+	_, reply, terminal, clearWorkflow := workspaceWorkflowTerminalState(task, err)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", false, err
 	}
-	return &summaryWorkspaceWorkflow{
-		MessageID:        messageID,
-		ResultType:       resultType,
-		ScopeVersion:     snapshot.Session.WorkflowScopeVersion,
-		TaskID:           snapshot.Session.WorkflowTaskID,
-		Status:           -1,
-		Scope:            snapshot.Session.WorkflowScope,
-		Saved:            saved,
-		AvailableActions: workspaceActionsForResult(resultType, saved),
-	}
+	return reply, terminal && clearWorkflow, nil
 }
 
 func workspacePreviewFromSnapshot(snapshot WorkspaceSnapshot) (*summaryWorkspacePreview, error) {
@@ -2125,6 +2118,25 @@ func (w *summaryWorkspaceCoordinator) turnFromSnapshot(ctx context.Context, sess
 	// same artifact as state, so replay the current authoritative artifact
 	// instead of combining a historical result with today's state.
 	if !workspaceMessageMatchesState(message, state) {
+		if message.ResultType == workspaceResultWorkflowStarted || message.ResultType == workspaceResultWorkflowCompleted {
+			reply, deleted, deletedErr := w.deletedWorkflowReply(ctx, snapshot)
+			if deletedErr != nil {
+				return summaryWorkspaceTurn{}, deletedErr
+			}
+			if deleted {
+				return summaryWorkspaceTurn{
+					ContractVersion:  summaryWorkspaceContractVersion,
+					SessionID:        sessionID,
+					MessageID:        message.ID,
+					ResultType:       workspaceResultError,
+					Reply:            reply,
+					ScopeVersion:     message.ScopeVersion,
+					RunID:            runID,
+					AvailableActions: []string{},
+					State:            state,
+				}, nil
+			}
+		}
 		message = workspaceMessageByID(snapshot.Messages, workspaceCurrentStateMessageID(state))
 		if !workspaceMessageMatchesState(message, state) {
 			return summaryWorkspaceTurn{}, errors.New("workspace state does not match response message")

@@ -458,6 +458,7 @@ func TestAgentTeamWorkflowCreatesCollaborators(t *testing.T) {
 	svc, db := newSummaryWorkflowTestService(t)
 	in := baseAgentWorkflowInput()
 	in.IdempotencyKey = "agent-team-001"
+	in.AgentSessionID = "workspace-session-v1"
 	in.Sources = append(in.Sources, SummaryWorkflowSource{SourceType: model.SourceGroup, SourceID: "group-2"})
 	in.Participants = []SummaryWorkflowParticipant{{UserID: "p1", UserName: "P1"}}
 
@@ -467,6 +468,9 @@ func TestAgentTeamWorkflowCreatesCollaborators(t *testing.T) {
 	}
 	if got.Target != SummaryWorkflowTeam {
 		t.Fatalf("target = %q, want team", got.Target)
+	}
+	if got.Task.AgentSessionID != in.AgentSessionID {
+		t.Fatalf("agent session id = %q, want %q", got.Task.AgentSessionID, in.AgentSessionID)
 	}
 	var participants []model.SummaryParticipant
 	if err := db.Order("user_id").Find(&participants).Error; err != nil {

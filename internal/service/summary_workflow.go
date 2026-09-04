@@ -122,6 +122,10 @@ type AgentCreateSummaryWorkflowInput struct {
 	OriginChannelID     string
 	OriginChannelType   int
 	IdempotencyKey      string
+	// AgentSessionID marks asynchronous workflows created by the unified Agent
+	// workspace. The worker uses it to preserve the workspace's documented
+	// participant-union source semantics without changing legacy workflows.
+	AgentSessionID string
 }
 
 // CreateSummaryWorkflowResult contains the committed task and the worker
@@ -183,6 +187,7 @@ type normalizedSummaryWorkflowInput struct {
 	originChannelID     string
 	originChannelType   int
 	idempotencyKey      string
+	agentSessionID      string
 	inferred            bool
 	target              SummaryWorkflowTarget
 }
@@ -291,6 +296,7 @@ func (s *SummaryWorkflowService) createFromAgent(ctx context.Context, in AgentCr
 	if normalized.target != expectedTarget {
 		return zero, NewBizError(40001, "workflow target does not match confirmed route", http.StatusBadRequest)
 	}
+	normalized.agentSessionID = strings.TrimSpace(in.AgentSessionID)
 
 	return s.persistIdempotently(ctx, normalized, canonicalSummaryWorkflowRequestHash(normalized))
 }
@@ -437,6 +443,7 @@ func (s *SummaryWorkflowService) persist(ctx context.Context, in normalizedSumma
 		ConfirmDeadline:   &deadline,
 		OriginChannelID:   in.originChannelID,
 		OriginChannelType: in.originChannelType,
+		AgentSessionID:    in.agentSessionID,
 	}
 
 	var creatorParticipantID int64
@@ -701,6 +708,7 @@ func canonicalSummaryWorkflowRequestHash(in normalizedSummaryWorkflowInput) stri
 		ConfirmTimeoutHours int                          `json:"confirm_timeout_hours"`
 		OriginChannelID     string                       `json:"origin_channel_id"`
 		OriginChannelType   int                          `json:"origin_channel_type"`
+		AgentSessionID      string                       `json:"agent_session_id,omitempty"`
 	}{
 		CreatorID:           in.creatorID,
 		Title:               strings.TrimSpace(in.title),
@@ -713,6 +721,7 @@ func canonicalSummaryWorkflowRequestHash(in normalizedSummaryWorkflowInput) stri
 		ConfirmTimeoutHours: in.confirmTimeoutHours,
 		OriginChannelID:     in.originChannelID,
 		OriginChannelType:   in.originChannelType,
+		AgentSessionID:      in.agentSessionID,
 	}
 	data, _ := json.Marshal(payload)
 	hash := sha256.Sum256(data)

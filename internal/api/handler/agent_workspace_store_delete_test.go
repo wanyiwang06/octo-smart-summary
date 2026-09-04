@@ -152,6 +152,30 @@ func TestWorkspaceDeleteAfterCompletionHistorySelfHeals(t *testing.T) {
 	}
 }
 
+func TestWorkspaceDeleteBeforeCompletionPollPersistsErrorWithoutWorkflowState(t *testing.T) {
+	store, coordinator, key, task := seedCompletedWorkflow(t)
+	now := time.Now()
+	if err := store.db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).
+		Updates(map[string]interface{}{"deleted_at": now, "status": -1}).Error; err != nil {
+		t.Fatalf("soft delete task: %v", err)
+	}
+
+	snapshot := runHistoryPoll(t, store, coordinator, key)
+	if snapshot.Session.WorkflowTaskID != 0 {
+		t.Fatalf("workflow pointer = %d, want cleared", snapshot.Session.WorkflowTaskID)
+	}
+	history, err := coordinator.historyFromSnapshot(context.Background(), key.SessionID, snapshot)
+	if err != nil {
+		t.Fatalf("history after delete: %v", err)
+	}
+	if history.State.Workflow != nil {
+		t.Fatalf("error history must not expose an invalid workflow state: %#v", history.State.Workflow)
+	}
+	if len(history.Messages) == 0 || history.Messages[len(history.Messages)-1].ResultType != workspaceResultError {
+		t.Fatalf("history messages = %#v, want terminal error message", history.Messages)
+	}
+}
+
 // SHAPE 2: delete-then-chat — a fresh chat turn after the delete must not 500.
 func TestWorkspaceDeleteThenChatTurnDoesNotError(t *testing.T) {
 	store, coordinator, key, task := seedCompletedWorkflow(t)
@@ -181,11 +205,47 @@ func TestWorkspaceDeleteThenChatTurnDoesNotError(t *testing.T) {
 	}
 }
 
-// SHAPE 3: delete-then-replay — replaying the earlier completed request must
-// render the persisted terminal artifact, not error. The client always loads
-// History (which self-heals the pointer) before it can chat, so the poll runs
-// first here — mirroring the real product sequence after a delete.
-func TestWorkspaceDeleteThenReplayRendersTerminalArtifact(t *testing.T) {
+// SHAPE 3: delete-then-replay before any History poll. The persisted response
+// is workflow_started, but the task has disappeared; replay must return a
+// contract-valid top-level error instead of combining an error workflow state
+// with the old message and returning HTTP 500.
+func TestWorkspaceDeleteThenReplayBeforeHistoryReturnsErrorTurn(t *testing.T) {
+	store, coordinator, key, task := seedCompletedWorkflow(t)
+	now := time.Now()
+	if err := store.db.Model(&model.SummaryTask{}).Where("id = ?", task.ID).
+		Updates(map[string]interface{}{"deleted_at": now, "status": -1}).Error; err != nil {
+		t.Fatalf("soft delete task: %v", err)
+	}
+
+	scope := deleteWorkflowScope()
+	scopeJSON, scopeHash, err := marshalSummaryWorkspaceContext(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := store.BeginTurn(context.Background(), WorkspaceBeginTurnInput{
+		Key:           key,
+		RequestID:     "request-start",
+		RequestHash:   summaryWorkspaceRequestHash("chat", "总结", 1, scopeHash),
+		ScopeVersion:  1,
+		ScopeJSON:     scopeJSON,
+		ScopeHash:     scopeHash,
+		LeaseDuration: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("replay begin: %v", err)
+	}
+	turn, err := coordinator.turnFromSnapshot(context.Background(), key.SessionID, replay.Snapshot, replay.Turn.ResponseMessageID, replay.Turn.RunID)
+	if err != nil {
+		t.Fatalf("replay before History must not error: %v", err)
+	}
+	if turn.ResultType != workspaceResultError || turn.State.Workflow != nil {
+		t.Fatalf("replay turn = %#v, want top-level error with no workflow state", turn)
+	}
+}
+
+// SHAPE 4: a completed artifact exists, then the task is deleted and the old
+// request is replayed before the deletion-healing History poll.
+func TestWorkspaceDeleteCompletedThenReplayBeforeHistoryReturnsErrorTurn(t *testing.T) {
 	store, coordinator, key, task := seedCompletedWorkflow(t)
 
 	poll1 := runHistoryPoll(t, store, coordinator, key)
@@ -197,9 +257,6 @@ func TestWorkspaceDeleteThenReplayRendersTerminalArtifact(t *testing.T) {
 		Updates(map[string]interface{}{"deleted_at": now, "status": -1}).Error; err != nil {
 		t.Fatalf("soft delete task: %v", err)
 	}
-	// The self-healing History poll (SHAPE 1) runs on workspace open.
-	runHistoryPoll(t, store, coordinator, key)
-
 	scope := deleteWorkflowScope()
 	scopeJSON, scopeHash, err := marshalSummaryWorkspaceContext(scope)
 	if err != nil {
@@ -222,16 +279,9 @@ func TestWorkspaceDeleteThenReplayRendersTerminalArtifact(t *testing.T) {
 	}
 	turn, err := coordinator.turnFromSnapshot(context.Background(), key.SessionID, replay.Snapshot, replay.Turn.ResponseMessageID, replay.Turn.RunID)
 	if err != nil {
-		t.Fatalf("P0: replay render after delete must not error: %v", err)
+		t.Fatalf("completed replay before History must not error: %v", err)
 	}
-	// The replay renders the current authoritative artifact. After the heal,
-	// that is the last terminal workflow message (the completed artifact from
-	// poll 1, or an error fold). Either is terminal: no pending confirm, no
-	// in-flight workflow, and no error — the render must simply work.
-	switch turn.ResultType {
-	case workspaceResultWorkflowCompleted, workspaceResultError:
-		// terminal — good
-	default:
-		t.Fatalf("expected a terminal workflow artifact after delete-heal, got %q", turn.ResultType)
+	if turn.ResultType != workspaceResultError || turn.State.Workflow != nil {
+		t.Fatalf("replay turn = %#v, want top-level error with no workflow state", turn)
 	}
 }

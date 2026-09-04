@@ -1,6 +1,46 @@
 package pipeline
 
-import "testing"
+import (
+	"context"
+	"reflect"
+	"testing"
+)
+
+func TestGetPeerUIDRequiresActorParticipation(t *testing.T) {
+	tests := []struct {
+		name      string
+		channelID string
+		selfUID   string
+		want      string
+	}{
+		{name: "actor first", channelID: "actor@peer", selfUID: "actor", want: "peer"},
+		{name: "actor second", channelID: "peer@actor", selfUID: "actor", want: "peer"},
+		{name: "malformed", channelID: "peer", selfUID: "actor", want: ""},
+		{name: "actor absent", channelID: "peer-a@peer-b", selfUID: "actor", want: ""},
+		{name: "self dm", channelID: "actor@actor", selfUID: "actor", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := getPeerUID(tt.channelID, tt.selfUID); got != tt.want {
+				t.Fatalf("getPeerUID(%q, %q) = %q, want %q", tt.channelID, tt.selfUID, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestApplyParticipantChannelScopePreservesWorkspaceUnionSources(t *testing.T) {
+	channels := []ChannelInfo{{ChannelID: "group-a"}, {ChannelID: "group-b"}}
+	got, err := applyParticipantChannelScope(
+		context.Background(), channels, []string{"member-a", "member-b"}, nil,
+		&ChannelScopeOptions{ParticipantSourceUnion: true},
+	)
+	if err != nil {
+		t.Fatalf("applyParticipantChannelScope() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, channels) {
+		t.Fatalf("channels = %#v, want %#v", got, channels)
+	}
+}
 
 func TestValidateExplicitSourceCoverageRejectsFilteredSource(t *testing.T) {
 	channels := []ChannelInfo{{ChannelID: "group-visible"}}

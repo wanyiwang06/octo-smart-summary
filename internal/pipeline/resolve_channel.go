@@ -20,6 +20,11 @@ type ChannelScopeOptions struct {
 	// and threads must belong to this Space; DM peers must be active members of
 	// it. Empty preserves the legacy unscoped discovery behavior.
 	SpaceID string
+	// ParticipantSourceUnion keeps creator-authorised explicit sources when a
+	// unified-workspace team summary allows participants drawn from the union of
+	// the selected groups. Legacy workflows leave this false and retain the
+	// existing all-participants channel intersection.
+	ParticipantSourceUnion bool
 }
 
 // ChannelScopeRule represents a single channel scope constraint rule.

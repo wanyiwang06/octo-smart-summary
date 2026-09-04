@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"log"
@@ -302,12 +303,18 @@ func isValidMessageTable(table string, tableCount int) bool {
 func getPeerUID(channelID, selfUID string) string {
 	parts := strings.SplitN(channelID, "@", 2)
 	if len(parts) != 2 {
-		return channelID
+		return ""
 	}
 	if parts[0] == selfUID {
+		if parts[1] == selfUID {
+			return ""
+		}
 		return parts[1]
 	}
-	return parts[0]
+	if parts[1] == selfUID {
+		return parts[0]
+	}
+	return ""
 }
 
 // NormalizeDMChannelID canonicalises the WuKongIM DM channel_id ("uid_a@uid_b")
@@ -444,6 +451,14 @@ func ApplySourceConstraints(userChannels []ChannelInfo, specifiedSources []map[s
 }
 
 func validateExplicitSourceCoverage(userChannels []ChannelInfo, specifiedSources []map[string]interface{}, selfUID string) error {
+	return validateExplicitSourceCoverageWithMessage(userChannels, specifiedSources, selfUID, "explicit summary source is unavailable in the current space")
+}
+
+func validateExplicitParticipantSourceCoverage(userChannels []ChannelInfo, specifiedSources []map[string]interface{}, selfUID string) error {
+	return validateExplicitSourceCoverageWithMessage(userChannels, specifiedSources, selfUID, "explicit summary source is not shared by every participant")
+}
+
+func validateExplicitSourceCoverageWithMessage(userChannels []ChannelInfo, specifiedSources []map[string]interface{}, selfUID, message string) error {
 	if len(specifiedSources) == 0 {
 		return nil
 	}
@@ -461,7 +476,7 @@ func validateExplicitSourceCoverage(userChannels []ChannelInfo, specifiedSources
 	}
 	for id := range requested {
 		if _, ok := available[id]; !ok {
-			return fmt.Errorf("explicit summary source is unavailable in the current space")
+			return errors.New(message)
 		}
 	}
 	return nil
@@ -771,6 +786,13 @@ func IntersectParticipantChannels(ctx context.Context, creatorChannels []Channel
 	return result, nil
 }
 
+func applyParticipantChannelScope(ctx context.Context, creatorChannels []ChannelInfo, participantUIDs []string, imDB *gorm.DB, scope *ChannelScopeOptions, opts ...ChannelQueryOption) ([]ChannelInfo, error) {
+	if scope != nil && scope.ParticipantSourceUnion {
+		return creatorChannels, nil
+	}
+	return IntersectParticipantChannels(ctx, creatorChannels, participantUIDs, imDB, opts...)
+}
+
 // FilterByMutualActivity keeps only messages from channels where both
 // the creator and at least one participant have sent messages. (Layer 4.5)
 func FilterByMutualActivity(messages []Message, creatorUID string, participantUIDs []string) []Message {
@@ -970,17 +992,25 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 	}
 	log.Printf("[pipeline-personal] Layer 1 (channel discovery) took %dms (%d channels)",
 		time.Since(l1Start).Milliseconds(), len(userChannels))
-
-	// Layer 1.5: intersect with participant channels
-	l15Start := time.Now()
-	userChannels, err = IntersectParticipantChannels(ctx, userChannels, participantUIDs, imDB, channelQueryOpts...)
-	if err != nil {
-		return nil, nil, fmt.Errorf("intersect participant channels: %w", err)
-	}
 	if err := validateExplicitSourceCoverage(userChannels, specifiedSources, creatorUID); err != nil {
 		return nil, nil, err
 	}
-	log.Printf("[pipeline-personal] Layer 1.5 (participant intersect) took %dms (%d channels)",
+
+	// Layer 1.5: legacy workflows require every participant to share every
+	// channel. Unified-workspace team workflows instead authorise participants
+	// against the selected-group member union before task creation, so their
+	// explicit creator-authorised sources must remain intact here.
+	l15Start := time.Now()
+	userChannels, err = applyParticipantChannelScope(ctx, userChannels, participantUIDs, imDB, channelScopeOpts, channelQueryOpts...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("intersect participant channels: %w", err)
+	}
+	if channelScopeOpts == nil || !channelScopeOpts.ParticipantSourceUnion {
+		if err := validateExplicitParticipantSourceCoverage(userChannels, specifiedSources, creatorUID); err != nil {
+			return nil, nil, err
+		}
+	}
+	log.Printf("[pipeline-personal] Layer 1.5 (participant scope) took %dms (%d channels)",
 		time.Since(l15Start).Milliseconds(), len(userChannels))
 
 	// Build memberMap for intent recognition (before LLM call)
