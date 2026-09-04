@@ -18,8 +18,9 @@ const (
 type SummaryAction string
 
 const (
-	SummaryActionChat            SummaryAction = "chat"
-	SummaryActionConfirmWorkflow SummaryAction = "confirm_workflow"
+	SummaryActionChat              SummaryAction = "chat"
+	SummaryActionStartTeamWorkflow SummaryAction = "start_team_workflow"
+	SummaryActionConfirmWorkflow   SummaryAction = "confirm_workflow"
 )
 
 // SummaryRoute is the next operation allowed by the deterministic policy.
@@ -65,6 +66,13 @@ func DeriveSummaryRoute(in SummaryRouteInput) SummaryRoute {
 			(in.HasSelectedSource && !in.HasValidSource) ||
 			(!in.HasSelectedTemplate && !in.HasRequirement) ||
 			!in.HasTeamProposal || !in.TeamProposalScopeMatches {
+			return SummaryRouteClarification
+		}
+		return SummaryRouteTeamWorkflow
+	case SummaryActionStartTeamWorkflow:
+		if in.HasHardMissingData || !in.HasOtherParticipants || !in.ParticipantsValid ||
+			(in.HasSelectedSource && !in.HasValidSource) ||
+			(!in.HasSelectedTemplate && !in.HasRequirement) {
 			return SummaryRouteClarification
 		}
 		return SummaryRouteTeamWorkflow

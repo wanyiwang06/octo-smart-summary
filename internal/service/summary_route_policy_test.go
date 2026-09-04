@@ -9,6 +9,34 @@ func TestDeriveSummaryRoute(t *testing.T) {
 		want SummaryRoute
 	}{
 		{
+			name: "explicit team start bypasses confirmation",
+			in: SummaryRouteInput{
+				Action:               SummaryActionStartTeamWorkflow,
+				HasRequirement:       true,
+				HasOtherParticipants: true,
+				ParticipantsValid:    true,
+			},
+			want: SummaryRouteTeamWorkflow,
+		},
+		{
+			name: "explicit team start still validates requirements",
+			in: SummaryRouteInput{
+				Action:               SummaryActionStartTeamWorkflow,
+				HasOtherParticipants: true,
+				ParticipantsValid:    true,
+			},
+			want: SummaryRouteClarification,
+		},
+		{
+			name: "explicit team start still validates participants",
+			in: SummaryRouteInput{
+				Action:               SummaryActionStartTeamWorkflow,
+				HasRequirement:       true,
+				HasOtherParticipants: true,
+			},
+			want: SummaryRouteClarification,
+		},
+		{
 			name: "personal workflow requires source template and generate intent",
 			in: SummaryRouteInput{
 				Intent:               SummaryIntentGenerate,

@@ -165,9 +165,10 @@ func (h *AgentChatHandler) ConfigureSummaryWorkspace(imDB *gorm.DB, workerTrigge
 func (h *AgentChatHandler) SummaryWorkspaceCapabilities(c *gin.Context) {
 	enabled := h != nil && h.workspace != nil
 	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: gin.H{
-		"enabled":             enabled,
-		"contract_version":    summaryWorkspaceContractVersion,
-		"max_time_range_days": pipeline.MaxTimeRangeDays,
+		"enabled":              enabled,
+		"contract_version":     summaryWorkspaceContractVersion,
+		"max_time_range_days":  pipeline.MaxTimeRangeDays,
+		"direct_team_workflow": enabled,
 	}})
 }
 
@@ -176,8 +177,9 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50300, Message: "summary workspace is not configured"})
 		return
 	}
-	if req.Action != string(service.SummaryActionChat) {
-		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "action 必须为 chat"})
+	action := service.SummaryAction(req.Action)
+	if action != service.SummaryActionChat && action != service.SummaryActionStartTeamWorkflow {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40000, Message: "action 必须为 chat 或 start_team_workflow"})
 		return
 	}
 	req.Message = strings.TrimSpace(req.Message)
@@ -276,7 +278,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	openScopeAgent := !selectedSourceExplicit && len(contextValue.Participants) == 0 &&
 		len(contextValue.ReferencedTaskIDs) == 0 && summaryWorkspaceUserRequirement(req.Message, req.InputOrigin) != ""
 	contextValue, inferredSource, err := h.workspace.materializeWorkspaceAgentContext(
-		c.Request.Context(), spaceID, uid, contextValue, begin.Snapshot, intent, req.InputOrigin,
+		c.Request.Context(), spaceID, uid, contextValue, begin.Snapshot, req.Message, intent, req.InputOrigin,
 	)
 	if err != nil {
 		if errors.Is(err, errSummaryWorkspaceNoRecentChannel) {
@@ -313,7 +315,7 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		return
 	}
 	explicitRunIntent := intent == service.SummaryIntentGenerate && summaryWorkspaceExecutionAuthorized(req.InputOrigin)
-	route := deriveWorkspaceRoute(contextValue, intent, explicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent, begin.Snapshot, validation.participantsValid, validation.sourcesValid, validation.referencesValid)
+	route := deriveWorkspaceRoute(contextValue, action, intent, explicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent, begin.Snapshot, validation.participantsValid, validation.sourcesValid, validation.referencesValid)
 
 	var snapshot WorkspaceSnapshot
 	// The chat contract accepts request ids the workflow idempotency-key
@@ -670,7 +672,7 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 			nextVersion = 1
 		}
 		payload.Preview.Version = nextVersion
-		payload.Preview.Assumptions = appendUniqueStrings(payload.Preview.Assumptions, summaryWorkspaceAssumptions(contextValue)...)
+		payload.Preview.Assumptions = mergeSummaryWorkspaceAssumptions(payload.Preview.Assumptions, contextValue)
 		if inferredSource && len(effectiveChannels) == 1 {
 			payload.Preview.Assumptions = appendUniqueStrings(payload.Preview.Assumptions, "未指定聊天，使用最近活跃聊天「"+effectiveChannels[0].Name+"」")
 		}
@@ -1115,10 +1117,10 @@ func containsAny(value string, needles ...string) bool {
 	return false
 }
 
-func deriveWorkspaceRoute(context summaryWorkspaceContext, intent service.SummaryIntent, hasExplicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent bool, state WorkspaceSnapshot, participantsValid, sourcesValid, referencesValid bool) service.SummaryRoute {
+func deriveWorkspaceRoute(context summaryWorkspaceContext, action service.SummaryAction, intent service.SummaryIntent, hasExplicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent bool, state WorkspaceSnapshot, participantsValid, sourcesValid, referencesValid bool) service.SummaryRoute {
 	hasPreview := state.CurrentPreview != nil
 	return service.DeriveSummaryRoute(service.SummaryRouteInput{
-		Action:                     service.SummaryActionChat,
+		Action:                     action,
 		Intent:                     intent,
 		HasExplicitRunIntent:       hasExplicitRunIntent,
 		HasSelectedSource:          selectedSourceExplicit,
@@ -1225,8 +1227,10 @@ func summaryWorkspaceExecutionRequirement(contextValue summaryWorkspaceContext, 
 
 func summaryWorkspaceAssumptions(context summaryWorkspaceContext) []string {
 	assumptions := make([]string, 0, 3)
-	if context.TimeRange == nil || context.TimeRange.Label == "最近 7 天（默认）" {
+	if context.TimeRange == nil {
 		assumptions = append(assumptions, "时间范围使用最近 7 天")
+	} else if label := strings.TrimSuffix(strings.TrimSpace(context.TimeRange.Label), "（默认）"); label != "" {
+		assumptions = append(assumptions, "时间范围使用"+label)
 	}
 	if context.Template == nil {
 		assumptions = append(assumptions, "采用通用总结结构")
@@ -1237,11 +1241,24 @@ func summaryWorkspaceAssumptions(context summaryWorkspaceContext) []string {
 	return assumptions
 }
 
+func mergeSummaryWorkspaceAssumptions(existing []string, context summaryWorkspaceContext) []string {
+	merged := make([]string, 0, len(existing)+3)
+	for _, assumption := range existing {
+		trimmed := strings.TrimSpace(assumption)
+		if trimmed == "" || strings.HasPrefix(strings.ReplaceAll(trimmed, " ", ""), "时间范围") {
+			continue
+		}
+		merged = appendUniqueStrings(merged, trimmed)
+	}
+	return appendUniqueStrings(merged, summaryWorkspaceAssumptions(context)...)
+}
+
 func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 	ctx context.Context,
 	spaceID, actorID string,
 	contextValue summaryWorkspaceContext,
 	before WorkspaceSnapshot,
+	message string,
 	intent service.SummaryIntent,
 	inputOrigin string,
 ) (summaryWorkspaceContext, bool, error) {
@@ -1254,6 +1271,11 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 	now := timezone.Now()
 	if w != nil && w.now != nil {
 		now = w.now()
+	}
+	if inputOrigin == summaryWorkspaceInputUser && intent != service.SummaryIntentExplain {
+		if requestedRange, ok := summaryWorkspaceRequestedPresetTimeRange(message, now); ok {
+			contextValue.TimeRange = requestedRange
+		}
 	}
 	needsRecentFallback := intent == service.SummaryIntentGenerate &&
 		len(contextValue.SelectedChannels) == 0 &&
@@ -1279,6 +1301,73 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 		contextValue = materializeSummaryWorkspaceDefaultTimeRange(contextValue, now)
 	}
 	return contextValue, false, nil
+}
+
+type summaryWorkspacePresetTimeRange struct {
+	days     int
+	label    string
+	patterns []string
+}
+
+var summaryWorkspacePresetTimeRanges = []summaryWorkspacePresetTimeRange{
+	{days: 7, label: "最近 7 天", patterns: []string{"最近7天", "最近七天", "近7天", "近七天", "过去7天", "过去七天", "最近一周", "近一周", "过去一周"}},
+	{days: 15, label: "最近半个月", patterns: []string{"最近15天", "最近十五天", "近15天", "近十五天", "过去15天", "过去十五天", "最近半个月", "近半个月", "过去半个月"}},
+	{days: 30, label: "最近一个月", patterns: []string{"最近30天", "最近三十天", "近30天", "近三十天", "过去30天", "过去三十天", "最近一个月", "近一个月", "过去一个月", "一个月以来"}},
+}
+
+func summaryWorkspaceRequestedPresetTimeRange(message string, now time.Time) (*summaryWorkspaceTimeRange, bool) {
+	normalized := strings.ToLower(strings.Join(strings.Fields(message), ""))
+	if normalized == "" {
+		return nil, false
+	}
+
+	type matchedPreset struct {
+		index int
+		days  int
+		label string
+	}
+	best := matchedPreset{index: -1}
+	for _, preset := range summaryWorkspacePresetTimeRanges {
+		for _, pattern := range preset.patterns {
+			if index := strings.LastIndex(normalized, pattern); index > best.index {
+				best = matchedPreset{index: index, days: preset.days, label: preset.label}
+			}
+		}
+	}
+
+	if best.index < 0 && containsAny(normalized,
+		"时间范围", "时间窗口", "取数范围", "统计范围",
+		"扩大到", "扩展到", "调整为", "改为", "改成",
+	) {
+		for _, candidate := range []struct {
+			patterns []string
+			days     int
+			label    string
+		}{
+			{patterns: []string{"7天", "七天", "一周"}, days: 7, label: "最近 7 天"},
+			{patterns: []string{"15天", "十五天", "半个月"}, days: 15, label: "最近半个月"},
+			{patterns: []string{"30天", "三十天", "一个月"}, days: 30, label: "最近一个月"},
+		} {
+			for _, pattern := range candidate.patterns {
+				if index := strings.LastIndex(normalized, pattern); index > best.index {
+					best = matchedPreset{index: index, days: candidate.days, label: candidate.label}
+				}
+			}
+		}
+	}
+	if best.index < 0 {
+		return nil, false
+	}
+
+	location := now.Location()
+	end := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, int(time.Second-time.Nanosecond), location)
+	startDay := now.AddDate(0, 0, -(best.days - 1))
+	start := time.Date(startDay.Year(), startDay.Month(), startDay.Day(), 0, 0, 0, 0, location)
+	return &summaryWorkspaceTimeRange{
+		Start: start.Format(time.RFC3339Nano),
+		End:   end.Format(time.RFC3339Nano),
+		Label: best.label,
+	}, true
 }
 
 func materializeSummaryWorkspaceDefaultTimeRange(contextValue summaryWorkspaceContext, now time.Time) summaryWorkspaceContext {
@@ -1339,7 +1428,7 @@ func hydrateSummaryWorkspaceContextFromPreview(contextValue summaryWorkspaceCont
 		}
 		contextValue.SelectedChannels = channels
 	}
-	if contextValue.TimeRange == nil && effective.TimeRange != nil {
+	if effective.TimeRange != nil && strings.TrimSpace(effective.TimeRange.Label) != "" {
 		contextValue.TimeRange = &summaryWorkspaceTimeRange{
 			Start: effective.TimeRange.Start,
 			End:   effective.TimeRange.End,
@@ -2173,6 +2262,7 @@ func (w *summaryWorkspaceCoordinator) historyFromSnapshot(ctx context.Context, s
 		if message.Role == "assistant" && workspaceMessageMatchesState(&message, state) {
 			actions = workspaceActionsForResult(message.ResultType, message.SavedTaskID > 0)
 		}
+		preview := workspaceHistoryPreview(message, actions)
 		messages = append(messages, summaryWorkspaceHistoryMessage{
 			ID:               message.ID,
 			Role:             message.Role,
@@ -2181,6 +2271,7 @@ func (w *summaryWorkspaceCoordinator) historyFromSnapshot(ctx context.Context, s
 			ScopeVersion:     message.ScopeVersion,
 			ArtifactVersion:  message.ArtifactVersion,
 			AvailableActions: actions,
+			Preview:          preview,
 		})
 	}
 	return summaryWorkspaceHistory{
@@ -2189,4 +2280,28 @@ func (w *summaryWorkspaceCoordinator) historyFromSnapshot(ctx context.Context, s
 		Messages:        messages,
 		State:           state,
 	}, nil
+}
+
+func workspaceHistoryPreview(message model.AgentMessage, actions []string) *summaryWorkspacePreview {
+	if message.Role != "assistant" ||
+		(message.ResultType != workspaceResultAgentPreview && message.ResultType != workspaceResultAgentRevision) ||
+		message.ResponsePayload == nil || strings.TrimSpace(*message.ResponsePayload) == "" {
+		return nil
+	}
+	var payload agent.SummaryResponsePayload
+	if err := json.Unmarshal([]byte(*message.ResponsePayload), &payload); err != nil ||
+		payload.Preview == nil || strings.TrimSpace(payload.Preview.Content) == "" ||
+		payload.Preview.Version != message.ArtifactVersion {
+		return nil
+	}
+	return &summaryWorkspacePreview{
+		MessageID:        message.ID,
+		ResultType:       message.ResultType,
+		ScopeVersion:     message.ScopeVersion,
+		ArtifactVersion:  message.ArtifactVersion,
+		SnapshotVersion:  message.SnapshotVersion,
+		Content:          payload.Preview.Content,
+		Assumptions:      append([]string{}, payload.Preview.Assumptions...),
+		AvailableActions: append([]string{}, actions...),
+	}
 }

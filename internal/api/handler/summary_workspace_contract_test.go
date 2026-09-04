@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -8,11 +9,72 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
 	"github.com/gin-gonic/gin"
 )
+
+func TestSummaryWorkspaceHistoryPreservesEveryPreview(t *testing.T) {
+	scopeJSON, _, err := marshalSummaryWorkspaceContext(emptySummaryWorkspaceContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	previewPayload := func(content string, version int) *string {
+		data, marshalErr := json.Marshal(agent.SummaryResponsePayload{
+			ResultType:      workspaceResultAgentRevision,
+			ExecutionTarget: "agent_preview",
+			Preview: &agent.SummaryResponsePreview{
+				Content: content,
+				Version: version,
+			},
+		})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		value := string(data)
+		return &value
+	}
+	messages := []model.AgentMessage{
+		{
+			ID: 11, Role: "assistant", Content: "第一版", ResultType: workspaceResultAgentRevision,
+			ScopeVersion: 1, ArtifactVersion: 1, SnapshotVersion: workspaceSnapshotVersion,
+			ResponsePayload: previewPayload("# 总结 V1", 1),
+		},
+		{
+			ID: 22, Role: "assistant", Content: "第二版", ResultType: workspaceResultAgentRevision,
+			ScopeVersion: 1, ArtifactVersion: 2, SnapshotVersion: workspaceSnapshotVersion,
+			ResponsePayload: previewPayload("# 总结 V2", 2),
+		},
+	}
+	snapshot := WorkspaceSnapshot{
+		Session: model.AgentSummarySession{
+			ContractVersion:        summaryWorkspaceContractVersion,
+			ScopeVersion:           1,
+			ScopeJSON:              string(scopeJSON),
+			ArtifactVersion:        2,
+			LatestPreviewMessageID: 22,
+		},
+		Messages:       messages,
+		CurrentPreview: &messages[1],
+	}
+
+	history, err := (&summaryWorkspaceCoordinator{}).historyFromSnapshot(context.Background(), "session-1", snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history.Messages) != 2 || history.Messages[0].Preview == nil || history.Messages[1].Preview == nil {
+		t.Fatalf("history previews = %#v, want both versions", history.Messages)
+	}
+	if history.Messages[0].Preview.Content != "# 总结 V1" || len(history.Messages[0].Preview.AvailableActions) != 0 {
+		t.Fatalf("old preview = %#v, want read-only V1", history.Messages[0].Preview)
+	}
+	if history.Messages[1].Preview.Content != "# 总结 V2" ||
+		!reflect.DeepEqual(history.Messages[1].Preview.AvailableActions, []string{workspaceActionSavePreview, workspaceActionContinueChat}) {
+		t.Fatalf("latest preview = %#v, want actionable V2", history.Messages[1].Preview)
+	}
+}
 
 func TestSummaryWorkspaceCapabilitiesAdvertisesTimeRangeLimit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -27,9 +89,10 @@ func TestSummaryWorkspaceCapabilitiesAdvertisesTimeRangeLimit(t *testing.T) {
 	}
 	var payload struct {
 		Data struct {
-			Enabled          bool   `json:"enabled"`
-			ContractVersion  string `json:"contract_version"`
-			MaxTimeRangeDays int    `json:"max_time_range_days"`
+			Enabled            bool   `json:"enabled"`
+			ContractVersion    string `json:"contract_version"`
+			MaxTimeRangeDays   int    `json:"max_time_range_days"`
+			DirectTeamWorkflow bool   `json:"direct_team_workflow"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
@@ -40,6 +103,9 @@ func TestSummaryWorkspaceCapabilitiesAdvertisesTimeRangeLimit(t *testing.T) {
 	}
 	if payload.Data.MaxTimeRangeDays != 90 {
 		t.Fatalf("max_time_range_days = %d, want 90", payload.Data.MaxTimeRangeDays)
+	}
+	if !payload.Data.DirectTeamWorkflow {
+		t.Fatal("direct_team_workflow = false, want true")
 	}
 }
 
@@ -294,6 +360,7 @@ func TestDeriveWorkspaceRouteFinalMatrix(t *testing.T) {
 	participant := summaryWorkspaceParticipant{UserID: "u2"}
 	tests := []struct {
 		name                   string
+		action                 service.SummaryAction
 		context                summaryWorkspaceContext
 		selectedSourceExplicit bool
 		hasRequirement         bool
@@ -308,11 +375,16 @@ func TestDeriveWorkspaceRouteFinalMatrix(t *testing.T) {
 		{name: "C plus P without requirement clarifies", context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}, Participants: []summaryWorkspaceParticipant{participant}}, selectedSourceExplicit: true, sourcesValid: true, want: service.SummaryRouteClarification},
 		{name: "P plus T requires team confirmation", context: summaryWorkspaceContext{Participants: []summaryWorkspaceParticipant{participant}, Template: template}, hasRequirement: true, want: service.SummaryRouteTeamConfirmation},
 		{name: "C plus P plus T requires team confirmation", context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}, Participants: []summaryWorkspaceParticipant{participant}, Template: template}, selectedSourceExplicit: true, hasRequirement: true, sourcesValid: true, want: service.SummaryRouteTeamConfirmation},
+		{name: "explicit team start skips confirmation", action: service.SummaryActionStartTeamWorkflow, context: summaryWorkspaceContext{SelectedChannels: []summaryWorkspaceChannel{channel}, Participants: []summaryWorkspaceParticipant{participant}, Template: template}, selectedSourceExplicit: true, hasRequirement: true, sourcesValid: true, want: service.SummaryRouteTeamWorkflow},
 		{name: "U only enters open-scope agent", context: summaryWorkspaceContext{}, hasRequirement: true, openScopeAgent: true, want: service.SummaryRouteAgentPreview},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := deriveWorkspaceRoute(tt.context, service.SummaryIntentGenerate, true, tt.selectedSourceExplicit, tt.hasRequirement, tt.openScopeAgent, WorkspaceSnapshot{}, true, tt.sourcesValid, true)
+			action := tt.action
+			if action == "" {
+				action = service.SummaryActionChat
+			}
+			got := deriveWorkspaceRoute(tt.context, action, service.SummaryIntentGenerate, true, tt.selectedSourceExplicit, tt.hasRequirement, tt.openScopeAgent, WorkspaceSnapshot{}, true, tt.sourcesValid, true)
 			if got != tt.want {
 				t.Fatalf("route = %q, want %q", got, tt.want)
 			}

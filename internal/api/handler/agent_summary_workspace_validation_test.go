@@ -105,7 +105,7 @@ func TestMaterializeTemplateOnlyContextPinsRecentChannelAndSevenDays(t *testing.
 		Template:          &summaryWorkspaceTemplate{TemplateID: "weekly", Label: "周报", Requirement: "总结进展"},
 		ReferencedTaskIDs: []int64{},
 	}
-	got, inferred, err := coordinator.materializeWorkspaceAgentContext(context.Background(), "space-a", "actor", contextValue, WorkspaceSnapshot{}, service.SummaryIntentGenerate, summaryWorkspaceInputSystemIntent)
+	got, inferred, err := coordinator.materializeWorkspaceAgentContext(context.Background(), "space-a", "actor", contextValue, WorkspaceSnapshot{}, "", service.SummaryIntentGenerate, summaryWorkspaceInputSystemIntent)
 	if err != nil {
 		t.Fatalf("materialize context: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestMaterializeOpenScopeAgentContextPinsSevenDays(t *testing.T) {
 
 	got, inferred, err := coordinator.materializeWorkspaceAgentContext(
 		context.Background(), "space-a", "actor", emptySummaryWorkspaceContext(), WorkspaceSnapshot{},
-		service.SummaryIntentGenerate, summaryWorkspaceInputUser,
+		"生成一份总结", service.SummaryIntentGenerate, summaryWorkspaceInputUser,
 	)
 	if err != nil {
 		t.Fatalf("materialize open-scope context: %v", err)

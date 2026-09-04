@@ -139,13 +139,14 @@ type summaryWorkspaceTurn struct {
 }
 
 type summaryWorkspaceHistoryMessage struct {
-	ID               int64    `json:"id"`
-	Role             string   `json:"role"`
-	Content          string   `json:"content"`
-	ResultType       string   `json:"result_type,omitempty"`
-	ScopeVersion     int      `json:"scope_version"`
-	ArtifactVersion  int      `json:"artifact_version,omitempty"`
-	AvailableActions []string `json:"available_actions,omitempty"`
+	ID               int64                    `json:"id"`
+	Role             string                   `json:"role"`
+	Content          string                   `json:"content"`
+	ResultType       string                   `json:"result_type,omitempty"`
+	ScopeVersion     int                      `json:"scope_version"`
+	ArtifactVersion  int                      `json:"artifact_version,omitempty"`
+	AvailableActions []string                 `json:"available_actions,omitempty"`
+	Preview          *summaryWorkspacePreview `json:"preview,omitempty"`
 }
 
 type summaryWorkspaceHistory struct {
