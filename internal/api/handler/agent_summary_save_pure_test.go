@@ -176,6 +176,28 @@ func TestCanonicalAgentSaveRequestHash_WorkspaceVersionsMatter(t *testing.T) {
 	}
 }
 
+func TestCanonicalAgentSaveRequestHash_WorkspaceIgnoresDiscardedClientScope(t *testing.T) {
+	scope, artifact := 2, 3
+	originA, originB := "client-a", "client-b"
+	base := createAgentSummaryReq{
+		SessionID: "workspace-session", AgentMessageID: 42, SnapshotVersion: 1,
+		ScopeVersion: &scope, ExpectedArtifactVersion: &artifact, Title: "Weekly",
+		OriginChannelID: &originA, OriginChannelType: 1,
+		Sources:           []sourceReq{{SourceType: 1, SourceID: "source-a"}},
+		Participants:      []participantReq{{UserID: "member-a", UserName: "A"}},
+		ReferencedTaskIDs: []int64{10},
+	}
+	changed := base
+	changed.OriginChannelID = &originB
+	changed.OriginChannelType = 2
+	changed.Sources = []sourceReq{{SourceType: 2, SourceID: "source-b"}}
+	changed.Participants = []participantReq{{UserID: "member-b", UserName: "B"}}
+	changed.ReferencedTaskIDs = []int64{20}
+	if first, second := canonicalAgentSaveRequestHash("u1", base), canonicalAgentSaveRequestHash("u1", changed); first != second {
+		t.Fatalf("workspace hash changed for discarded client scope: %s != %s", first, second)
+	}
+}
+
 func TestValidateWorkspacePreviewSaveRequest_LegacyAndStrictShapes(t *testing.T) {
 	if err := validateWorkspacePreviewSaveRequest(createAgentSummaryReq{SessionID: "legacy"}); err != nil {
 		t.Fatalf("legacy request rejected: %v", err)

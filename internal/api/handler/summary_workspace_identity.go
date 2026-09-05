@@ -30,12 +30,3 @@ func persistedOrDerivedWorkspaceAgentSessionID(persisted, spaceID, sessionID str
 	}
 	return summaryWorkspaceAgentSessionID(spaceID, sessionID, scopeVersion)
 }
-
-func summaryWorkspaceCommittedAgentSessionID(previous, candidate string, mode summaryWorkspaceSourceUpdateMode, scopeCommitted bool) string {
-	if mode == summaryWorkspaceSourceReplace && scopeCommitted {
-		if candidate = strings.TrimSpace(candidate); candidate != "" {
-			return candidate
-		}
-	}
-	return strings.TrimSpace(previous)
-}

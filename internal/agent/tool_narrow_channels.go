@@ -48,7 +48,7 @@ func NarrowChannelsByTopicTool() (Tool, Handler) {
 			return "", fmt.Errorf("missing user identity in context")
 		}
 
-		summaryDB, imDB, _, cfg := GetSummaryDeps()
+		_, imDB, _, cfg := GetSummaryDeps()
 
 		accessible, err := pipeline.GetUserChannels(ctx, uid, imDB, pipeline.WithSpaceID(WorkspaceSpaceID(ctx)))
 		if err != nil {
@@ -91,7 +91,6 @@ func NarrowChannelsByTopicTool() (Tool, Handler) {
 		// candidates as never-fetched gaps. A pass-through is the absence of a scope
 		// decision, not a decision to cover everything.
 		if didNarrow {
-			recordDiscoveredChannels(ctx, summaryDB, uid, channelIDsOf(narrowed))
 			AuthorizeDiscoveredChannels(ctx, narrowed)
 		}
 

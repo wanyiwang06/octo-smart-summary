@@ -31,7 +31,7 @@ const (
 	workspaceActionViewProgress         = "view_progress"
 	workspaceActionContinueChat         = "continue_chat"
 	workspaceSnapshotVersion            = 1
-	maxSummaryWorkspaceSelectedChannels = 30
+	maxSummaryWorkspaceSelectedChannels = agent.MaxWorkspaceSelectedChannels
 	maxSummaryWorkspaceParticipants     = 30
 	maxSummaryWorkspaceReferencedTask   = 20
 	maxSummaryWorkspaceIDLength         = 256

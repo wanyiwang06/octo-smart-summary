@@ -5,33 +5,18 @@ import (
 	"log"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
-	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"gorm.io/gorm"
 )
 
-// channelIDsOf projects channel ids out of a discovery result.
-func channelIDsOf(channels []pipeline.ChannelInfo) []string {
-	ids := make([]string, 0, len(channels))
-	for _, ch := range channels {
-		if ch.ChannelID != "" {
-			ids = append(ids, ch.ChannelID)
-		}
-	}
-	return ids
-}
-
-// recordDiscoveredChannels unions the channels a NARROWING tool just chose as the
-// run's scope onto the run row, so the finish gate can detect an open-scope
-// under-fetch.
+// recordDiscoveredChannels records the final model-declared channel scope on
+// the run row, so the finish gate can detect an open-scope under-fetch.
 //
 // Why this exists: for an open-scope run (no UI channel picker) the Spec pins no
 // channels, so the gate's expected-vs-fetched comparison had nothing to compare
-// and every such run reported COMPLETE — including one that narrowed to 12
-// channels and fetched 2. The narrowing tools (narrow_channels_by_topic /
-// find_shared_channels) are the only place that knows what "everything in scope"
-// meant. list_channels calls it only when commit_scope=true explicitly declares
-// that the whole visible surface is the requested scope; ordinary exploratory
-// listing remains excluded so topic-based runs do not gain false coverage gaps.
+// and every such run reported COMPLETE — including one that selected 12
+// channels and fetched 2. Discovery candidates are deliberately not recorded:
+// only set_summary_scope owns the final selection and therefore the expected
+// coverage set.
 //
 // Best-effort and V2-gated, exactly like the coverage recording in fetch_channel:
 // this is observability for the verdict, never a reason to fail a tool call. The
@@ -48,4 +33,14 @@ func recordDiscoveredChannels(ctx context.Context, summaryDB *gorm.DB, uid strin
 	if err := summaryrun.NewStore(summaryDB).RecordDiscoveredChannels(context.WithoutCancel(ctx), uid, runID, channelIDs); err != nil {
 		log.Printf("[agent] record discovered channels failed run=%s count=%d: %v", runID, len(channelIDs), err)
 	}
+}
+
+func channelScopeIDsOf(channels []ChannelScope) []string {
+	ids := make([]string, 0, len(channels))
+	for _, channel := range channels {
+		if channel.ChannelID != "" {
+			ids = append(ids, channel.ChannelID)
+		}
+	}
+	return ids
 }

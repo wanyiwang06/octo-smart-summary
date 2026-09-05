@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -241,6 +242,37 @@ func TestRunTools_FetchBeforeSummarizePreservesResultOrder(t *testing.T) {
 		mkToolCall("fetch", "fetch_channel", `{}`),
 	}, 2, 20)
 	if len(results) != 2 || results[0] != "summarize-result" || results[1] != "fetch-result" {
+		t.Fatalf("results lost original tool-call order: %+v", results)
+	}
+}
+
+func TestRunTools_ScopeDeclarationRunsBetweenDiscoveryAndFetch(t *testing.T) {
+	phase := 0
+	reg := NewRegistry()
+	register := func(name string, want, next int) {
+		reg.Register(Tool{Type: "function", Function: ToolFunction{Name: name}},
+			func(context.Context, json.RawMessage) (string, error) {
+				if phase != want {
+					return "", fmt.Errorf("%s ran at phase %d, want %d", name, phase, want)
+				}
+				phase = next
+				return name + "-result", nil
+			})
+	}
+	register("narrow_channels_by_topic", 0, 1)
+	register("set_summary_scope", 1, 2)
+	register("fetch_channel", 2, 3)
+
+	r := NewRunner(nil, reg, NewPool(4), Policy{})
+	results := r.runTools(context.Background(), []ToolCall{
+		mkToolCall("fetch", "fetch_channel", `{}`),
+		mkToolCall("scope", "set_summary_scope", `{}`),
+		mkToolCall("discover", "narrow_channels_by_topic", `{}`),
+	}, 2, 20)
+	if phase != 3 {
+		t.Fatalf("final phase = %d, want 3; results=%+v", phase, results)
+	}
+	if len(results) != 3 || results[0] != "fetch_channel-result" || results[1] != "set_summary_scope-result" || results[2] != "narrow_channels_by_topic-result" {
 		t.Fatalf("results lost original tool-call order: %+v", results)
 	}
 }

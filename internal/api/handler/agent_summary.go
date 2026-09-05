@@ -460,9 +460,9 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			return
 		}
 	}
-	resolvedRequestID := req.RequestID
-	if agent.SummaryV2Enabled() {
-		resolvedRequestID, err = resolveAgentMessageRequestID(
+	runBinding := agentMessageRunBinding{RequestID: req.RequestID}
+	if agent.SummaryV2Enabled() || workspaceSave {
+		runBinding, err = resolveAgentMessageRunBinding(
 			c.Request.Context(), h.db, userID, req.SessionID, req.RequestID, draftMsg,
 		)
 		if err != nil {
@@ -478,6 +478,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			return
 		}
 	}
+	resolvedRequestID := runBinding.RequestID
 	content := draftMsg.Content
 	if workspaceSave {
 		content = workspaceCandidate.Content
@@ -683,12 +684,16 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		// Build citations from session tool traces (fallback to empty array on error)
 		evidenceSessionID := req.SessionID
 		if workspaceSave {
-			evidenceSessionID = persistedOrDerivedWorkspaceAgentSessionID(
-				workspaceCandidate.Session.AgentSessionID,
-				spaceID,
-				req.SessionID,
-				workspaceCandidate.Session.ScopeVersion,
-			)
+			if runBinding.EvidenceSessionID != "" {
+				evidenceSessionID = runBinding.EvidenceSessionID
+			} else {
+				evidenceSessionID = persistedOrDerivedWorkspaceAgentSessionID(
+					workspaceCandidate.Session.AgentSessionID,
+					spaceID,
+					req.SessionID,
+					workspaceCandidate.Session.ScopeVersion,
+				)
+			}
 		}
 		cits, cerr := h.buildCitationsForSessionWithDB(c.Request.Context(), tx, evidenceSessionID, content, userID, resolvedRequestID)
 		if cerr != nil {

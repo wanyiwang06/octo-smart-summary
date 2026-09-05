@@ -3,14 +3,82 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/finishgate"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
+
+func TestCreateAgentSummary_WorkspaceSaveUsesGeneratingRunEvidenceIdentity(t *testing.T) {
+	t.Setenv("AGENT_SUMMARY_V2_MODE", "off")
+	db := setupAgentSummaryTestDB(t)
+	if err := db.AutoMigrate(&model.AgentSummaryRun{}, &model.AgentSummaryTurn{}); err != nil {
+		t.Fatalf("migrate run binding tables: %v", err)
+	}
+	fixture := seedWorkspaceSaveFixture(t, db, "workspace-save-run-evidence")
+	const requestID = "extend-request"
+	runSessionID := summaryWorkspaceReplacementAgentSessionID(
+		fixture.Session.SpaceID, fixture.Session.SessionID, fixture.Session.ScopeVersion, requestID,
+	)
+	run, _, err := summaryrun.NewStore(db).CreateOrGetRun(
+		context.Background(), fixture.Session.UserID, runSessionID, requestID, model.ScopePolicyOpen,
+	)
+	if err != nil {
+		t.Fatalf("create generating run: %v", err)
+	}
+	turn := model.AgentSummaryTurn{
+		SpaceID: fixture.Session.SpaceID, UserID: fixture.Session.UserID, SessionID: fixture.Session.SessionID,
+		RequestID: requestID, RequestHash: "extend-hash", ScopeVersion: fixture.Session.ScopeVersion,
+		Status: "completed", Attempt: 1, RunID: run.RunID,
+	}
+	if err := db.Create(&turn).Error; err != nil {
+		t.Fatalf("create generating turn: %v", err)
+	}
+	payloadJSON, err := json.Marshal(agent.SummaryResponsePayload{
+		ResultType:      agent.SummaryResultAgentPreview,
+		Reply:           "已生成预览。",
+		ExecutionTarget: "agent_preview",
+		Preview: &agent.SummaryResponsePreview{
+			Content: "Alice confirmed the plan [1]",
+			Version: fixture.Message.ArtifactVersion,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal preview: %v", err)
+	}
+	if err := db.Model(&model.AgentMessage{}).Where("id = ?", fixture.Message.ID).Updates(map[string]interface{}{
+		"run_id": run.RunID, "turn_id": turn.ID, "response_payload_json": string(payloadJSON),
+	}).Error; err != nil {
+		t.Fatalf("bind preview to generating run: %v", err)
+	}
+	seedEvidenceRow(t, db, fixture.Session.UserID, runSessionID, "run-evidence", []pipeline.Message{{
+		ChannelID: "channel-workspace", ChannelType: 2, MessageSeq: 1,
+		SenderUID: "alice", SenderName: "Alice", Content: "confirmed the plan",
+	}})
+	fixture.Body["request_id"] = requestID
+
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	w := doAgentSave(t, setupAgentSummaryRouter(h), fixture.Body, map[string]string{
+		"Idempotency-Key": "workspace-run-evidence-key",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("workspace save status=%d: %s", w.Code, w.Body.String())
+	}
+	var saved model.PersonalResult
+	if err := db.First(&saved).Error; err != nil {
+		t.Fatalf("load saved result: %v", err)
+	}
+	citations := saved.GetCitations()
+	if len(citations) != 1 || citations[0].ChannelID != "channel-workspace" {
+		t.Fatalf("saved citations = %+v, want evidence from generating run identity", citations)
+	}
+}
 
 // History hydration does not carry the generation request_id. A strict workspace
 // save must therefore use the request id derived from the selected preview's

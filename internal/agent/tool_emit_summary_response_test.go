@@ -114,6 +114,36 @@ func TestSetSummaryScopeExtendExcludesUnselectedDiscoveryResults(t *testing.T) {
 	}
 }
 
+func TestSetSummaryScopeRejectsSecondSuccessfulDeclaration(t *testing.T) {
+	_, handler := SetSummaryScopeTool()
+	ctx := context.WithValue(context.Background(), ContextKeyUID, "actor")
+	ctx = WithDiscoverableChannelScopeForUser(ctx, "actor", []ChannelScope{{ChannelID: "group-a", ChannelType: 2}})
+	AuthorizeDiscoveredChannels(ctx, []pipeline.ChannelInfo{{ChannelID: "group-b", ChannelType: 2}})
+	if _, err := handler(ctx, json.RawMessage(`{"source_mode":"replace","channels":[{"channel_id":"group-b","channel_type":2}]}`)); err != nil {
+		t.Fatalf("first declaration: %v", err)
+	}
+	if _, err := handler(ctx, json.RawMessage(`{"source_mode":"keep","time_range":{"start":"2026-09-01T00:00:00Z","end":"2026-09-02T00:00:00Z"}}`)); err == nil || !strings.Contains(err.Error(), "already declared") {
+		t.Fatalf("second declaration error = %v", err)
+	}
+}
+
+func TestSetSummaryScopeRejectsOversizedRangeBeforeItCanDriveFetch(t *testing.T) {
+	_, handler := SetSummaryScopeTool()
+	ctx := context.WithValue(context.Background(), ContextKeyUID, "actor")
+	ctx = WithDiscoverableChannelScopeForUser(ctx, "actor", []ChannelScope{{ChannelID: "group-a", ChannelType: 2}})
+	_, err := handler(ctx, json.RawMessage(`{
+		"source_mode":"keep",
+		"time_range":{"start":"2026-01-01T00:00:00Z","end":"2026-09-01T00:00:00Z"}
+	}`))
+	if err == nil || !strings.Contains(err.Error(), "cannot exceed 90 days") {
+		t.Fatalf("oversized range error = %v", err)
+	}
+	start, end := ResolveAllowedTimeRange(ctx, time.Time{}, time.Time{})
+	if !start.IsZero() || !end.IsZero() {
+		t.Fatalf("rejected range became effective: %s..%s", start, end)
+	}
+}
+
 func TestEmitSummaryResponseHonorsContextAllowlist(t *testing.T) {
 	_, handler := EmitSummaryResponseTool()
 	args := json.RawMessage(`{"result_type":"agent_preview","reply":"ready","execution_target":"agent_preview","preview":{"content":"body","version":1}}`)

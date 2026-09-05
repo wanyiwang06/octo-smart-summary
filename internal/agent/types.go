@@ -161,8 +161,10 @@ type contextKeyAllowedChannelScope struct{}
 type mutableChannelScope struct {
 	mu               sync.RWMutex
 	allowed          map[int]map[string]ChannelScope
+	discovered       map[int]map[string]ChannelScope
 	initial          []ChannelScope
 	discoveryOpen    bool
+	declared         bool
 	declaredMode     string
 	declaredChannels []ChannelScope
 	declaredRange    *WorkspaceTimeRange
@@ -172,6 +174,9 @@ const (
 	WorkspaceSourceKeep    = "keep"
 	WorkspaceSourceReplace = "replace"
 	WorkspaceSourceExtend  = "extend"
+
+	MaxWorkspaceSelectedChannels = 30
+	MaxWorkspaceTimeRangeLabel   = 256
 )
 
 // WorkspaceTimeRange is a model-declared candidate range. The application
@@ -195,25 +200,18 @@ type WorkspaceScopeChange struct {
 func newMutableChannelScope(channels []ChannelScope, discoveryOpen bool, uid string) *mutableChannelScope {
 	scope := &mutableChannelScope{
 		allowed:       make(map[int]map[string]ChannelScope),
+		discovered:    make(map[int]map[string]ChannelScope),
 		discoveryOpen: discoveryOpen,
 	}
-	scope.add(channels, uid)
-	scope.mu.RLock()
+	scope.mu.Lock()
+	scope.addToLocked(scope.allowed, channels, uid)
+	scope.addToLocked(scope.discovered, channels, uid)
 	scope.initial = scope.channelsLocked()
-	scope.mu.RUnlock()
+	scope.mu.Unlock()
 	return scope
 }
 
-func (s *mutableChannelScope) add(channels []ChannelScope, uid string) {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.addLocked(channels, uid)
-}
-
-func (s *mutableChannelScope) addLocked(channels []ChannelScope, uid string) {
+func (s *mutableChannelScope) addToLocked(target map[int]map[string]ChannelScope, channels []ChannelScope, uid string) {
 	for _, channel := range channels {
 		if channel.ChannelID == "" || channel.ChannelType == 0 {
 			continue
@@ -221,18 +219,22 @@ func (s *mutableChannelScope) addLocked(channels []ChannelScope, uid string) {
 		if uid != "" {
 			channel.ChannelID = pipeline.NormalizeDMChannelID(channel.ChannelID, uid, channel.ChannelType)
 		}
-		byID := s.allowed[channel.ChannelType]
+		byID := target[channel.ChannelType]
 		if byID == nil {
 			byID = make(map[string]ChannelScope)
-			s.allowed[channel.ChannelType] = byID
+			target[channel.ChannelType] = byID
 		}
 		byID[channel.ChannelID] = channel
 	}
 }
 
 func (s *mutableChannelScope) channelsLocked() []ChannelScope {
+	return channelsFromScopeMap(s.allowed)
+}
+
+func channelsFromScopeMap(scope map[int]map[string]ChannelScope) []ChannelScope {
 	channels := make([]ChannelScope, 0)
-	for _, byID := range s.allowed {
+	for _, byID := range scope {
 		for _, channel := range byID {
 			channels = append(channels, channel)
 		}
@@ -294,6 +296,9 @@ func DeclareWorkspaceScopeChange(ctx context.Context, change WorkspaceScopeChang
 	uid, _ := ctx.Value(ContextKeyUID).(string)
 	scope.mu.Lock()
 	defer scope.mu.Unlock()
+	if scope.declared {
+		return errors.New("workspace scope was already declared for this turn")
+	}
 
 	mode := change.SourceMode
 	if mode == "" {
@@ -313,7 +318,7 @@ func DeclareWorkspaceScopeChange(ctx context.Context, change WorkspaceScopeChang
 	seen := make(map[string]struct{}, len(change.Channels))
 	for _, channel := range change.Channels {
 		channel.ChannelID = pipeline.NormalizeDMChannelID(channel.ChannelID, uid, channel.ChannelType)
-		allowed, exists := scope.allowed[channel.ChannelType][channel.ChannelID]
+		allowed, exists := scope.discovered[channel.ChannelType][channel.ChannelID]
 		if !exists {
 			return fmt.Errorf("channel %d:%s was not authorized by discovery", channel.ChannelType, channel.ChannelID)
 		}
@@ -325,18 +330,24 @@ func DeclareWorkspaceScopeChange(ctx context.Context, change WorkspaceScopeChang
 		selected = append(selected, allowed)
 	}
 
-	scope.allowed = make(map[int]map[string]ChannelScope)
+	final := make(map[int]map[string]ChannelScope)
 	switch mode {
 	case WorkspaceSourceKeep:
-		scope.addLocked(scope.initial, uid)
+		scope.addToLocked(final, scope.initial, uid)
 	case WorkspaceSourceReplace:
-		scope.addLocked(selected, uid)
+		scope.addToLocked(final, selected, uid)
 	case WorkspaceSourceExtend:
-		scope.addLocked(scope.initial, uid)
-		scope.addLocked(selected, uid)
+		scope.addToLocked(final, scope.initial, uid)
+		scope.addToLocked(final, selected, uid)
 	}
+	finalChannels := channelsFromScopeMap(final)
+	if len(finalChannels) > MaxWorkspaceSelectedChannels {
+		return fmt.Errorf("workspace scope exceeds %d channels", MaxWorkspaceSelectedChannels)
+	}
+	scope.allowed = final
+	scope.declared = true
 	scope.declaredMode = mode
-	scope.declaredChannels = append([]ChannelScope(nil), selected...)
+	scope.declaredChannels = finalChannels
 	if change.TimeRange != nil {
 		rangeCopy := *change.TimeRange
 		scope.declaredRange = &rangeCopy
@@ -355,7 +366,7 @@ func DeclaredWorkspaceScopeChange(ctx context.Context) (WorkspaceScopeChange, bo
 	}
 	scope.mu.RLock()
 	defer scope.mu.RUnlock()
-	if scope.declaredMode == "" && scope.declaredRange == nil {
+	if !scope.declared {
 		return WorkspaceScopeChange{}, false
 	}
 	change := WorkspaceScopeChange{
@@ -373,7 +384,7 @@ func DeclaredWorkspaceScopeChange(ctx context.Context) (WorkspaceScopeChange, bo
 // operation to an open request scope. It is a no-op for closed UI scopes.
 func AuthorizeDiscoveredChannels(ctx context.Context, channels []pipeline.ChannelInfo) bool {
 	scope, ok := ctx.Value(contextKeyAllowedChannelScope{}).(*mutableChannelScope)
-	if !ok || scope == nil || !scope.discoveryOpen {
+	if !ok || scope == nil {
 		return false
 	}
 	uid, _ := ctx.Value(ContextKeyUID).(string)
@@ -387,7 +398,12 @@ func AuthorizeDiscoveredChannels(ctx context.Context, channels []pipeline.Channe
 			IsArchived:  channel.IsArchived,
 		})
 	}
-	scope.add(grants, uid)
+	scope.mu.Lock()
+	defer scope.mu.Unlock()
+	if !scope.discoveryOpen || scope.declared {
+		return false
+	}
+	scope.addToLocked(scope.discovered, grants, uid)
 	return true
 }
 
@@ -408,11 +424,14 @@ func AllowedChannelScopes(ctx context.Context) []ChannelScope {
 // selections are reduced to their allowlisted channels.
 func RestrictDiscoveredChannels(ctx context.Context, channels []pipeline.ChannelInfo) []pipeline.ChannelInfo {
 	scope, restricted := ctx.Value(contextKeyAllowedChannelScope{}).(*mutableChannelScope)
-	if !restricted || scope == nil || scope.discoveryOpen {
+	if !restricted || scope == nil {
 		return channels
 	}
 	scope.mu.RLock()
 	defer scope.mu.RUnlock()
+	if scope.discoveryOpen && !scope.declared {
+		return channels
+	}
 	filtered := make([]pipeline.ChannelInfo, 0, len(channels))
 	uid, _ := ctx.Value(ContextKeyUID).(string)
 	for _, channel := range channels {

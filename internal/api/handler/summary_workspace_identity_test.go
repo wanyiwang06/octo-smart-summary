@@ -35,15 +35,3 @@ func TestPersistedOrDerivedWorkspaceAgentSessionID(t *testing.T) {
 		t.Fatalf("derived fallback = %q, want %q", got, want)
 	}
 }
-
-func TestSummaryWorkspaceCommittedAgentSessionIDRotatesOnlyAfterScopeCommit(t *testing.T) {
-	if got := summaryWorkspaceCommittedAgentSessionID("base", "replacement", summaryWorkspaceSourceReplace, false); got != "base" {
-		t.Fatalf("clarification identity = %q, want base", got)
-	}
-	if got := summaryWorkspaceCommittedAgentSessionID("base", "replacement", summaryWorkspaceSourceReplace, true); got != "replacement" {
-		t.Fatalf("committed replacement identity = %q, want replacement", got)
-	}
-	if got := summaryWorkspaceCommittedAgentSessionID("base", "extension", summaryWorkspaceSourceExtend, true); got != "base" {
-		t.Fatalf("extension identity = %q, want base", got)
-	}
-}

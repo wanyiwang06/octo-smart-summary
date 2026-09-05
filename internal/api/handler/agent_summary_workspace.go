@@ -321,12 +321,11 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		responder.fail(http.StatusInternalServerError, 50000, "查找最近聊天失败", true)
 		return
 	}
-	// Natural-language scope changes are decided by the Agent through the
-	// structured set_summary_scope tool. This broad cue check only makes trusted
-	// discovery available; it never mutates the authoritative scope itself.
-	openScopeAgent := summaryWorkspaceMayRequestScopeChange(req.Message, req.InputOrigin, intent) ||
-		(len(contextValue.SelectedChannels) == 0 && len(contextValue.Participants) == 0 &&
-			len(contextValue.ReferencedTaskIDs) == 0 && summaryWorkspaceUserRequirement(req.Message, req.InputOrigin) != "")
+	// Every free-text chat turn goes through the Agent. Scope interpretation is
+	// model-declared and server-authorized instead of being gated by a keyword
+	// list. Trusted template/system actions retain their deterministic Workflow
+	// routes, including direct team collaboration.
+	openScopeAgent := summaryWorkspaceShouldOpenScopeAgent(action, req.InputOrigin, intent)
 
 	validation, lookupErr := h.workspace.validateWorkspaceScope(c.Request.Context(), spaceID, uid, contextValue)
 	if lookupErr != nil {
@@ -608,9 +607,16 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 		// Agent decides whether to keep, replace, or extend the scope.
 		agentSessionID = summaryWorkspaceReplacementAgentSessionID(key.SpaceID, key.SessionID, req.ScopeVersion, req.RequestID)
 	}
-	runner, system, err := h.buildRunnerForProfile(summaryWorkspaceProfile, key.UserID, agentSessionID, false)
-	if err != nil {
-		return WorkspaceSnapshot{}, err
+	var runner *agent.Runner
+	var system string
+	var err error
+	if h.testRunner != nil {
+		runner, system = h.testRunner, h.testSystem
+	} else {
+		runner, system, err = h.buildRunnerForProfile(summaryWorkspaceProfile, key.UserID, agentSessionID, false)
+		if err != nil {
+			return WorkspaceSnapshot{}, err
+		}
 	}
 	runChannels := contextValue.SelectedChannels
 	selected := make([]selectedChannel, 0, len(runChannels))
@@ -734,6 +740,7 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	if persistedAgentSessionID == "" {
 		persistedAgentSessionID = summaryWorkspaceAgentSessionID(key.SpaceID, key.SessionID, req.ScopeVersion)
 	}
+	effectiveChannels := append([]summaryWorkspaceChannel(nil), contextValue.SelectedChannels...)
 	if payload.Preview != nil {
 		if hasDeclaredScope && declaredScope.TimeRange != nil {
 			label := strings.TrimSpace(declaredScope.TimeRange.Label)
@@ -746,26 +753,29 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 			}
 			normalized, normalizeErr := normalizeSummaryWorkspaceContext(contextValue)
 			if normalizeErr != nil {
-				return WorkspaceSnapshot{}, normalizeErr
+				return WorkspaceSnapshot{}, service.NewBizError(40022, normalizeErr.Error(), http.StatusBadRequest)
 			}
 			contextValue = normalized
 		}
-		effectiveChannels := append([]summaryWorkspaceChannel(nil), contextValue.SelectedChannels...)
-		if sourceUpdate != summaryWorkspaceSourceUnchanged {
-			effectiveChannels = summaryWorkspaceChannelsFromAgentScope(agent.AllowedChannelScopes(ctx))
+		if hasDeclaredScope {
+			effectiveChannels = summaryWorkspaceChannelsFromAgentScope(declaredScope.Channels)
 		}
 		if len(effectiveChannels) == 0 && len(contextValue.ReferencedTaskIDs) == 0 {
-			return WorkspaceSnapshot{}, errors.New("summary workspace preview has no authorised source")
-		}
-		if sourceUpdate != summaryWorkspaceSourceUnchanged {
+			payload = agent.SummaryResponsePayload{
+				ResultType: agent.SummaryResultClarification,
+				Reply:      "请先告诉我需要总结哪个聊天或哪些参与者。",
+			}
+		} else if sourceUpdate != summaryWorkspaceSourceUnchanged {
 			contextValue, err = h.workspace.applyDiscoveredWorkspaceScope(ctx, key.SpaceID, key.UserID, contextValue, effectiveChannels, sourceUpdate)
 			if err != nil {
 				return WorkspaceSnapshot{}, err
 			}
 			effectiveChannels = append([]summaryWorkspaceChannel(nil), contextValue.SelectedChannels...)
-			persistedAgentSessionID = summaryWorkspaceCommittedAgentSessionID(
-				persistedAgentSessionID, agentSessionID, sourceUpdate, true,
-			)
+		}
+	}
+	if payload.Preview != nil {
+		if openScopeAgent {
+			persistedAgentSessionID = agentSessionID
 		}
 		nextVersion := before.Session.ArtifactVersion + 1
 		if nextVersion <= 0 {
@@ -1321,6 +1331,11 @@ func summaryWorkspaceExecutionAuthorized(inputOrigin string) bool {
 	}
 }
 
+func summaryWorkspaceShouldOpenScopeAgent(action service.SummaryAction, inputOrigin string, intent service.SummaryIntent) bool {
+	return action == service.SummaryActionChat &&
+		inputOrigin == summaryWorkspaceInputUser && intent != service.SummaryIntentExplain
+}
+
 func summaryWorkspaceUserRequirement(message, inputOrigin string) string {
 	if inputOrigin != summaryWorkspaceInputUser {
 		return ""
@@ -1419,304 +1434,6 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 
 	contextValue = materializeSummaryWorkspaceDefaultTimeRange(contextValue, now)
 	return contextValue, false, nil
-}
-
-func summaryWorkspaceMayRequestScopeChange(message, inputOrigin string, intent service.SummaryIntent) bool {
-	if inputOrigin != summaryWorkspaceInputUser || intent == service.SummaryIntentExplain {
-		return false
-	}
-	normalized := strings.ToLower(strings.Join(strings.Fields(message), ""))
-	return containsAny(normalized,
-		"群", "会话", "私聊", "聊天", "频道", "子区", "thread",
-		"时间", "范围", "窗口", "最近", "过去", "本周", "上周", "今天", "昨天", "前天", "天", "周", "月",
-	)
-}
-
-type summaryWorkspacePresetTimeRange struct {
-	days     int
-	label    string
-	patterns []string
-}
-
-var summaryWorkspacePresetTimeRanges = []summaryWorkspacePresetTimeRange{
-	{days: 7, label: "最近 7 天", patterns: []string{"最近7天", "最近七天", "近7天", "近七天", "过去7天", "过去七天", "最近一周", "近一周", "过去一周"}},
-	{days: 15, label: "最近半个月", patterns: []string{"最近15天", "最近十五天", "近15天", "近十五天", "过去15天", "过去十五天", "最近半个月", "近半个月", "过去半个月"}},
-	{days: 30, label: "最近一个月", patterns: []string{"最近30天", "最近三十天", "近30天", "近三十天", "过去30天", "过去三十天", "最近一个月", "近一个月", "过去一个月", "一个月以来"}},
-}
-
-// summaryWorkspaceRequestedSourceUpdate only decides whether trusted channel
-// discovery may reopen. It never resolves a channel id from user text; the
-// discovery tools still enforce Space membership and access permissions.
-func summaryWorkspaceRequestedSourceUpdate(message, inputOrigin string, intent service.SummaryIntent) summaryWorkspaceSourceUpdateMode {
-	if inputOrigin != summaryWorkspaceInputUser || intent == service.SummaryIntentExplain {
-		return summaryWorkspaceSourceUnchanged
-	}
-	normalized := strings.ToLower(strings.Join(strings.Fields(message), ""))
-	if normalized == "" || containsAny(normalized,
-		"不要修改会话范围", "不要修改聊天范围", "不要更换会话", "不要更换群聊",
-		"保持当前会话", "保持当前聊天", "继续用当前会话", "继续用当前聊天",
-	) {
-		return summaryWorkspaceSourceUnchanged
-	}
-	if !containsAny(normalized, "群", "会话", "私聊", "聊天", "频道", "子区", "thread") {
-		return summaryWorkspaceSourceUnchanged
-	}
-	if summaryWorkspaceRequestsAllSources(normalized) {
-		return summaryWorkspaceSourceReplace
-	}
-	if summaryWorkspaceSourceDirectiveTargetsChannel(normalized, []string{
-		"再加", "加上", "加入", "添加", "同时包含", "同时加", "也包含", "也加", "还要包含", "一并包含",
-	}) {
-		return summaryWorkspaceSourceExtend
-	}
-	if summaryWorkspaceSourceDirectiveTargetsChannel(normalized, []string{
-		"改成", "改为", "换成", "更换为", "切换到", "替换为", "只总结", "仅总结", "只看", "仅看",
-		"选择", "选中", "指定", "作为范围",
-	}) || summaryWorkspaceHasNamedSourceRequest(normalized) {
-		return summaryWorkspaceSourceReplace
-	}
-	return summaryWorkspaceSourceUnchanged
-}
-
-func summaryWorkspaceRouteAfterSourceUpdate(
-	route service.SummaryRoute,
-	mode summaryWorkspaceSourceUpdateMode,
-	hasCurrentPreview, hasParticipants bool,
-) service.SummaryRoute {
-	if mode == summaryWorkspaceSourceUnchanged || route == service.SummaryRouteClarification || route == service.SummaryRouteExplanation {
-		return route
-	}
-	if hasCurrentPreview && !hasParticipants {
-		return service.SummaryRouteAgentRevision
-	}
-	return service.SummaryRouteAgentPreview
-}
-
-var summaryWorkspaceSourceCues = []string{"群聊", "私聊", "会话", "聊天", "频道", "子区", "thread", "群"}
-
-var summaryWorkspaceSourceContextTerms = []string{
-	"时间范围", "时间窗口", "取数范围", "统计范围", "模板", "结构", "标题", "名称", "名字", "负责人",
-}
-
-var summaryWorkspaceNegations = []string{
-	"不要", "别用", "不用", "不使用", "无需", "别按", "不要用", "不总结", "不需要", "别管", "忽略", "排除",
-}
-
-func summaryWorkspaceClauseAround(message string, index, length int) (prefix, suffix, clause string) {
-	clauseStart := 0
-	if delimiter := strings.LastIndexAny(message[:index], "，,。；;！？!?\n"); delimiter >= 0 {
-		_, width := utf8.DecodeRuneInString(message[delimiter:])
-		clauseStart = delimiter + width
-	}
-	clauseEnd := len(message)
-	if relative := strings.IndexAny(message[index+length:], "，,。；;！？!?\n"); relative >= 0 {
-		clauseEnd = index + length + relative
-	}
-	return message[clauseStart:index], message[index+length : clauseEnd], message[clauseStart:clauseEnd]
-}
-
-func summaryWorkspaceRequestsAllSources(message string) bool {
-	for _, phrase := range []string{"所有群聊", "全部群聊", "所有会话", "全部会话", "所有聊天", "全部聊天"} {
-		for offset := 0; offset < len(message); {
-			relative := strings.Index(message[offset:], phrase)
-			if relative < 0 {
-				break
-			}
-			index := offset + relative
-			prefix, suffix, clause := summaryWorkspaceClauseAround(message, index, len(phrase))
-			if !containsAny(prefix, summaryWorkspaceNegations...) &&
-				!containsAny(prefix, "之前", "此前", "上次", "原来") &&
-				!containsAny(clause, summaryWorkspaceSourceContextTerms...) &&
-				!containsAny(suffix, "太多", "过多", "不对", "有问题") &&
-				(containsAny(clause, "总结", "汇总", "生成", "改成", "改为", "换成", "切换到", "替换为", "只看", "仅看") || strings.TrimSpace(clause) == phrase) {
-				return true
-			}
-			offset = index + len(phrase)
-		}
-	}
-	return false
-}
-
-func summaryWorkspaceSourceDirectiveTargetsChannel(message string, directives []string) bool {
-	for _, cue := range summaryWorkspaceSourceCues {
-		for offset := 0; offset < len(message); {
-			relative := strings.Index(message[offset:], cue)
-			if relative < 0 {
-				break
-			}
-			index := offset + relative
-			clauseStart := 0
-			if delimiter := strings.LastIndexAny(message[:index], "，,。；;！？!?\n"); delimiter >= 0 {
-				_, width := utf8.DecodeRuneInString(message[delimiter:])
-				clauseStart = delimiter + width
-			}
-			prefix := message[clauseStart:index]
-			for _, directive := range directives {
-				directiveIndex := strings.LastIndex(prefix, directive)
-				if directiveIndex < 0 {
-					continue
-				}
-				beforeDirective := prefix[:directiveIndex]
-				governed := prefix[directiveIndex+len(directive):]
-				if len([]rune(governed)) > 16 || summaryWorkspaceSourcePhraseIsGeneric(governed) ||
-					containsAny(prefix, summaryWorkspaceSourceContextTerms...) ||
-					containsAny(beforeDirective, summaryWorkspaceNegations...) {
-					continue
-				}
-				return true
-			}
-			offset = index + len(cue)
-		}
-	}
-	return false
-}
-
-func summaryWorkspaceHasNamedSourceRequest(message string) bool {
-	for _, cue := range summaryWorkspaceSourceCues {
-		for offset := 0; offset < len(message); {
-			relative := strings.Index(message[offset:], cue)
-			if relative < 0 {
-				break
-			}
-			index := offset + relative
-			prefix, _, clause := summaryWorkspaceClauseAround(message, index, len(cue))
-			if containsAny(clause, summaryWorkspaceSourceContextTerms...) || containsAny(prefix, summaryWorkspaceNegations...) {
-				offset = index + len(cue)
-				continue
-			}
-			command := prefix
-			for _, polite := range []string{"请帮我", "可以帮我", "麻烦帮我", "帮我", "麻烦", "请"} {
-				command = strings.TrimPrefix(command, polite)
-			}
-			for _, verb := range []string{"总结", "汇总", "生成"} {
-				if !strings.HasPrefix(command, verb) {
-					continue
-				}
-				descriptor := strings.TrimPrefix(command, verb)
-				descriptor = strings.TrimPrefix(descriptor, "一下")
-				descriptor = strings.TrimPrefix(descriptor, "下")
-				if descriptor != "" && !summaryWorkspaceSourcePhraseIsGeneric(descriptor) && !summaryWorkspaceSourceDescriptorIsIncidental(descriptor) {
-					return true
-				}
-			}
-			if cue == "私聊" && strings.HasPrefix(prefix, "和") && strings.HasSuffix(prefix, "的") && !summaryWorkspaceSourcePhraseIsGeneric(prefix) {
-				return true
-			}
-			offset = index + len(cue)
-		}
-	}
-	return false
-}
-
-func summaryWorkspaceSourceDescriptorIsIncidental(value string) bool {
-	return containsAny(value,
-		"今天", "昨天", "前天", "本周", "上周", "这周", "最近", "过去", "当前", "之前", "此前", "原来",
-		"相关的", "有关的",
-	) || strings.HasSuffix(value, "在")
-}
-
-func summaryWorkspaceSourcePhraseIsGeneric(value string) bool {
-	return value == "" || containsAny(value,
-		"这个", "这些", "这几个", "本群", "本会话", "当前", "所选", "选择的", "选中的",
-	)
-}
-
-func summaryWorkspaceRequestedPresetTimeRange(message string, now time.Time) (*summaryWorkspaceTimeRange, bool) {
-	normalized := strings.ToLower(strings.Join(strings.Fields(message), ""))
-	if normalized == "" {
-		return nil, false
-	}
-
-	type matchedPreset struct {
-		index int
-		days  int
-		label string
-	}
-	best := matchedPreset{index: -1}
-	consider := func(pattern string, days int, label string) {
-		for offset := 0; offset < len(normalized); {
-			relative := strings.Index(normalized[offset:], pattern)
-			if relative < 0 {
-				return
-			}
-			index := offset + relative
-			if index > best.index && summaryWorkspaceRangeMentionIsExplicit(normalized, index, len(pattern)) {
-				best = matchedPreset{index: index, days: days, label: label}
-			}
-			offset = index + len(pattern)
-		}
-	}
-	for _, preset := range summaryWorkspacePresetTimeRanges {
-		for _, pattern := range preset.patterns {
-			consider(pattern, preset.days, preset.label)
-		}
-	}
-
-	if best.index < 0 && containsAny(normalized,
-		"时间范围", "时间窗口", "取数范围", "统计范围",
-		"扩大到", "扩展到", "缩小到", "调整为", "改为", "改成",
-	) {
-		for _, candidate := range []struct {
-			patterns []string
-			days     int
-			label    string
-		}{
-			{patterns: []string{"7天", "七天", "一周"}, days: 7, label: "最近 7 天"},
-			{patterns: []string{"15天", "十五天", "半个月"}, days: 15, label: "最近半个月"},
-			{patterns: []string{"30天", "三十天", "一个月"}, days: 30, label: "最近一个月"},
-		} {
-			for _, pattern := range candidate.patterns {
-				consider(pattern, candidate.days, candidate.label)
-			}
-		}
-	}
-	if best.index < 0 {
-		return nil, false
-	}
-
-	location := now.Location()
-	end := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, int(time.Second-time.Nanosecond), location)
-	startDay := now.AddDate(0, 0, -(best.days - 1))
-	start := time.Date(startDay.Year(), startDay.Month(), startDay.Day(), 0, 0, 0, 0, location)
-	return &summaryWorkspaceTimeRange{
-		Start:  start.Format(time.RFC3339Nano),
-		End:    end.Format(time.RFC3339Nano),
-		Label:  best.label,
-		Source: summaryWorkspaceTimeRangeSourceConversation,
-	}, true
-}
-
-func summaryWorkspaceRangeMentionIsExplicit(message string, index, length int) bool {
-	prefix, suffix, clause := summaryWorkspaceClauseAround(message, index, length)
-	if strings.Contains(prefix, "而是") {
-		prefix = prefix[strings.LastIndex(prefix, "而是")+len("而是"):]
-	}
-	for _, negation := range append(append([]string(nil), summaryWorkspaceNegations...), "不是") {
-		if strings.Contains(prefix, negation) || strings.HasPrefix(suffix, negation) {
-			return false
-		}
-	}
-	if containsAny(prefix, "时间范围", "时间窗口", "取数范围", "统计范围") {
-		return true
-	}
-	if containsAny(prefix, "扩大到", "扩展到", "缩小到", "调整为", "改为", "改成") &&
-		!containsAny(prefix, "标题", "名称", "名字", "模板", "结构", "负责人") {
-		return true
-	}
-	if containsAny(message, "吗", "是否", "是不是", "能否") ||
-		containsAny(clause, "参考", "对照", "提到", "提及", "标题", "名称", "名字") ||
-		containsAny(suffix, "不用看", "不要看", "不总结", "无需总结", "太多了", "写得不好", "不一致", "不对", "有问题") ||
-		containsAny(prefix, "这份总结", "这个总结", "总结里", "总结中") ||
-		containsAny(prefix, "上次", "之前", "此前", "原来") ||
-		(strings.HasPrefix(suffix, "的背景") && !containsAny(prefix, "总结", "汇总", "生成")) {
-		return false
-	}
-	if containsAny(prefix, "总结", "汇总", "生成") || strings.HasSuffix(prefix, "按") || strings.HasSuffix(prefix, "用") || strings.HasSuffix(prefix, "看") {
-		return true
-	}
-	return (strings.TrimSpace(prefix) == "" && strings.TrimSpace(suffix) == "") ||
-		containsAny(suffix, "重新总结", "总结", "生成", "就好", "即可", "为准") ||
-		containsAny(message[index+length:], "总结一下", "重新总结", "重新生成", "帮我生成")
 }
 
 func materializeSummaryWorkspaceDefaultTimeRange(contextValue summaryWorkspaceContext, now time.Time) summaryWorkspaceContext {

@@ -49,7 +49,7 @@ func FindSharedChannelsTool() (Tool, Handler) {
 			return "", fmt.Errorf("missing user identity in context")
 		}
 
-		summaryDB, imDB, _, _ := GetSummaryDeps()
+		_, imDB, _, _ := GetSummaryDeps()
 
 		options := []pipeline.ChannelQueryOption{
 			pipeline.WithIncludeArchived(req.IncludeArchived),
@@ -82,7 +82,6 @@ func FindSharedChannelsTool() (Tool, Handler) {
 		// list_channels was deliberately stopped from recording. `required` in the
 		// tool schema is advisory metadata sent to the model, not validation.
 		if len(req.ParticipantUIDs) > 0 {
-			recordDiscoveredChannels(ctx, summaryDB, uid, channelIDsOf(shared))
 			AuthorizeDiscoveredChannels(ctx, shared)
 		}
 

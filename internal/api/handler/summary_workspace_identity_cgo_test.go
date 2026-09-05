@@ -83,6 +83,13 @@ func TestResolveAgentMessageRequestIDAcceptsRotatedWorkspaceRun(t *testing.T) {
 	if err != nil || got != requestID {
 		t.Fatalf("resolve replacement request = %q, %v; want %s", got, err, requestID)
 	}
+	binding, err := resolveAgentMessageRunBinding(ctx, db, userID, sessionID, requestID, message)
+	if err != nil {
+		t.Fatalf("resolve replacement binding: %v", err)
+	}
+	if binding.EvidenceSessionID != internalSessionID {
+		t.Fatalf("evidence session id = %q, want %q", binding.EvidenceSessionID, internalSessionID)
+	}
 }
 
 func TestBuildSnapshotV1FiltersWorkspaceToolMessagesBySpace(t *testing.T) {

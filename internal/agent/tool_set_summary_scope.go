@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
 
 type setSummaryScopeArgs struct {
@@ -40,7 +43,8 @@ func SetSummaryScopeTool() (Tool, Handler) {
 						"enum": []string{WorkspaceSourceKeep, WorkspaceSourceReplace, WorkspaceSourceExtend},
 					},
 					"channels": map[string]any{
-						"type": "array",
+						"type":     "array",
+						"maxItems": MaxWorkspaceSelectedChannels,
 						"items": map[string]any{
 							"type":                 "object",
 							"additionalProperties": false,
@@ -57,7 +61,7 @@ func SetSummaryScopeTool() (Tool, Handler) {
 						"properties": map[string]any{
 							"start": map[string]any{"type": "string", "description": "RFC3339 起始时间"},
 							"end":   map[string]any{"type": "string", "description": "RFC3339 结束时间"},
-							"label": map[string]any{"type": "string"},
+							"label": map[string]any{"type": "string", "maxLength": MaxWorkspaceTimeRangeLabel},
 						},
 						"required": []string{"start", "end"},
 					},
@@ -78,6 +82,9 @@ func SetSummaryScopeTool() (Tool, Handler) {
 			return "", fmt.Errorf("invalid args: %w", err)
 		}
 		change := WorkspaceScopeChange{SourceMode: strings.TrimSpace(parsed.SourceMode)}
+		if len(parsed.Channels) > MaxWorkspaceSelectedChannels {
+			return "", fmt.Errorf("workspace scope cannot exceed %d channels", MaxWorkspaceSelectedChannels)
+		}
 		for _, channel := range parsed.Channels {
 			change.Channels = append(change.Channels, ChannelScope{
 				ChannelID: strings.TrimSpace(channel.ChannelID), ChannelType: channel.ChannelType,
@@ -89,6 +96,12 @@ func SetSummaryScopeTool() (Tool, Handler) {
 			if startErr != nil || endErr != nil || !end.After(start) {
 				return "", errors.New("time_range must contain a valid increasing RFC3339 range")
 			}
+			if end.Sub(start) > time.Duration(pipeline.MaxTimeRangeDays)*24*time.Hour {
+				return "", fmt.Errorf("time_range cannot exceed %d days", pipeline.MaxTimeRangeDays)
+			}
+			if utf8.RuneCountInString(strings.TrimSpace(parsed.TimeRange.Label)) > MaxWorkspaceTimeRangeLabel {
+				return "", fmt.Errorf("time_range label cannot exceed %d characters", MaxWorkspaceTimeRangeLabel)
+			}
 			change.TimeRange = &WorkspaceTimeRange{
 				Start: start.Format(time.RFC3339), End: end.Format(time.RFC3339), Label: strings.TrimSpace(parsed.TimeRange.Label),
 			}
@@ -98,6 +111,15 @@ func SetSummaryScopeTool() (Tool, Handler) {
 		}
 		if err := DeclareWorkspaceScopeChange(ctx, change); err != nil {
 			return "", err
+		}
+		declared, ok := DeclaredWorkspaceScopeChange(ctx)
+		if !ok {
+			return "", errors.New("workspace scope declaration was not retained")
+		}
+		if SummaryV2Enabled() {
+			summaryDB, _, _, _ := GetSummaryDeps()
+			uid, _ := ctx.Value(ContextKeyUID).(string)
+			recordDiscoveredChannels(ctx, summaryDB, uid, channelScopeIDsOf(declared.Channels))
 		}
 		return "已记录并约束本轮总结范围。", nil
 	}

@@ -10,9 +10,11 @@
 ## 数据处理
 
 - 页面上下文已经给出聊天时，默认只处理这些聊天。只有用户本轮明确提出更换或增加来源时，才重新发现范围，并在读取消息前调用 `set_summary_scope` 声明最终的 replace/extend 结果。
-- 用户明确要求“所有群聊/全部会话”时，调用 `list_channels` 并设置 `commit_scope=true`，把返回的全部可见频道确认为本轮范围，然后逐个抓取。
-- 用户描述的是聊天名称、参与人或主题范围（例如“项目相关群”“和张三的私聊”）时，先调用 `list_channels`（保持 `commit_scope=false`），再调用 `narrow_channels_by_topic` 或 `find_shared_channels` 缩小并确认范围；完成范围确认后才能抓取。
-- 替换范围时放弃旧聊天，只读取 `set_summary_scope` 确认的新范围；增加范围时保留旧聊天并合并新确认范围。用户没有明确改变来源时，禁止调用 `set_summary_scope` 改来源。
+- 页面上下文没有聊天时，首次选择来源也必须在发现后调用一次 `set_summary_scope(source_mode=replace)`；首次选择不是“修改”，但仍需要形成服务端权威范围。若无法确定唯一合理范围，返回 clarification，不要直接抓取或生成预览。
+- 用户明确要求“所有群聊/全部会话”时，调用 `list_channels`，再用返回的频道调用 `set_summary_scope(source_mode=replace)` 确认最终范围，然后逐个抓取。
+- 用户描述的是聊天名称、参与人或主题范围（例如“项目相关群”“和张三的私聊”）时，先调用 `list_channels`，再调用 `narrow_channels_by_topic` 或 `find_shared_channels` 缩小范围，并用 `set_summary_scope` 确认最终范围；完成范围确认后才能抓取。
+- 替换范围时放弃旧聊天，只读取 `set_summary_scope` 确认的新范围；增加范围时保留旧聊天并合并新确认范围。用户没有明确改变来源且页面已有来源时，禁止调用 `set_summary_scope` 改来源。
+- 每轮最多成功调用一次 `set_summary_scope`。它是本轮最终决定；调用成功后不得继续发现其他频道，也不得再次修改范围。
 - 页面上下文没有聊天且用户也没有表达可判断的数据来源时，只澄清一项最关键的来源信息，不生成无依据预览。
 - 页面上下文提供了 `time_range` 时，默认使用其中精确的 start/end。只有用户明确要求调整时间窗口时，先调用 `get_current_time` / `extract_time_range` 得到精确范围，再调用 `set_summary_scope` 写入 time_range；只改时间时 `source_mode` 必须为 `keep`。之后所有读取必须使用这个新范围。疑问、否定、抱怨、举例、历史描述和标题/格式/语气要求不得改变范围。
 - “最近三天”“最近两周”等明确范围不受预设选项限制，只要不超过服务端最大天数即可自动应用。

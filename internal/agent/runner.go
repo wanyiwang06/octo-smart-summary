@@ -506,6 +506,9 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 	all := make([]int, 0, len(calls))
 	fetches := make([]int, 0, len(calls))
 	rest := make([]int, 0, len(calls))
+	discoveries := make([]int, 0, len(calls))
+	scopeSetters := make([]int, 0, 1)
+	afterScope := make([]int, 0, len(calls))
 	hasSummarize := false
 	for i, tc := range calls {
 		all = append(all, i)
@@ -517,12 +520,52 @@ func (r *Runner) runTools(ctx context.Context, calls []ToolCall, step, ofSteps i
 		if tc.Function.Name == "summarize_chunk" {
 			hasSummarize = true
 		}
+		switch tc.Function.Name {
+		case "list_channels", "narrow_channels_by_topic", "find_shared_channels":
+			discoveries = append(discoveries, i)
+		case "set_summary_scope":
+			scopeSetters = append(scopeSetters, i)
+		default:
+			afterScope = append(afterScope, i)
+		}
 	}
 	// Hook outcomes are reported once, after every phase has finished, so the
 	// fatal-marker verdict stays independent of both worker completion order AND
 	// phase boundaries. Reporting per phase would let a phase-1 failure latch
 	// before a phase-2 success for the same (tool, target) could clear it.
 	defer r.reportToolHookOutcomes(hookOutcomes)
+	if len(scopeSetters) > 0 {
+		if len(discoveries) > 0 {
+			r.runToolBatch(toolCtx, calls, discoveries, results, hookOutcomes, step, ofSteps)
+		}
+		// A successful scope declaration is final for the turn. Execute setters
+		// serially in model order so a duplicate deterministically receives the
+		// repairable "already declared" tool error instead of racing for the lock.
+		for _, index := range scopeSetters {
+			r.runToolBatch(toolCtx, calls, []int{index}, results, hookOutcomes, step, ofSteps)
+		}
+		remainingFetches := make([]int, 0, len(afterScope))
+		remainingRest := make([]int, 0, len(afterScope))
+		remainingHasSummarize := false
+		for _, index := range afterScope {
+			name := calls[index].Function.Name
+			if name == "fetch_channel" {
+				remainingFetches = append(remainingFetches, index)
+			} else {
+				remainingRest = append(remainingRest, index)
+			}
+			if name == "summarize_chunk" {
+				remainingHasSummarize = true
+			}
+		}
+		if len(remainingFetches) > 0 && remainingHasSummarize {
+			r.runToolBatch(toolCtx, calls, remainingFetches, results, hookOutcomes, step, ofSteps)
+			r.runToolBatch(toolCtx, calls, remainingRest, results, hookOutcomes, step, ofSteps)
+		} else if len(afterScope) > 0 {
+			r.runToolBatch(toolCtx, calls, afterScope, results, hookOutcomes, step, ofSteps)
+		}
+		return results
+	}
 	if len(fetches) > 0 && hasSummarize {
 		r.runToolBatch(toolCtx, calls, fetches, results, hookOutcomes, step, ofSteps)
 		r.runToolBatch(toolCtx, calls, rest, results, hookOutcomes, step, ofSteps)

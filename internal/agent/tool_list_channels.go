@@ -23,10 +23,6 @@ func ListChannelsTool() (Tool, Handler) {
 						"type":        "boolean",
 						"description": "是否包含已归档的子区（thread）。默认 false（只列活跃频道）。仅当用户明确要「已归档/历史/已关闭的子区」时才置 true。返回结果中归档子区带 is_archived=true 标记。",
 					},
-					"commit_scope": map[string]interface{}{
-						"type":        "boolean",
-						"description": "是否把本次返回的全部可见频道确认为当前总结范围。仅当用户明确要求总结所有可见会话时置 true；主题筛选或探索阶段保持 false。",
-					},
 				},
 				"required": []string{},
 			},
@@ -36,7 +32,6 @@ func ListChannelsTool() (Tool, Handler) {
 	handler := func(ctx context.Context, args json.RawMessage) (string, error) {
 		var req struct {
 			IncludeArchived bool `json:"include_archived,omitempty"`
-			CommitScope     bool `json:"commit_scope,omitempty"`
 		}
 		// An omitted argument payload is equivalent to {}; malformed JSON is
 		// surfaced so the model can self-correct instead of silently changing
@@ -54,10 +49,9 @@ func ListChannelsTool() (Tool, Handler) {
 			return "", fmt.Errorf("missing user identity in context")
 		}
 
-		// Listing is exploratory by default and does not expand the read scope.
-		// commit_scope is the explicit all-visible-channels decision: only an open
-		// request scope accepts it, while a closed UI scope remains unexpandable.
-		summaryDB, imDB, _, _ := GetSummaryDeps()
+		// Listing only authorizes candidates for a later set_summary_scope call;
+		// it never expands the message-read scope by itself.
+		_, imDB, _, _ := GetSummaryDeps()
 
 		options := []pipeline.ChannelQueryOption{
 			pipeline.WithIncludeArchived(req.IncludeArchived),
@@ -71,16 +65,12 @@ func ListChannelsTool() (Tool, Handler) {
 			return "", fmt.Errorf("get user channels: %w", err)
 		}
 		channels = RestrictDiscoveredChannels(ctx, channels)
-		scopeCommitted := false
-		if req.CommitScope && AuthorizeDiscoveredChannels(ctx, channels) {
-			recordDiscoveredChannels(ctx, summaryDB, uid, channelIDsOf(channels))
-			scopeCommitted = true
-		}
+		scopeDiscovered := AuthorizeDiscoveredChannels(ctx, channels)
 
 		result := map[string]interface{}{
-			"total":           len(channels),
-			"channels":        channels,
-			"scope_committed": scopeCommitted,
+			"total":            len(channels),
+			"channels":         channels,
+			"scope_discovered": scopeDiscovered,
 		}
 		data, err := json.Marshal(result)
 		if err != nil {

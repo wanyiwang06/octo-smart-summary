@@ -27,19 +27,31 @@ must replace its local chat chips with the returned `selected_channels`.
 Conversational source replacement/extension is two-phase. The Agent first
 resolves candidate chats through server-authorised discovery, then calls
 `set_summary_scope` with one final `keep`, `replace`, or `extend` decision. The
-server accepts only discovered channels and applies contract limits, actor
+server accepts only discovered channels and applies the 30-chat limit, actor
 membership, and team-scope checks before atomically replacing the stored scope.
-Ordinary edits, questions, negations, and historical references do not call the
-scope tool and therefore keep the picker scope. A source-changing turn cannot
-directly dispatch a Workflow; the trusted start action may run after the
-resolved scope is returned.
+Discovery only creates candidates: a newly discovered chat cannot be read until
+the declaration succeeds. The declaration is single-use for the turn, freezes
+further discovery, and its complete final channel list is the one used for
+message retrieval, `scope_json`, and `preview.effective_scope`. Ordinary edits,
+questions, negations, and historical references do not call the scope tool and
+therefore keep the picker scope. On a cold start, a preview without a successful
+source declaration becomes a clarification instead of an ungrounded preview or
+a retryable server error. A source-changing turn cannot directly dispatch a
+Workflow; the trusted start action may run after the resolved scope is returned.
 
 `time_range.source` records whether the current range came from the picker,
 the server default, or a conversational instruction. Explicit conversational
 ranges, including non-preset ranges such as three days or two weeks, are parsed
 by the Agent and declared through `set_summary_scope` before message retrieval.
-Incidental, questioned, negated, complained-about, or historical mentions do
-not replace the current range.
+The tool rejects inverted ranges, ranges over 90 days, and labels over 256
+characters before any retrieval starts. Incidental, questioned, negated,
+complained-about, or historical mentions do not replace the current range.
+
+Each preview message is bound to the exact Agent run that generated it. Saving
+the preview resolves citations from that run's evidence session, including
+replacement/extension turns that rotate the internal session identity. The
+workspace session identity is used only as a compatibility fallback for legacy
+messages without a persisted run binding.
 
 A pending team proposal also stores its resolved `time_range`. Confirmation
 uses that stored value, so the displayed range and the dispatched workflow

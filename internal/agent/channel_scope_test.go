@@ -37,7 +37,7 @@ func TestAllowedChannelScopeIsOptInAndExact(t *testing.T) {
 	}
 }
 
-func TestDiscoverableChannelScopeStartsClosedAndGrantsConfirmedChannels(t *testing.T) {
+func TestDiscoverableChannelScopeRequiresDeclarationBeforeRead(t *testing.T) {
 	ctx := context.WithValue(context.Background(), ContextKeyUID, "user-1")
 	ctx = WithDiscoverableChannelScope(ctx)
 	if restricted, allowed := ChannelAllowedByScope(ctx, "group-1", model.ChannelTypeGroup); !restricted || allowed {
@@ -54,12 +54,18 @@ func TestDiscoverableChannelScopeStartsClosedAndGrantsConfirmedChannels(t *testi
 		t.Fatal("discoverable scope rejected trusted discovery result")
 	}
 	for _, channel := range all {
-		if restricted, allowed := ChannelAllowedByScope(ctx, channel.ChannelID, channel.ChannelType); !restricted || !allowed {
-			t.Fatalf("discovered channel %s = (%v,%v), want (true,true)", channel.ChannelID, restricted, allowed)
+		if restricted, allowed := ChannelAllowedByScope(ctx, channel.ChannelID, channel.ChannelType); !restricted || allowed {
+			t.Fatalf("undeclared channel %s = (%v,%v), want (true,false)", channel.ChannelID, restricted, allowed)
 		}
 	}
+	if err := DeclareWorkspaceScopeChange(ctx, WorkspaceScopeChange{SourceMode: WorkspaceSourceReplace, Channels: []ChannelScope{
+		{ChannelID: "group-1", ChannelType: model.ChannelTypeGroup},
+		{ChannelID: "group-2", ChannelType: model.ChannelTypeGroup},
+	}}); err != nil {
+		t.Fatalf("declare discovered scope: %v", err)
+	}
 	if got := AllowedChannelScopes(ctx); len(got) != 2 {
-		t.Fatalf("effective discovered scope = %#v, want 2 channels", got)
+		t.Fatalf("declared effective scope = %#v, want 2 channels", got)
 	}
 }
 
@@ -69,10 +75,34 @@ func TestDiscoverableChannelScopeUnionsMultipleDiscoveryResults(t *testing.T) {
 	AuthorizeDiscoveredChannels(ctx, []pipeline.ChannelInfo{{ChannelID: "group-1", ChannelType: model.ChannelTypeGroup}})
 	AuthorizeDiscoveredChannels(ctx, []pipeline.ChannelInfo{{ChannelID: "group-2", ChannelType: model.ChannelTypeGroup}})
 
+	if err := DeclareWorkspaceScopeChange(ctx, WorkspaceScopeChange{SourceMode: WorkspaceSourceReplace, Channels: []ChannelScope{
+		{ChannelID: "group-1", ChannelType: model.ChannelTypeGroup},
+		{ChannelID: "group-2", ChannelType: model.ChannelTypeGroup},
+	}}); err != nil {
+		t.Fatalf("declare union of discovery results: %v", err)
+	}
 	for _, channelID := range []string{"group-1", "group-2"} {
 		if restricted, allowed := ChannelAllowedByScope(ctx, channelID, model.ChannelTypeGroup); !restricted || !allowed {
-			t.Fatalf("channel %s = (%v,%v), want retained union grant", channelID, restricted, allowed)
+			t.Fatalf("declared channel %s = (%v,%v), want retained union", channelID, restricted, allowed)
 		}
+	}
+}
+
+func TestDeclaredChannelScopeFreezesDiscovery(t *testing.T) {
+	ctx := context.WithValue(context.Background(), ContextKeyUID, "user-1")
+	ctx = WithDiscoverableChannelScope(ctx, []ChannelScope{{ChannelID: "group-a", ChannelType: model.ChannelTypeGroup}})
+	AuthorizeDiscoveredChannels(ctx, []pipeline.ChannelInfo{{ChannelID: "group-b", ChannelType: model.ChannelTypeGroup}})
+	if err := DeclareWorkspaceScopeChange(ctx, WorkspaceScopeChange{
+		SourceMode: WorkspaceSourceReplace,
+		Channels:   []ChannelScope{{ChannelID: "group-b", ChannelType: model.ChannelTypeGroup}},
+	}); err != nil {
+		t.Fatalf("declare scope: %v", err)
+	}
+	if AuthorizeDiscoveredChannels(ctx, []pipeline.ChannelInfo{{ChannelID: "group-c", ChannelType: model.ChannelTypeGroup}}) {
+		t.Fatal("discovery grant succeeded after final scope declaration")
+	}
+	if restricted, allowed := ChannelAllowedByScope(ctx, "group-c", model.ChannelTypeGroup); !restricted || allowed {
+		t.Fatalf("post-declaration channel = (%v,%v), want denied", restricted, allowed)
 	}
 }
 

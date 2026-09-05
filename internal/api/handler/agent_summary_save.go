@@ -358,44 +358,58 @@ func loadAgentMessageForSave(db *gorm.DB, sessionID, userID string, messageID in
 	return msg, nil
 }
 
-// resolveAgentMessageRequestID makes the server-persisted message→run binding
-// authoritative before any deliverable rows are written. New messages can
-// derive a missing request_id and reject an explicit mismatch; legacy messages
-// (RunID empty) preserve the previous request_id-based behaviour.
-func resolveAgentMessageRequestID(ctx context.Context, db *gorm.DB, userID, sessionID, requestID string, msg model.AgentMessage) (string, error) {
+type agentMessageRunBinding struct {
+	RequestID         string
+	EvidenceSessionID string
+}
+
+// resolveAgentMessageRunBinding makes the server-persisted message→run binding
+// authoritative before any deliverable rows are written. Besides deriving the
+// request id, it returns the internal session identity that the generating run
+// used to persist citation evidence. Legacy messages without a run preserve the
+// previous request-id and session fallback behaviour.
+func resolveAgentMessageRunBinding(ctx context.Context, db *gorm.DB, userID, sessionID, requestID string, msg model.AgentMessage) (agentMessageRunBinding, error) {
 	if msg.RunID == "" {
-		return requestID, nil
+		return agentMessageRunBinding{RequestID: requestID}, nil
 	}
 	run, err := summaryrun.NewStore(db).GetByID(ctx, userID, msg.RunID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return "", fmt.Errorf("%w: bound run not found", errAgentMessageRunMismatch)
+			return agentMessageRunBinding{}, fmt.Errorf("%w: bound run not found", errAgentMessageRunMismatch)
 		}
-		return "", err
+		return agentMessageRunBinding{}, err
 	}
 	if strings.TrimSpace(msg.SpaceID) != "" {
 		if msg.TurnID <= 0 {
-			return "", fmt.Errorf("%w: workspace turn is missing", errAgentMessageRunMismatch)
+			return agentMessageRunBinding{}, fmt.Errorf("%w: workspace turn is missing", errAgentMessageRunMismatch)
 		}
 		var turn model.AgentSummaryTurn
 		if err := db.WithContext(ctx).
 			Where("id = ? AND space_id = ? AND user_id = ? AND session_id = ?", msg.TurnID, msg.SpaceID, userID, sessionID).
 			Take(&turn).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return "", fmt.Errorf("%w: workspace turn not found", errAgentMessageRunMismatch)
+				return agentMessageRunBinding{}, fmt.Errorf("%w: workspace turn not found", errAgentMessageRunMismatch)
 			}
-			return "", err
+			return agentMessageRunBinding{}, err
 		}
 		if turn.RunID != run.RunID || turn.ScopeVersion != msg.ScopeVersion || turn.RequestID != run.RequestID {
-			return "", fmt.Errorf("%w: workspace turn differs", errAgentMessageRunMismatch)
+			return agentMessageRunBinding{}, fmt.Errorf("%w: workspace turn differs", errAgentMessageRunMismatch)
 		}
 	} else if run.SessionID != sessionID {
-		return "", fmt.Errorf("%w: session differs", errAgentMessageRunMismatch)
+		return agentMessageRunBinding{}, fmt.Errorf("%w: session differs", errAgentMessageRunMismatch)
 	}
 	if requestID != "" && requestID != run.RequestID {
-		return "", fmt.Errorf("%w: request differs", errAgentMessageRunMismatch)
+		return agentMessageRunBinding{}, fmt.Errorf("%w: request differs", errAgentMessageRunMismatch)
 	}
-	return run.RequestID, nil
+	return agentMessageRunBinding{
+		RequestID:         run.RequestID,
+		EvidenceSessionID: run.SessionID,
+	}, nil
+}
+
+func resolveAgentMessageRequestID(ctx context.Context, db *gorm.DB, userID, sessionID, requestID string, msg model.AgentMessage) (string, error) {
+	binding, err := resolveAgentMessageRunBinding(ctx, db, userID, sessionID, requestID, msg)
+	return binding.RequestID, err
 }
 
 // canonicalAgentSaveRequestHash returns a deterministic sha256 fingerprint of
@@ -417,9 +431,25 @@ func canonicalAgentSaveRequestHash(userID string, req createAgentSummaryReq) str
 		UserName string `json:"user_name"`
 	}
 
-	sortedSources := make([]canonicalSource, 0, len(req.Sources))
-	seenSources := make(map[string]struct{}, len(req.Sources))
-	for _, s := range req.Sources {
+	sourceInput := req.Sources
+	participantInput := req.Participants
+	referenceInput := req.ReferencedTaskIDs
+	originInput := req.OriginChannelID
+	originTypeInput := req.OriginChannelType
+	if isWorkspacePreviewSave(req) {
+		// Workspace persistence replaces these client fields with the
+		// server-authoritative scope. They are not semantic request inputs and
+		// therefore must not turn an otherwise identical retry into a mismatch.
+		sourceInput = nil
+		participantInput = nil
+		referenceInput = nil
+		originInput = nil
+		originTypeInput = 0
+	}
+
+	sortedSources := make([]canonicalSource, 0, len(sourceInput))
+	seenSources := make(map[string]struct{}, len(sourceInput))
+	for _, s := range sourceInput {
 		if s.SourceID == "" {
 			continue
 		}
@@ -437,9 +467,9 @@ func canonicalAgentSaveRequestHash(userID string, req createAgentSummaryReq) str
 		return sortedSources[i].SourceID < sortedSources[j].SourceID
 	})
 
-	participants := make([]canonicalParticipant, 0, len(req.Participants))
+	participants := make([]canonicalParticipant, 0, len(participantInput))
 	seenParticipants := map[string]struct{}{userID: {}}
-	for _, p := range req.Participants {
+	for _, p := range participantInput {
 		if p.UserID == "" {
 			continue
 		}
@@ -454,14 +484,14 @@ func canonicalAgentSaveRequestHash(userID string, req createAgentSummaryReq) str
 	// ReferencedTaskIDs are order-sensitive: element 0 is the origin/citation
 	// inheritance source. Preserve first-occurrence order while removing
 	// duplicates, matching the normalization performed at handler entry.
-	refCopy := dedupReferencedTaskIDs(req.ReferencedTaskIDs)
+	refCopy := dedupReferencedTaskIDs(referenceInput)
 
-	originProvided := req.OriginChannelID != nil
+	originProvided := originInput != nil
 	originID := ""
 	originType := 0
 	if originProvided {
-		originID = *req.OriginChannelID
-		originType = req.OriginChannelType
+		originID = *originInput
+		originType = originTypeInput
 	}
 	payload := struct {
 		SessionID               string                 `json:"session_id"`
