@@ -339,6 +339,16 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	}
 	explicitRunIntent := intent == service.SummaryIntentGenerate && summaryWorkspaceExecutionAuthorized(req.InputOrigin)
 	route := deriveWorkspaceRoute(contextValue, action, intent, explicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent, begin.Snapshot, validation.participantsValid, validation.sourcesValid, validation.referencesValid)
+	// Natural-language source changes must resolve to a concrete, authorised
+	// channel set before a side-effecting Workflow can consume them. The Agent
+	// turn commits that scope atomically; a later trusted action may launch it.
+	if sourceUpdate != summaryWorkspaceSourceUnchanged {
+		if begin.Snapshot.CurrentPreview != nil && len(contextValue.Participants) == 0 {
+			route = service.SummaryRouteAgentRevision
+		} else {
+			route = service.SummaryRouteAgentPreview
+		}
+	}
 
 	var snapshot WorkspaceSnapshot
 	// The chat contract accepts request ids the workflow idempotency-key
@@ -591,13 +601,25 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	if agentSessionID == "" {
 		agentSessionID = summaryWorkspaceAgentSessionID(key.SpaceID, key.SessionID, req.ScopeVersion)
 	}
+	if sourceUpdate == summaryWorkspaceSourceReplace {
+		// A replacement gets a fresh evidence/cache identity. Historical tool
+		// handles from the old channel set therefore cannot be redeemed after the
+		// scope changes, while a failed replacement leaves the old identity intact.
+		agentSessionID = summaryWorkspaceReplacementAgentSessionID(key.SpaceID, key.SessionID, req.ScopeVersion, req.RequestID)
+	}
 	runner, system, err := h.buildRunnerForProfile(summaryWorkspaceProfile, key.UserID, agentSessionID, false)
 	if err != nil {
 		return WorkspaceSnapshot{}, err
 	}
-	selected := make([]selectedChannel, 0, len(contextValue.SelectedChannels))
-	allowedChannels := make([]agent.ChannelScope, 0, len(contextValue.SelectedChannels))
-	for _, channel := range contextValue.SelectedChannels {
+	runChannels := contextValue.SelectedChannels
+	if sourceUpdate == summaryWorkspaceSourceReplace {
+		// Preserve the old persisted scope until a replacement has been resolved
+		// and validated, but do not make old-channel handles available to this run.
+		runChannels = nil
+	}
+	selected := make([]selectedChannel, 0, len(runChannels))
+	allowedChannels := make([]agent.ChannelScope, 0, len(runChannels))
+	for _, channel := range runChannels {
 		selected = append(selected, selectedChannel{
 			ChannelID:   channel.ChatID,
 			ChannelType: channel.ChatType,
@@ -636,7 +658,7 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	workspaceRunRequest.SessionID = agentSessionID
 	workspaceRunRequest.SelectedChannels = selected
 	workspaceRunRequest.ReferencedTaskIDs = append([]int64(nil), contextValue.ReferencedTaskIDs...)
-	runID := h.maybePersistSummaryRun(ctx, key.UserID, workspaceRunRequest, len(selected) > 0)
+	runID := h.maybePersistSummaryRun(ctx, key.UserID, workspaceRunRequest, len(selected) > 0 || openScopeAgent)
 	if runID != "" {
 		ctx = context.WithValue(ctx, agent.ContextKeyRunID, runID)
 	}
@@ -649,7 +671,9 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	if err != nil {
 		return WorkspaceSnapshot{}, err
 	}
-	system += buildSummaryWorkspaceGuidance(contextValue, route, currentPreview, sourceUpdate)
+	guidanceContext := contextValue
+	guidanceContext.SelectedChannels = append([]summaryWorkspaceChannel(nil), runChannels...)
+	system += buildSummaryWorkspaceGuidance(guidanceContext, route, currentPreview, sourceUpdate)
 
 	allowedResult := agent.SummaryResultAgentPreview
 	if route == service.SummaryRouteAgentRevision {
@@ -705,10 +729,13 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 		if len(effectiveChannels) == 0 && len(contextValue.ReferencedTaskIDs) == 0 {
 			return WorkspaceSnapshot{}, errors.New("summary workspace preview has no authorised source")
 		}
-		// Discovery changes the authoritative session scope, not only the preview
-		// decoration. Persist the exact server-authorised channels so saving and
-		// the next conversational turn cannot silently fall back to the old scope.
-		contextValue.SelectedChannels = effectiveChannels
+		if sourceUpdate != summaryWorkspaceSourceUnchanged {
+			contextValue, err = h.workspace.applyDiscoveredWorkspaceScope(ctx, key.SpaceID, key.UserID, contextValue, effectiveChannels, sourceUpdate)
+			if err != nil {
+				return WorkspaceSnapshot{}, err
+			}
+			effectiveChannels = append([]summaryWorkspaceChannel(nil), contextValue.SelectedChannels...)
+		}
 		nextVersion := before.Session.ArtifactVersion + 1
 		if nextVersion <= 0 {
 			nextVersion = 1
@@ -759,6 +786,7 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 		ParentMessageID:    int64(parentMessageID),
 		EffectiveScopeJSON: effectiveScopeJSON,
 		EffectiveScopeHash: effectiveScopeHash,
+		AgentSessionID:     agentSessionID,
 	})
 	if err != nil {
 		return WorkspaceSnapshot{}, err
@@ -1333,11 +1361,6 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 		return contextValue, false, err
 	}
 	contextValue = effective
-	if summaryWorkspaceRequestedSourceUpdate(message, inputOrigin, intent) == summaryWorkspaceSourceReplace {
-		// Keep the rest of the hydrated context (time range, template, references)
-		// but discard the old channel allowlist before trusted discovery starts.
-		contextValue.SelectedChannels = nil
-	}
 
 	now := timezone.Now()
 	if w != nil && w.now != nil {
@@ -1398,26 +1421,94 @@ func summaryWorkspaceRequestedSourceUpdate(message, inputOrigin string, intent s
 	) {
 		return summaryWorkspaceSourceUnchanged
 	}
-	hasSourceCue := containsAny(normalized,
-		"群", "会话", "私聊", "聊天", "频道", "子区", "thread",
-	)
-	if !hasSourceCue {
+	if !containsAny(normalized, "群", "会话", "私聊", "聊天", "频道", "子区", "thread") {
 		return summaryWorkspaceSourceUnchanged
 	}
 	if containsAny(normalized,
-		"再加", "加上", "加入", "添加", "同时包含", "同时加", "也包含", "也加", "还要包含", "一并包含",
+		"所有群聊", "全部群聊", "所有会话", "全部会话", "所有聊天", "全部聊天",
 	) {
+		return summaryWorkspaceSourceReplace
+	}
+	if summaryWorkspaceSourceDirectiveTargetsChannel(normalized, []string{
+		"再加", "加上", "加入", "添加", "同时包含", "同时加", "也包含", "也加", "还要包含", "一并包含",
+	}) {
 		return summaryWorkspaceSourceExtend
 	}
-	if containsAny(normalized,
+	if summaryWorkspaceSourceDirectiveTargetsChannel(normalized, []string{
 		"改成", "改为", "换成", "更换为", "切换到", "替换为", "只总结", "仅总结", "只看", "仅看",
-		"选择", "选中", "指定", "使用", "作为范围",
-		"所有群聊", "全部群聊", "所有会话", "全部会话", "所有聊天", "全部聊天",
-	) || strings.HasPrefix(normalized, "总结") || strings.HasPrefix(normalized, "汇总") || strings.HasPrefix(normalized, "生成") ||
-		strings.HasSuffix(normalized, "群") || strings.HasSuffix(normalized, "群聊") || strings.HasSuffix(normalized, "会话") || strings.HasSuffix(normalized, "私聊") {
+		"选择", "选中", "指定", "作为范围",
+	}) || summaryWorkspaceHasNamedSourceRequest(normalized) {
 		return summaryWorkspaceSourceReplace
 	}
 	return summaryWorkspaceSourceUnchanged
+}
+
+var summaryWorkspaceSourceCues = []string{"群聊", "私聊", "会话", "聊天", "频道", "子区", "thread", "群"}
+
+func summaryWorkspaceSourceDirectiveTargetsChannel(message string, directives []string) bool {
+	for _, cue := range summaryWorkspaceSourceCues {
+		for offset := 0; offset < len(message); {
+			relative := strings.Index(message[offset:], cue)
+			if relative < 0 {
+				break
+			}
+			index := offset + relative
+			clauseStart := 0
+			if delimiter := strings.LastIndexAny(message[:index], "，,。；;！？!?\n"); delimiter >= 0 {
+				_, width := utf8.DecodeRuneInString(message[delimiter:])
+				clauseStart = delimiter + width
+			}
+			prefix := message[clauseStart:index]
+			for _, directive := range directives {
+				directiveIndex := strings.LastIndex(prefix, directive)
+				if directiveIndex < 0 {
+					continue
+				}
+				governed := prefix[directiveIndex+len(directive):]
+				if len([]rune(governed)) > 16 || summaryWorkspaceSourcePhraseIsGeneric(governed) ||
+					containsAny(prefix, "时间范围", "时间窗口", "取数范围", "统计范围", "模板", "结构", "标题", "名称", "名字", "负责人") {
+					continue
+				}
+				return true
+			}
+			offset = index + len(cue)
+		}
+	}
+	return false
+}
+
+func summaryWorkspaceHasNamedSourceRequest(message string) bool {
+	for _, cue := range summaryWorkspaceSourceCues {
+		index := strings.Index(message, cue)
+		if index < 0 {
+			continue
+		}
+		prefix := message[:index]
+		if containsAny(prefix, "时间范围", "时间窗口", "取数范围", "统计范围", "模板", "结构", "标题", "名称", "名字", "负责人") {
+			continue
+		}
+		for _, verb := range []string{"总结", "汇总", "生成"} {
+			if !strings.HasPrefix(prefix, verb) {
+				continue
+			}
+			descriptor := strings.TrimPrefix(prefix, verb)
+			descriptor = strings.TrimPrefix(descriptor, "一下")
+			descriptor = strings.TrimPrefix(descriptor, "下")
+			if descriptor != "" && !summaryWorkspaceSourcePhraseIsGeneric(descriptor) {
+				return true
+			}
+		}
+		if cue == "私聊" && strings.HasPrefix(prefix, "和") && strings.HasSuffix(prefix, "的") && !summaryWorkspaceSourcePhraseIsGeneric(prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func summaryWorkspaceSourcePhraseIsGeneric(value string) bool {
+	return value == "" || containsAny(value,
+		"这个", "这些", "这几个", "本群", "本会话", "当前", "所选", "选择的", "选中的",
+	)
 }
 
 func summaryWorkspaceRequestedPresetTimeRange(message string, now time.Time) (*summaryWorkspaceTimeRange, bool) {
@@ -1498,12 +1589,16 @@ func summaryWorkspaceRangeMentionIsExplicit(message string, index, length int) b
 	prefix := message[clauseStart:index]
 	suffix := message[index+length : clauseEnd]
 	clause := message[clauseStart:clauseEnd]
-	for _, negation := range []string{"不要", "别用", "不用", "不使用", "无需", "别按", "不要用"} {
+	if strings.Contains(prefix, "而是") {
+		prefix = prefix[strings.LastIndex(prefix, "而是")+len("而是"):]
+	}
+	for _, negation := range []string{"不要", "别用", "不用", "不使用", "无需", "别按", "不要用", "不是", "不总结", "不需要"} {
 		if strings.Contains(prefix, negation) || strings.HasPrefix(suffix, negation) {
 			return false
 		}
 	}
-	if containsAny(clause, "参考", "对照", "提到", "提及") ||
+	if containsAny(clause, "参考", "对照", "提到", "提及", "标题", "名称", "名字", "上次", "之前", "此前", "原来") ||
+		containsAny(suffix, "不用看", "不要看", "不总结", "无需总结", "太多了") ||
 		(strings.HasPrefix(suffix, "的背景") && !containsAny(prefix, "总结", "汇总", "生成")) {
 		return false
 	}
@@ -1513,7 +1608,8 @@ func summaryWorkspaceRangeMentionIsExplicit(message string, index, length int) b
 	if containsAny(prefix, "总结", "汇总", "生成") || strings.HasSuffix(prefix, "按") || strings.HasSuffix(prefix, "用") || strings.HasSuffix(prefix, "看") {
 		return true
 	}
-	return strings.TrimSpace(prefix) == "" || containsAny(suffix, "重新总结", "总结", "生成", "就好", "即可", "为准")
+	return (strings.TrimSpace(prefix) == "" && strings.TrimSpace(suffix) == "") ||
+		containsAny(suffix, "重新总结", "总结", "生成", "就好", "即可", "为准")
 }
 
 func materializeSummaryWorkspaceDefaultTimeRange(contextValue summaryWorkspaceContext, now time.Time) summaryWorkspaceContext {
@@ -1623,6 +1719,49 @@ func summaryWorkspaceChannelsFromAgentScope(channels []agent.ChannelScope) []sum
 		})
 	}
 	return result
+}
+
+// applyDiscoveredWorkspaceScope is the commit boundary for conversational
+// source changes. Discovery may inspect candidates, but the session's previous
+// scope remains authoritative unless the complete replacement/extension passes
+// contract normalization, actor authorization, and team-scope validation.
+func (w *summaryWorkspaceCoordinator) applyDiscoveredWorkspaceScope(
+	ctx context.Context,
+	spaceID, actorID string,
+	current summaryWorkspaceContext,
+	discovered []summaryWorkspaceChannel,
+	mode summaryWorkspaceSourceUpdateMode,
+) (summaryWorkspaceContext, error) {
+	if mode == summaryWorkspaceSourceUnchanged {
+		return current, nil
+	}
+	if len(discovered) == 0 {
+		return current, errors.New("source change did not resolve any authorised channel")
+	}
+	candidate := current
+	candidate.SelectedChannels = append([]summaryWorkspaceChannel(nil), discovered...)
+	candidate = canonicalizeSummaryWorkspaceContextForActor(candidate, actorID)
+	normalized, err := normalizeSummaryWorkspaceContext(candidate)
+	if err != nil {
+		return current, fmt.Errorf("normalize discovered workspace scope: %w", err)
+	}
+	valid, err := w.validateSources(ctx, spaceID, actorID, normalized.SelectedChannels)
+	if err != nil {
+		return current, fmt.Errorf("validate discovered workspace scope: %w", err)
+	}
+	if !valid {
+		return current, errors.New("discovered workspace scope is not authorised")
+	}
+	if len(normalized.Participants) > 0 {
+		valid, reason, err := w.validateTeamScope(ctx, normalized.SelectedChannels, normalized.Participants)
+		if err != nil {
+			return current, fmt.Errorf("validate discovered team scope: %w", err)
+		}
+		if !valid {
+			return current, errors.New(summaryWorkspaceTeamScopeMessage(reason))
+		}
+	}
+	return normalized, nil
 }
 
 func summaryWorkspaceChatType(channelType int) string {

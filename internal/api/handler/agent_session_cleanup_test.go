@@ -454,6 +454,60 @@ func TestRunOnce_expiredWorkspaceSessionAndEvidenceCleaned(t *testing.T) {
 	}
 }
 
+func TestRunOnce_expiredWorkspaceCleansFailedTurnRunWithoutMessages(t *testing.T) {
+	db, skip := newCleanupTestDB(t)
+	if skip {
+		return
+	}
+
+	const (
+		spaceID   = "space-1"
+		userID    = "user-1"
+		sessionID = "workspace-failed-run"
+		runID     = "run-failed-without-message"
+	)
+	seedWorkspaceSession(t, db, spaceID, userID, sessionID)
+	var session model.AgentSummarySession
+	if err := db.Where("space_id = ? AND user_id = ? AND session_id = ?", spaceID, userID, sessionID).Take(&session).Error; err != nil {
+		t.Fatalf("load workspace session: %v", err)
+	}
+	now := timezone.Now()
+	expiredAt := now.Add(-time.Hour)
+	if err := db.Model(&session).Updates(map[string]interface{}{"expires_at": expiredAt, "updated_at": now.Add(-summaryWorkspaceRetention - time.Hour)}).Error; err != nil {
+		t.Fatalf("expire workspace session: %v", err)
+	}
+	if err := db.Create(&model.AgentSummaryTurn{
+		SpaceID: spaceID, UserID: userID, SessionID: sessionID, RequestID: "failed-request",
+		RequestHash: "failed-hash", ScopeVersion: 2, Status: "failed", Attempt: 1,
+		ErrorCode: "AGENT_FAILED", CreatedAt: expiredAt, UpdatedAt: expiredAt,
+	}).Error; err != nil {
+		t.Fatalf("seed failed workspace turn: %v", err)
+	}
+	internalSessionID := summaryWorkspaceReplacementAgentSessionID(spaceID, sessionID, 2, "failed-request")
+	if err := db.Create(&model.AgentSummaryRun{
+		RunID: runID, UserID: userID, SessionID: internalSessionID, RequestID: "failed-request",
+		ScopePolicy: model.ScopePolicyOpen, Status: "created", AttemptedChannels: "[]", SucceededChannels: "[]", FailedChannels: "[]", DiscoveredChannels: "[]",
+		CreatedAt: expiredAt, UpdatedAt: expiredAt,
+	}).Error; err != nil {
+		t.Fatalf("seed failed workspace run: %v", err)
+	}
+	if err := db.Create(&model.AgentSummarySpec{
+		SpecID: "spec-failed", RunID: runID, Version: 1, SpecHash: "hash",
+		SpecJSON: "{}", FieldSources: "{}", UserRequest: "sensitive failed request", CreatedAt: expiredAt,
+	}).Error; err != nil {
+		t.Fatalf("seed failed workspace spec: %v", err)
+	}
+
+	runOnce(db)
+
+	if got := countModelRows(t, db, &model.AgentSummaryRun{}, "run_id = ?", runID); got != 0 {
+		t.Fatalf("failed workspace runs = %d, want 0", got)
+	}
+	if got := countModelRows(t, db, &model.AgentSummarySpec{}, "run_id = ?", runID); got != 0 {
+		t.Fatalf("failed workspace specs = %d, want 0", got)
+	}
+}
+
 func TestRunOnce_activeWorkspaceSessionPreserved(t *testing.T) {
 	db, skip := newCleanupTestDB(t)
 	if skip {

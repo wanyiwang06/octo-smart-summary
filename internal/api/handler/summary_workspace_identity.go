@@ -19,6 +19,11 @@ func summaryWorkspaceAgentSessionID(spaceID, sessionID string, scopeVersion int)
 	return pipeline.WorkspaceAgentSessionPrefix + hex.EncodeToString(sum[:])
 }
 
+func summaryWorkspaceReplacementAgentSessionID(spaceID, sessionID string, scopeVersion int, requestID string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(spaceID) + "\x00" + strings.TrimSpace(sessionID) + "\x00" + strconv.Itoa(scopeVersion) + "\x00replace\x00" + strings.TrimSpace(requestID)))
+	return pipeline.WorkspaceAgentSessionPrefix + hex.EncodeToString(sum[:])
+}
+
 func persistedOrDerivedWorkspaceAgentSessionID(persisted, spaceID, sessionID string, scopeVersion int) string {
 	if persisted = strings.TrimSpace(persisted); persisted != "" {
 		return persisted

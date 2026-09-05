@@ -19,9 +19,18 @@ returns `enabled: true` and `contract_version: "2"`.
 
 The session's `scope_json` and `scope_hash` are the authoritative effective
 scope. When the server resolves a default, inferred source, or explicit
-natural-language time-range change, the completed turn stores that resolved
-scope without changing `scope_version`. The response returns the same scope in
-`state.summary_context`; the client must use it for the next turn.
+natural-language source/time-range change, the completed turn stores that
+resolved scope without changing `scope_version`. The response returns the same
+scope in `state.summary_context`; the client must use it for the next turn and
+must replace its local chat chips with the returned `selected_channels`.
+
+Conversational source replacement/extension is two-phase. Ordinary requests
+such as “总结这个群” keep the picker scope. An explicit source instruction first
+resolves candidate chats through server-authorised discovery; the server then
+applies contract limits, actor membership, and team-scope checks before
+atomically replacing the stored scope. Until those checks pass, the previous
+scope remains authoritative. A source-changing turn cannot directly dispatch a
+Workflow; the trusted start action may run after the resolved scope is returned.
 
 `time_range.source` records whether the current range came from the picker,
 the server default, or a conversational instruction. A picker range is changed

@@ -309,20 +309,60 @@ func deleteWorkspaceSessionState(tx *gorm.DB, session model.AgentSummarySession)
 		return fmt.Errorf("load workspace run ids for session %d: %w", session.ID, err)
 	}
 
-	evidenceSessions := make([]string, 0, len(runIDs)+1)
-	if strings.TrimSpace(session.AgentSessionID) != "" {
-		evidenceSessions = append(evidenceSessions, session.AgentSessionID)
+	// Failed Agent turns have no agent_message row, but maybePersistSummaryRun
+	// has already written their run/spec. Derive every internal Agent session
+	// identity used by this workspace's turns so cleanup covers those runs too.
+	var turns []model.AgentSummaryTurn
+	if err := tx.Select("scope_version", "request_id").Model(&model.AgentSummaryTurn{}).
+		Where("space_id = ? AND user_id = ? AND session_id = ?", session.SpaceID, session.UserID, session.SessionID).
+		Find(&turns).Error; err != nil {
+		return fmt.Errorf("load workspace turn identities for session %d: %w", session.ID, err)
 	}
-	if len(runIDs) > 0 {
-		var runs []model.AgentSummaryRun
-		if err := tx.Select("run_id", "session_id").Where("user_id = ? AND run_id IN ?", session.UserID, runIDs).Find(&runs).Error; err != nil {
+	evidenceSessions := make([]string, 0, len(turns)*2+1)
+	seenEvidenceSessions := make(map[string]struct{}, len(turns)*2+1)
+	addEvidenceSession := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, exists := seenEvidenceSessions[value]; exists {
+			return
+		}
+		seenEvidenceSessions[value] = struct{}{}
+		evidenceSessions = append(evidenceSessions, value)
+	}
+	addEvidenceSession(session.AgentSessionID)
+	for _, turn := range turns {
+		addEvidenceSession(summaryWorkspaceAgentSessionID(session.SpaceID, session.SessionID, turn.ScopeVersion))
+		addEvidenceSession(summaryWorkspaceReplacementAgentSessionID(session.SpaceID, session.SessionID, turn.ScopeVersion, turn.RequestID))
+	}
+
+	seenRunIDs := make(map[string]struct{}, len(runIDs))
+	for _, runID := range runIDs {
+		seenRunIDs[runID] = struct{}{}
+	}
+	var runs []model.AgentSummaryRun
+	query := tx.Select("run_id", "session_id").Where("user_id = ?", session.UserID)
+	if len(evidenceSessions) > 0 && len(runIDs) > 0 {
+		query = query.Where("session_id IN ? OR run_id IN ?", evidenceSessions, runIDs)
+	} else if len(evidenceSessions) > 0 {
+		query = query.Where("session_id IN ?", evidenceSessions)
+	} else if len(runIDs) > 0 {
+		query = query.Where("run_id IN ?", runIDs)
+	}
+	if len(evidenceSessions) > 0 || len(runIDs) > 0 {
+		if err := query.Find(&runs).Error; err != nil {
 			return fmt.Errorf("load workspace runs for session %d: %w", session.ID, err)
 		}
-		for _, run := range runs {
-			if strings.TrimSpace(run.SessionID) != "" {
-				evidenceSessions = append(evidenceSessions, run.SessionID)
-			}
+	}
+	for _, run := range runs {
+		addEvidenceSession(run.SessionID)
+		if _, exists := seenRunIDs[run.RunID]; !exists {
+			seenRunIDs[run.RunID] = struct{}{}
+			runIDs = append(runIDs, run.RunID)
 		}
+	}
+	if len(runIDs) > 0 {
 		if err := tx.Where("run_id IN ?", runIDs).Delete(&model.AgentCitationManifest{}).Error; err != nil {
 			return fmt.Errorf("delete workspace citation manifests for session %d: %w", session.ID, err)
 		}

@@ -24,6 +24,14 @@ func TestSummaryWorkspaceRequestedSourceUpdate(t *testing.T) {
 		{name: "extend group", message: "再加上运营群", intent: service.SummaryIntentRevise, want: summaryWorkspaceSourceExtend},
 		{name: "extend direct chat", message: "同时包含和张三的私聊", intent: service.SummaryIntentRevise, want: summaryWorkspaceSourceExtend},
 		{name: "content mention", message: "补充项目群里提到的风险", intent: service.SummaryIntentRevise, want: summaryWorkspaceSourceUnchanged},
+		{name: "ordinary selected groups", message: "总结一下这几个群的进展", intent: service.SummaryIntentRevise, want: summaryWorkspaceSourceUnchanged},
+		{name: "ordinary current group", message: "总结这个群里的风险和行动项", intent: service.SummaryIntentRevise, want: summaryWorkspaceSourceUnchanged},
+		{name: "generic conversation", message: "总结会话内容", intent: service.SummaryIntentRevise, want: summaryWorkspaceSourceUnchanged},
+		{name: "template is not source", message: "使用周报模板重新总结这个群", intent: service.SummaryIntentRevise, want: summaryWorkspaceSourceUnchanged},
+		{name: "structure is not source", message: "选择更简洁的结构总结这个会话", intent: service.SummaryIntentRevise, want: summaryWorkspaceSourceUnchanged},
+		{name: "owner is not source", message: "指定负责人后再总结这个群", intent: service.SummaryIntentRevise, want: summaryWorkspaceSourceUnchanged},
+		{name: "title is not source", message: "把总结标题改成项目群周报", intent: service.SummaryIntentRevise, want: summaryWorkspaceSourceUnchanged},
+		{name: "range is not source", message: "把项目群的时间范围改成一周", intent: service.SummaryIntentRevise, want: summaryWorkspaceSourceUnchanged},
 		{name: "keep current", message: "保持当前会话，只调整结构", intent: service.SummaryIntentRevise, want: summaryWorkspaceSourceUnchanged},
 		{name: "explanation never reopens", message: "为什么没有总结项目群", intent: service.SummaryIntentExplain, want: summaryWorkspaceSourceUnchanged},
 	}
@@ -36,7 +44,7 @@ func TestSummaryWorkspaceRequestedSourceUpdate(t *testing.T) {
 	}
 }
 
-func TestMaterializeWorkspaceAgentContextReplacesHydratedChannels(t *testing.T) {
+func TestMaterializeWorkspaceAgentContextKeepsOldChannelsUntilReplacementIsValidated(t *testing.T) {
 	preview := workspacePreviewMessage(t, []agent.SummaryResponseChannel{{ChannelID: "old-group", ChannelType: 2, ChannelName: "旧群"}})
 	contextValue := emptySummaryWorkspaceContext()
 	contextValue.SelectedChannels = []summaryWorkspaceChannel{{ChatID: "ui-group", ChatType: "group", Name: "页面群"}}
@@ -48,8 +56,27 @@ func TestMaterializeWorkspaceAgentContextReplacesHydratedChannels(t *testing.T) 
 	if err != nil {
 		t.Fatalf("materialize context: %v", err)
 	}
-	if len(got.SelectedChannels) != 0 {
-		t.Fatalf("replacement retained old channels: %#v", got.SelectedChannels)
+	if len(got.SelectedChannels) != 1 || got.SelectedChannels[0].ChatID != "ui-group" {
+		t.Fatalf("replacement mutated authoritative channels before validation: %#v", got.SelectedChannels)
+	}
+}
+
+func TestApplyDiscoveredWorkspaceScopeRejectsOversizedReplacementWithoutMutatingOldScope(t *testing.T) {
+	current := emptySummaryWorkspaceContext()
+	current.SelectedChannels = []summaryWorkspaceChannel{{ChatID: "old-group", ChatType: "group", Name: "旧群"}}
+	discovered := make([]summaryWorkspaceChannel, maxSummaryWorkspaceSelectedChannels+1)
+	for i := range discovered {
+		discovered[i] = summaryWorkspaceChannel{ChatID: "group-" + string(rune('a'+i)), ChatType: "group", Name: "群" + string(rune('a'+i))}
+	}
+
+	got, err := (&summaryWorkspaceCoordinator{}).applyDiscoveredWorkspaceScope(
+		t.Context(), "space-a", "actor", current, discovered, summaryWorkspaceSourceReplace,
+	)
+	if err == nil {
+		t.Fatal("oversized replacement must be rejected")
+	}
+	if len(got.SelectedChannels) != 1 || got.SelectedChannels[0].ChatID != "old-group" {
+		t.Fatalf("rejected replacement mutated old scope: %#v", got.SelectedChannels)
 	}
 }
 

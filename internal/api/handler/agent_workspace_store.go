@@ -95,6 +95,7 @@ type WorkspaceTurnCompletion struct {
 	ParentMessageID    int64
 	EffectiveScopeJSON []byte
 	EffectiveScopeHash string
+	AgentSessionID     string
 	Proposal           *WorkspaceProposalMutation
 	Workflow           *WorkspaceWorkflowMutation
 }
@@ -421,6 +422,9 @@ func (s *AgentWorkspaceStore) CompleteTurn(ctx context.Context, in WorkspaceTurn
 			}
 			updates["scope_json"] = string(in.EffectiveScopeJSON)
 			updates["scope_hash"] = in.EffectiveScopeHash
+		}
+		if agentSessionID := strings.TrimSpace(in.AgentSessionID); agentSessionID != "" {
+			updates["agent_session_id"] = agentSessionID
 		}
 		if in.ResultType == workspaceResultAgentPreview || in.ResultType == workspaceResultAgentRevision {
 			updates["artifact_version"] = artifactVersion
