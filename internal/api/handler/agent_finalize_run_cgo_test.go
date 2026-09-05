@@ -34,7 +34,7 @@ func newFinalizeTestDB(t *testing.T) *gorm.DB {
 		t.Skipf("CGO required for sqlite: %v", err)
 		return nil
 	}
-	if err := db.AutoMigrate(&model.AgentSummaryRun{}, &model.AgentSummarySpec{}, &model.AgentEvidenceArtifact{}, &model.AgentMessage{}); err != nil {
+	if err := db.AutoMigrate(&model.AgentSummaryRun{}, &model.AgentSummarySpec{}, &model.AgentEvidenceArtifact{}, &model.AgentMessage{}, &model.AgentSummaryTurn{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return db

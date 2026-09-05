@@ -151,3 +151,48 @@ func TestCanonicalAgentSaveRequestHash_ImplicitOriginDiffersFromExplicitEmpty(t 
 		t.Fatal("implicit origin and explicitly empty origin must hash differently")
 	}
 }
+
+func TestCanonicalAgentSaveRequestHash_WorkspaceVersionsMatter(t *testing.T) {
+	scope1, scope2 := 1, 2
+	artifact1, artifact2 := 3, 4
+	baseReq := createAgentSummaryReq{
+		SessionID:               "workspace-session",
+		AgentMessageID:          42,
+		SnapshotVersion:         1,
+		ScopeVersion:            &scope1,
+		ExpectedArtifactVersion: &artifact1,
+	}
+	base := canonicalAgentSaveRequestHash("u1", baseReq)
+
+	changedScope := baseReq
+	changedScope.ScopeVersion = &scope2
+	if got := canonicalAgentSaveRequestHash("u1", changedScope); got == base {
+		t.Fatal("scope_version did not change the idempotency hash")
+	}
+	changedArtifact := baseReq
+	changedArtifact.ExpectedArtifactVersion = &artifact2
+	if got := canonicalAgentSaveRequestHash("u1", changedArtifact); got == base {
+		t.Fatal("expected_artifact_version did not change the idempotency hash")
+	}
+}
+
+func TestValidateWorkspacePreviewSaveRequest_LegacyAndStrictShapes(t *testing.T) {
+	if err := validateWorkspacePreviewSaveRequest(createAgentSummaryReq{SessionID: "legacy"}); err != nil {
+		t.Fatalf("legacy request rejected: %v", err)
+	}
+	scope, artifact := 1, 1
+	if err := validateWorkspacePreviewSaveRequest(createAgentSummaryReq{
+		SessionID: "workspace", ScopeVersion: &scope,
+	}); err == nil {
+		t.Fatal("half-supplied workspace versions were accepted")
+	}
+	if err := validateWorkspacePreviewSaveRequest(createAgentSummaryReq{
+		SessionID:               "workspace",
+		AgentMessageID:          1,
+		SnapshotVersion:         1,
+		ScopeVersion:            &scope,
+		ExpectedArtifactVersion: &artifact,
+	}); err != nil {
+		t.Fatalf("valid strict workspace request rejected: %v", err)
+	}
+}

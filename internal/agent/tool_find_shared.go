@@ -51,7 +51,10 @@ func FindSharedChannelsTool() (Tool, Handler) {
 
 		summaryDB, imDB, _, _ := GetSummaryDeps()
 
-		options := []pipeline.ChannelQueryOption{pipeline.WithIncludeArchived(req.IncludeArchived)}
+		options := []pipeline.ChannelQueryOption{
+			pipeline.WithIncludeArchived(req.IncludeArchived),
+			pipeline.WithSpaceID(WorkspaceSpaceID(ctx)),
+		}
 		if !req.IncludeArchived {
 			options = append(options, pipeline.WithSelectedThreads(SelectedArchivedChannelIDs(ctx)))
 		}
@@ -59,6 +62,7 @@ func FindSharedChannelsTool() (Tool, Handler) {
 		if err != nil {
 			return "", fmt.Errorf("get creator channels: %w", err)
 		}
+		creatorChannels = RestrictDiscoveredChannels(ctx, creatorChannels)
 
 		shared, err := pipeline.IntersectParticipantChannels(ctx, creatorChannels, req.ParticipantUIDs, imDB, options...)
 		if err != nil {
@@ -79,6 +83,7 @@ func FindSharedChannelsTool() (Tool, Handler) {
 		// tool schema is advisory metadata sent to the model, not validation.
 		if len(req.ParticipantUIDs) > 0 {
 			recordDiscoveredChannels(ctx, summaryDB, uid, channelIDsOf(shared))
+			AuthorizeDiscoveredChannels(ctx, shared)
 		}
 
 		result := map[string]interface{}{

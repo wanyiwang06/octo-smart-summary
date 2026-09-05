@@ -261,6 +261,20 @@ func (s *Store) SetStatus(ctx context.Context, userID, runID, status string) err
 		Updates(map[string]interface{}{"status": status, "updated_at": now()}).Error
 }
 
+// FinishRunning marks a successfully completed Agent execution as terminal
+// without overwriting a fatal status recorded concurrently by a tool-error hook.
+func (s *Store) FinishRunning(ctx context.Context, userID, runID string) error {
+	if userID == "" || runID == "" {
+		return nil
+	}
+	return s.db.WithContext(ctx).Model(&model.AgentSummaryRun{}).
+		Where("run_id = ? AND user_id = ? AND status = ?", runID, userID, model.RunStatusRunning).
+		Updates(map[string]interface{}{
+			"status":     model.RunStatusFinished,
+			"updated_at": now(),
+		}).Error
+}
+
 // ClearFailedStatusForReplay resets a run whose status was latched to failed by a
 // PREVIOUS attempt under the same idempotency tuple, so a fresh attempt starts
 // from a clean slate.

@@ -32,9 +32,14 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/summaryrun"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
+	"github.com/gin-gonic/gin"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -50,6 +55,248 @@ var errAgentSaveIdempotencyConflict = errors.New("agent save idempotency conflic
 // passed the owner/session/role checks. It therefore means the selected draft's
 // persisted run binding is stale or conflicts with the caller's request_id.
 var errAgentMessageRunMismatch = errors.New("agent message does not match summary run")
+
+// errWorkspacePreviewSaveStale deliberately collapses all workspace ownership,
+// latest-preview and optimistic-version failures into one public conflict. The
+// detailed suffix is useful in logs/tests but must not be exposed to callers,
+// otherwise a message id could be used to probe another workspace.
+var errWorkspacePreviewSaveStale = errors.New("workspace preview is stale")
+
+type workspacePreviewSaveCandidate struct {
+	Session model.AgentSummarySession
+	Message model.AgentMessage
+	Scope   summaryWorkspaceContext
+	Content string
+}
+
+func isWorkspacePreviewSave(req createAgentSummaryReq) bool {
+	return req.ScopeVersion != nil || req.ExpectedArtifactVersion != nil
+}
+
+func validateWorkspacePreviewSaveRequest(req createAgentSummaryReq) error {
+	if !isWorkspacePreviewSave(req) {
+		return nil
+	}
+	if req.ScopeVersion == nil || req.ExpectedArtifactVersion == nil {
+		return errors.New("scope_version and expected_artifact_version must be provided together")
+	}
+	if *req.ScopeVersion <= 0 || *req.ExpectedArtifactVersion <= 0 {
+		return errors.New("scope_version and expected_artifact_version must be positive")
+	}
+	if req.AgentMessageID <= 0 || req.SnapshotVersion <= 0 {
+		return errors.New("workspace save requires agent_message_id and snapshot_version")
+	}
+	return nil
+}
+
+// loadWorkspacePreviewForSave resolves the only saveable artifact from
+// server-owned workspace rows. In strict mode the visible assistant Content is
+// conversational text; the deliverable is response_payload_json.preview.content.
+// When lock is true the session and message rows are locked for the save
+// transaction so a concurrent scope change, revision or save cannot pass the
+// optimistic checks and create a second summary.
+func loadWorkspacePreviewForSave(
+	db *gorm.DB,
+	spaceID, userID string,
+	req createAgentSummaryReq,
+	lock bool,
+) (workspacePreviewSaveCandidate, error) {
+	if err := validateWorkspacePreviewSaveRequest(req); err != nil {
+		return workspacePreviewSaveCandidate{}, err
+	}
+
+	sessionQuery := db
+	if lock {
+		sessionQuery = sessionQuery.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	var session model.AgentSummarySession
+	if err := sessionQuery.Where(
+		"space_id = ? AND user_id = ? AND session_id = ?",
+		spaceID, userID, req.SessionID,
+	).Take(&session).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: session not found", errWorkspacePreviewSaveStale)
+		}
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("load workspace session: %w", err)
+	}
+	if session.ContractVersion != summaryWorkspaceContractVersion {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: contract version differs", errWorkspacePreviewSaveStale)
+	}
+	if session.ScopeVersion != *req.ScopeVersion {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: session scope version differs", errWorkspacePreviewSaveStale)
+	}
+	if session.ArtifactVersion != *req.ExpectedArtifactVersion {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: session artifact version differs", errWorkspacePreviewSaveStale)
+	}
+	if session.LatestPreviewMessageID != req.AgentMessageID || session.LatestPreviewMessageID <= 0 {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: message is not the latest preview", errWorkspacePreviewSaveStale)
+	}
+	if session.LatestPreviewSavedTaskID > 0 {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: latest preview is already saved", errWorkspacePreviewSaveStale)
+	}
+
+	messageQuery := db
+	if lock {
+		messageQuery = messageQuery.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	var message model.AgentMessage
+	if err := messageQuery.Where(
+		"id = ? AND space_id = ? AND user_id = ? AND session_id = ? AND role = ? AND tool_calls IS NULL",
+		req.AgentMessageID, spaceID, userID, req.SessionID, "assistant",
+	).Take(&message).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: preview message not found", errWorkspacePreviewSaveStale)
+		}
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("load workspace preview: %w", err)
+	}
+	if message.ResultType != agent.SummaryResultAgentPreview && message.ResultType != agent.SummaryResultAgentRevision {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: result type is not saveable", errWorkspacePreviewSaveStale)
+	}
+	if message.ScopeVersion != session.ScopeVersion || message.ScopeVersion != *req.ScopeVersion {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: message scope version differs", errWorkspacePreviewSaveStale)
+	}
+	if message.ArtifactVersion != session.ArtifactVersion || message.ArtifactVersion != *req.ExpectedArtifactVersion {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: message artifact version differs", errWorkspacePreviewSaveStale)
+	}
+	if message.SnapshotVersion != req.SnapshotVersion || message.SnapshotVersion != workspaceSnapshotVersion {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: snapshot version differs", errWorkspacePreviewSaveStale)
+	}
+	if message.SavedTaskID > 0 {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: preview message is already saved", errWorkspacePreviewSaveStale)
+	}
+	if message.ResponsePayload == nil || strings.TrimSpace(*message.ResponsePayload) == "" {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: response payload is missing", errWorkspacePreviewSaveStale)
+	}
+
+	var payload agent.SummaryResponsePayload
+	if err := json.Unmarshal([]byte(*message.ResponsePayload), &payload); err != nil {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: invalid response payload", errWorkspacePreviewSaveStale)
+	}
+	if payload.ResultType != message.ResultType || payload.ExecutionTarget != "agent_preview" || payload.Preview == nil {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: response payload does not describe this preview", errWorkspacePreviewSaveStale)
+	}
+	if payload.Preview.Version != message.ArtifactVersion || strings.TrimSpace(payload.Preview.Content) == "" {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: preview payload version or content differs", errWorkspacePreviewSaveStale)
+	}
+	if message.ResultType == agent.SummaryResultAgentPreview {
+		if message.ParentMessageID != 0 || payload.Preview.ParentMessageID != 0 {
+			return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: initial preview has a parent", errWorkspacePreviewSaveStale)
+		}
+	} else if message.ParentMessageID <= 0 || payload.Preview.ParentMessageID != message.ParentMessageID {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: revision parent differs", errWorkspacePreviewSaveStale)
+	}
+
+	scope := emptySummaryWorkspaceContext()
+	if strings.TrimSpace(session.ScopeJSON) == "" {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: workspace scope is missing", errWorkspacePreviewSaveStale)
+	}
+	if err := json.Unmarshal([]byte(session.ScopeJSON), &scope); err != nil {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: workspace scope is invalid", errWorkspacePreviewSaveStale)
+	}
+	normalizedScope, err := normalizeSummaryWorkspaceContext(scope)
+	if err != nil {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: workspace scope is invalid", errWorkspacePreviewSaveStale)
+	}
+	normalizedScope, err = hydrateSummaryWorkspaceContextFromPreview(normalizedScope, &message, userID)
+	if err != nil {
+		return workspacePreviewSaveCandidate{}, fmt.Errorf("%w: preview effective scope is invalid", errWorkspacePreviewSaveStale)
+	}
+
+	return workspacePreviewSaveCandidate{
+		Session: session,
+		Message: message,
+		Scope:   normalizedScope,
+		Content: payload.Preview.Content,
+	}, nil
+}
+
+// applyWorkspaceScopeToSaveRequest makes the persisted workspace scope—not
+// client-repeated legacy fields—the source of truth for origin, sources and
+// referenced summaries. The frontend therefore only needs to send the preview
+// identity and optimistic versions.
+func applyWorkspaceScopeToSaveRequest(req *createAgentSummaryReq, candidate workspacePreviewSaveCandidate) {
+	req.OriginChannelID = nil
+	req.OriginChannelType = 0
+	if channelID, channelType := summaryWorkspaceOrigin(candidate.Scope); channelID != "" {
+		req.OriginChannelID = &channelID
+		req.OriginChannelType = channelType
+	}
+	req.Sources = make([]sourceReq, 0, len(candidate.Scope.SelectedChannels))
+	for _, source := range summaryWorkspaceSources(candidate.Scope) {
+		req.Sources = append(req.Sources, sourceReq{SourceID: source.SourceID, SourceType: source.SourceType})
+	}
+	req.Participants = nil
+	req.ReferencedTaskIDs = append([]int64(nil), candidate.Scope.ReferencedTaskIDs...)
+}
+
+// workspaceAgentSaveTimeRange resolves the same authoritative time boundary
+// used by workspace Workflow creation. Agent previews remain user-saveable,
+// but the resulting formal summary must not lose the selected scope or fall
+// back to the legacy now/now placeholder.
+func workspaceAgentSaveTimeRange(scope summaryWorkspaceContext, now time.Time) (service.SummaryWorkflowTimeRange, error) {
+	selected, err := workspaceWorkflowTimeRange(scope)
+	if err != nil {
+		return service.SummaryWorkflowTimeRange{}, err
+	}
+	if selected != nil {
+		return *selected, nil
+	}
+	return service.SummaryWorkflowTimeRange{
+		Start: now.Add(-service.AgentSummaryDefaultTimeRangeDays * 24 * time.Hour),
+		End:   now,
+	}, nil
+}
+
+func markWorkspacePreviewSaved(
+	tx *gorm.DB,
+	spaceID, userID, sessionID string,
+	candidate workspacePreviewSaveCandidate,
+	taskID int64,
+) error {
+	messageUpdate := tx.Model(&model.AgentMessage{}).
+		Where(
+			"id = ? AND space_id = ? AND user_id = ? AND session_id = ? AND saved_task_id = 0",
+			candidate.Message.ID, spaceID, userID, sessionID,
+		).
+		Update("saved_task_id", taskID)
+	if messageUpdate.Error != nil {
+		return fmt.Errorf("mark workspace preview saved: %w", messageUpdate.Error)
+	}
+	if messageUpdate.RowsAffected != 1 {
+		return fmt.Errorf("%w: preview save marker changed", errWorkspacePreviewSaveStale)
+	}
+
+	now := timezone.Now()
+	sessionUpdate := tx.Model(&model.AgentSummarySession{}).
+		Where(
+			"space_id = ? AND user_id = ? AND session_id = ? AND scope_version = ? AND artifact_version = ? AND latest_preview_message_id = ? AND latest_preview_saved_task_id = 0",
+			spaceID, userID, sessionID, candidate.Session.ScopeVersion, candidate.Session.ArtifactVersion, candidate.Message.ID,
+		).
+		Updates(map[string]interface{}{
+			"latest_preview_saved_task_id": taskID,
+			"state_version":                gorm.Expr("state_version + 1"),
+			"expires_at":                   summaryWorkspaceExpiresAt(now),
+			"updated_at":                   now,
+		})
+	if sessionUpdate.Error != nil {
+		return fmt.Errorf("mark workspace session saved: %w", sessionUpdate.Error)
+	}
+	if sessionUpdate.RowsAffected != 1 {
+		return fmt.Errorf("%w: workspace save marker changed", errWorkspacePreviewSaveStale)
+	}
+	return nil
+}
+
+func writeWorkspacePreviewSaveConflict(c *gin.Context) {
+	c.JSON(409, apiResponse{
+		Code:    40901,
+		Message: "agent_draft_stale: 当前预览已变化或已保存，请刷新工作台后重试",
+		Data: map[string]interface{}{
+			"reason":          "workspace_preview_stale",
+			"recovery_action": "reload_session",
+		},
+	})
+}
 
 // Reuse the bot handler's Idempotency-Key regex + length cap so the two
 // user-facing endpoints share one canonical validation rule. Declared here as
@@ -84,8 +331,8 @@ func loadAgentMessageForSave(db *gorm.DB, sessionID, userID string, messageID in
 		// resolved AgentMessageID onto SummaryTask for audit even on the
 		// legacy path.
 		err := db.Where(
-			"user_id = ? AND session_id = ? AND role = ? AND tool_calls IS NULL AND content <> ''",
-			userID, sessionID, "assistant",
+			"space_id = ? AND user_id = ? AND session_id = ? AND role = ? AND tool_calls IS NULL AND content <> ''",
+			legacyAgentMessageSpaceID, userID, sessionID, "assistant",
 		).Order("id DESC").Limit(1).Take(&msg).Error
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -96,8 +343,8 @@ func loadAgentMessageForSave(db *gorm.DB, sessionID, userID string, messageID in
 		return msg, nil
 	}
 	err := db.Where(
-		"id = ? AND user_id = ? AND session_id = ? AND role = ? AND tool_calls IS NULL AND content <> ''",
-		messageID, userID, sessionID, "assistant",
+		"id = ? AND space_id = ? AND user_id = ? AND session_id = ? AND role = ? AND tool_calls IS NULL AND content <> ''",
+		messageID, legacyAgentMessageSpaceID, userID, sessionID, "assistant",
 	).Take(&msg).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -126,7 +373,23 @@ func resolveAgentMessageRequestID(ctx context.Context, db *gorm.DB, userID, sess
 		}
 		return "", err
 	}
-	if run.SessionID != sessionID {
+	if strings.TrimSpace(msg.SpaceID) != "" {
+		if msg.TurnID <= 0 {
+			return "", fmt.Errorf("%w: workspace turn is missing", errAgentMessageRunMismatch)
+		}
+		var turn model.AgentSummaryTurn
+		if err := db.WithContext(ctx).
+			Where("id = ? AND space_id = ? AND user_id = ? AND session_id = ?", msg.TurnID, msg.SpaceID, userID, sessionID).
+			Take(&turn).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return "", fmt.Errorf("%w: workspace turn not found", errAgentMessageRunMismatch)
+			}
+			return "", err
+		}
+		if turn.RunID != run.RunID || turn.ScopeVersion != msg.ScopeVersion || turn.RequestID != run.RequestID {
+			return "", fmt.Errorf("%w: workspace turn differs", errAgentMessageRunMismatch)
+		}
+	} else if run.SessionID != sessionID {
 		return "", fmt.Errorf("%w: session differs", errAgentMessageRunMismatch)
 	}
 	if requestID != "" && requestID != run.RequestID {
@@ -201,29 +464,33 @@ func canonicalAgentSaveRequestHash(userID string, req createAgentSummaryReq) str
 		originType = req.OriginChannelType
 	}
 	payload := struct {
-		SessionID         string                 `json:"session_id"`
-		RequestID         string                 `json:"request_id"`
-		AgentMessageID    int64                  `json:"agent_message_id"`
-		SnapshotVersion   int                    `json:"snapshot_version"`
-		Title             string                 `json:"title"`
-		OriginProvided    bool                   `json:"origin_provided"`
-		OriginChannelID   string                 `json:"origin_channel_id"`
-		OriginChannelType int                    `json:"origin_channel_type"`
-		Sources           []canonicalSource      `json:"sources"`
-		Participants      []canonicalParticipant `json:"participants"`
-		ReferencedTaskIDs []int64                `json:"referenced_task_ids"`
+		SessionID               string                 `json:"session_id"`
+		RequestID               string                 `json:"request_id"`
+		AgentMessageID          int64                  `json:"agent_message_id"`
+		SnapshotVersion         int                    `json:"snapshot_version"`
+		ScopeVersion            *int                   `json:"scope_version"`
+		ExpectedArtifactVersion *int                   `json:"expected_artifact_version"`
+		Title                   string                 `json:"title"`
+		OriginProvided          bool                   `json:"origin_provided"`
+		OriginChannelID         string                 `json:"origin_channel_id"`
+		OriginChannelType       int                    `json:"origin_channel_type"`
+		Sources                 []canonicalSource      `json:"sources"`
+		Participants            []canonicalParticipant `json:"participants"`
+		ReferencedTaskIDs       []int64                `json:"referenced_task_ids"`
 	}{
-		SessionID:         strings.TrimSpace(req.SessionID),
-		RequestID:         strings.TrimSpace(req.RequestID),
-		AgentMessageID:    req.AgentMessageID,
-		SnapshotVersion:   req.SnapshotVersion,
-		Title:             strings.TrimSpace(req.Title),
-		OriginProvided:    originProvided,
-		OriginChannelID:   originID,
-		OriginChannelType: originType,
-		Sources:           sortedSources,
-		Participants:      participants,
-		ReferencedTaskIDs: refCopy,
+		SessionID:               strings.TrimSpace(req.SessionID),
+		RequestID:               strings.TrimSpace(req.RequestID),
+		AgentMessageID:          req.AgentMessageID,
+		SnapshotVersion:         req.SnapshotVersion,
+		ScopeVersion:            req.ScopeVersion,
+		ExpectedArtifactVersion: req.ExpectedArtifactVersion,
+		Title:                   strings.TrimSpace(req.Title),
+		OriginProvided:          originProvided,
+		OriginChannelID:         originID,
+		OriginChannelType:       originType,
+		Sources:                 sortedSources,
+		Participants:            participants,
+		ReferencedTaskIDs:       refCopy,
 	}
 	// json.Marshal on a struct is field-order deterministic — same layout in
 	// two processes hashes identically.

@@ -125,7 +125,7 @@ func (f *coverageGateFixture) seedFetched(t *testing.T, channelID string, msgs [
 	if err := f.runStore.RecordChannelFetch(context.Background(), f.uid, f.runID, channelID, true, false); err != nil {
 		t.Fatalf("record fetch %s: %v", channelID, err)
 	}
-	handle := messageCache.Store(msgs, f.uid)
+	handle := messageCache.Store(msgs, f.uid, f.sessionID)
 	t.Cleanup(func() {
 		messageCache.mu.Lock()
 		delete(messageCache.store, handle)

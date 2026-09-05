@@ -8,6 +8,7 @@ import (
 	"log"
 	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/agent/artifact"
@@ -97,7 +98,7 @@ func (h *AgentSummaryHandler) buildCitationsForSessionWithDB(
 		}
 
 		// Prefer cache (avoids JSON unmarshal on the hot path)
-		if cached := cache.Retrieve(ev.Handle, uid); cached != nil {
+		if cached := cache.Retrieve(ev.Handle, uid, sessionID); cached != nil {
 			for _, msg := range cached {
 				key := fmt.Sprintf("%s:%d", msg.ChannelID, msg.MessageSeq)
 				if !seenKey[key] {
@@ -322,7 +323,11 @@ func (h *AgentSummaryHandler) finalizeRun(ctx context.Context, uid, sessionID, r
 // id and attempt-local output-truncation fact on the same row as the content;
 // legacy rows have an empty run id and use the run-level fallback above.
 func (h *AgentSummaryHandler) finalizeRunForMessage(ctx context.Context, uid, sessionID, requestID, content string, cits []model.Citation, msg model.AgentMessage) (finishgate.Verdict, []finishgate.Gap) {
-	return h.finalizeRunForDeliverable(ctx, uid, sessionID, requestID, content, cits, msg.RunID, msg.OutputTruncated)
+	runSessionID := sessionID
+	if strings.TrimSpace(msg.SpaceID) != "" && strings.TrimSpace(msg.RunID) == "" {
+		runSessionID = summaryWorkspaceAgentSessionID(msg.SpaceID, sessionID, msg.ScopeVersion)
+	}
+	return h.finalizeRunForDeliverable(ctx, uid, runSessionID, requestID, content, cits, msg.RunID, msg.OutputTruncated)
 }
 
 // finalizeRunForDeliverable computes the SS-07 finish verdict
@@ -340,7 +345,13 @@ func (h *AgentSummaryHandler) finalizeRunForDeliverable(ctx context.Context, uid
 		return "", nil
 	}
 	runStore := summaryrun.NewStore(h.db)
-	run, err := runStore.GetByRequest(ctx, uid, sessionID, requestID)
+	var run *model.AgentSummaryRun
+	var err error
+	if deliverableRunID != "" {
+		run, err = runStore.GetByID(ctx, uid, deliverableRunID)
+	} else {
+		run, err = runStore.GetByRequest(ctx, uid, sessionID, requestID)
+	}
 	if err != nil {
 		// "No such run" and "could not read the run" are opposite situations and were
 		// being reported identically.
@@ -376,6 +387,17 @@ func (h *AgentSummaryHandler) finalizeRunForDeliverable(ctx context.Context, uid
 			gaps := []finishgate.Gap{{
 				Kind:   finishgate.GapToolError,
 				Detail: "selected deliverable does not match the summary run",
+			}}
+			if err := runStore.SetFinishStatus(ctx, uid, run.RunID, string(finishgate.Partial)); err != nil {
+				log.Printf("[finish] persist mismatched finish_status failed run=%s: %v", run.RunID, err)
+			}
+			return finishgate.Partial, gaps
+		}
+		if requestID != "" && requestID != run.RequestID {
+			log.Printf("[finish] selected message/request mismatch session=%s request=%s run_request=%s", sessionID, requestID, run.RequestID)
+			gaps := []finishgate.Gap{{
+				Kind:   finishgate.GapToolError,
+				Detail: "selected deliverable does not match the summary request",
 			}}
 			if err := runStore.SetFinishStatus(ctx, uid, run.RunID, string(finishgate.Partial)); err != nil {
 				log.Printf("[finish] persist mismatched finish_status failed run=%s: %v", run.RunID, err)

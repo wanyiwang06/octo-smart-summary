@@ -56,6 +56,13 @@ func TestListChannelsToolSchema(t *testing.T) {
 	if !ok {
 		t.Fatal("parameters should be map[string]interface{}")
 	}
+	properties, ok := params["properties"].(map[string]interface{})
+	if !ok {
+		t.Fatal("parameters.properties should be map[string]interface{}")
+	}
+	if _, ok := properties["commit_scope"]; !ok {
+		t.Fatal("list_channels schema is missing commit_scope")
+	}
 
 	checkRequiredFields(t, params)
 }

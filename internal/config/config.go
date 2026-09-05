@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -160,12 +161,18 @@ type Config struct {
 	// (API rejects multi-person schedules with 40015, worker disables them).
 	FeatureTeamSchedule bool
 
+	// SummaryWorkbenchEnabled gates new entry into the unified smart-summary
+	// workbench. Default false keeps the legacy entry available for a fail-closed
+	// rollout; enable per deployment with SUMMARY_WORKBENCH_ENABLED.
+	SummaryWorkbenchEnabled bool
+
 	// Intent recognition shortcut (skip LLM for simple topics)
 	EnableIntentShortcut bool
 
 	// Hardcoded limits (now configurable)
 	MaxSafetyLimit       int // Max messages per channel before safety truncation, default 100000
-	DefaultTimeRangeDays int // Default time range in days when not specified, default 31
+	DefaultTimeRangeDays int // Legacy default time range when not specified, default 31
+	MaxTimeRangeDays     int // Maximum selectable/fetchable summary range, default 90
 
 	// Token calculation config
 	SkipMapReduceThreshold int    // Skip Map-Reduce threshold (tokens), env SKIP_MAP_REDUCE_THRESHOLD
@@ -195,6 +202,19 @@ type Config struct {
 }
 
 func Load() *Config {
+	defaultTimeRangeDays := envInt("DEFAULT_TIME_RANGE_DAYS", 31)
+	if defaultTimeRangeDays <= 0 {
+		log.Printf("[config] invalid DEFAULT_TIME_RANGE_DAYS=%d, preserving legacy default 31", defaultTimeRangeDays)
+		defaultTimeRangeDays = 31
+	}
+	maxTimeRangeDefault := 90
+	if defaultTimeRangeDays > maxTimeRangeDefault {
+		// MAX_TIME_RANGE_DAYS is new. When it is unset, do not make a
+		// previously valid legacy default crash-loop the API and worker.
+		maxTimeRangeDefault = defaultTimeRangeDays
+	}
+	maxTimeRangeDays := envInt("MAX_TIME_RANGE_DAYS", maxTimeRangeDefault)
+
 	return &Config{
 		MySQLDSN:   envStr("MYSQL_DSN", ""),
 		IMMySQLDSN: envStr("IM_MYSQL_DSN", ""),
@@ -259,10 +279,13 @@ func Load() *Config {
 		// keep upstream main default (true, #112)
 		FeatureTeamSchedule: envBool("FEATURE_TEAM_SCHEDULE", true),
 
+		SummaryWorkbenchEnabled: envBool("SUMMARY_WORKBENCH_ENABLED", false),
+
 		EnableIntentShortcut: envBool("ENABLE_INTENT_SHORTCUT", true),
 
 		MaxSafetyLimit:       envInt("MAX_SAFETY_LIMIT", 100000),
-		DefaultTimeRangeDays: envInt("DEFAULT_TIME_RANGE_DAYS", 31),
+		DefaultTimeRangeDays: defaultTimeRangeDays,
+		MaxTimeRangeDays:     maxTimeRangeDays,
 
 		SkipMapReduceThreshold: envInt("SKIP_MAP_REDUCE_THRESHOLD", 0),
 		KimiAPIKey:             envStr("KIMI_API_KEY", ""),
@@ -288,6 +311,29 @@ func ValidateRequired(fields map[string]string) {
 	if len(missing) != 0 {
 		log.Fatalf("[config] required environment variables not set: %s", strings.Join(missing, ", "))
 	}
+}
+
+// ValidateSummaryTimeRanges keeps the implicit summary window inside the
+// configured hard ceiling. Both API and worker must reject the same invalid
+// startup configuration before copying these values into pipeline globals.
+func ValidateSummaryTimeRanges(defaultDays, maxDays int) error {
+	if defaultDays <= 0 {
+		return fmt.Errorf("DEFAULT_TIME_RANGE_DAYS must be greater than 0")
+	}
+	if maxDays <= 0 {
+		return fmt.Errorf("MAX_TIME_RANGE_DAYS must be greater than 0")
+	}
+	if maxDays < defaultDays {
+		return fmt.Errorf("MAX_TIME_RANGE_DAYS (%d) must be greater than or equal to DEFAULT_TIME_RANGE_DAYS (%d)", maxDays, defaultDays)
+	}
+	// The unified Agent workspace intentionally defaults to a seven-day window.
+	// Reject a ceiling that would let both binaries start but make every
+	// default-range workspace request fail at runtime.
+	const workspaceDefaultDays = 7
+	if maxDays < workspaceDefaultDays {
+		return fmt.Errorf("MAX_TIME_RANGE_DAYS (%d) must be at least %d for the summary workspace default", maxDays, workspaceDefaultDays)
+	}
+	return nil
 }
 
 func envStr(key, def string) string {
