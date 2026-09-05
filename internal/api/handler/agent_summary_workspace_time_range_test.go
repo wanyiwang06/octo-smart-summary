@@ -23,6 +23,7 @@ func TestSummaryWorkspaceRequestedPresetTimeRange(t *testing.T) {
 	}{
 		{name: "explicit month", message: "把时间范围扩大到一个月", label: "最近一个月", days: 30, ok: true},
 		{name: "month with expansion verb", message: "扩大到一个月再生成", label: "最近一个月", days: 30, ok: true},
+		{name: "month with shrink verb", message: "把时间范围缩小到一个月", label: "最近一个月", days: 30, ok: true},
 		{name: "relative half month", message: "请按最近半个月重新总结", label: "最近半个月", days: 15, ok: true},
 		{name: "last range wins", message: "不要最近一个月，时间范围改成最近七天", label: "最近 7 天", days: 7, ok: true},
 		{name: "negated trailing range is ignored", message: "时间范围改成最近七天，不要最近一个月", label: "最近 7 天", days: 7, ok: true},
@@ -104,6 +105,28 @@ func TestMaterializeWorkspaceAgentContextLetsExplicitCommandReplacePickerRange(t
 	}
 	if got.TimeRange == nil || got.TimeRange.Label != "最近一个月" || got.TimeRange.Source != summaryWorkspaceTimeRangeSourceConversation {
 		t.Fatalf("time range=%#v, want conversational month", got.TimeRange)
+	}
+}
+
+func TestMaterializeWorkspaceAgentContextLetsDirectRequestReplacePickerRange(t *testing.T) {
+	now := time.Date(2026, 9, 4, 16, 30, 0, 0, time.UTC)
+	coordinator := &summaryWorkspaceCoordinator{now: func() time.Time { return now }}
+	contextValue := emptySummaryWorkspaceContext()
+	contextValue.SelectedChannels = []summaryWorkspaceChannel{{ChatID: "group-a", ChatType: "group", Name: "A群"}}
+	contextValue.TimeRange = &summaryWorkspaceTimeRange{
+		Start: now.AddDate(0, 0, -2).Format(time.RFC3339), End: now.Format(time.RFC3339),
+		Label: "2026-09-02 至 2026-09-04", Source: summaryWorkspaceTimeRangeSourcePicker,
+	}
+
+	got, _, err := coordinator.materializeWorkspaceAgentContext(
+		t.Context(), "space-a", "actor", contextValue, WorkspaceSnapshot{},
+		"总结最近一个月的进展", service.SummaryIntentGenerate, summaryWorkspaceInputUser,
+	)
+	if err != nil {
+		t.Fatalf("materialize context: %v", err)
+	}
+	if got.TimeRange == nil || got.TimeRange.Label != "最近一个月" || got.TimeRange.Source != summaryWorkspaceTimeRangeSourceConversation {
+		t.Fatalf("time range=%#v, want direct conversational month", got.TimeRange)
 	}
 }
 

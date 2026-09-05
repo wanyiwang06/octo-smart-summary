@@ -161,6 +161,11 @@ type Config struct {
 	// (API rejects multi-person schedules with 40015, worker disables them).
 	FeatureTeamSchedule bool
 
+	// SummaryWorkbenchEnabled gates new entry into the unified smart-summary
+	// workbench. Default false keeps the legacy entry available for a fail-closed
+	// rollout; enable per deployment with SUMMARY_WORKBENCH_ENABLED.
+	SummaryWorkbenchEnabled bool
+
 	// Intent recognition shortcut (skip LLM for simple topics)
 	EnableIntentShortcut bool
 
@@ -273,6 +278,8 @@ func Load() *Config {
 
 		// keep upstream main default (true, #112)
 		FeatureTeamSchedule: envBool("FEATURE_TEAM_SCHEDULE", true),
+
+		SummaryWorkbenchEnabled: envBool("SUMMARY_WORKBENCH_ENABLED", false),
 
 		EnableIntentShortcut: envBool("ENABLE_INTENT_SHORTCUT", true),
 

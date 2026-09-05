@@ -130,7 +130,8 @@ type AgentChatHandler struct {
 
 	// workspace is configured by the public router for the unified smart-summary
 	// entry. Nil keeps legacy/test constructors byte-compatible.
-	workspace *summaryWorkspaceCoordinator
+	workspace             *summaryWorkspaceCoordinator
+	workspaceEntryEnabled bool
 
 	// test-only fields: when set, bypass dynamic runner construction
 	testRunner *agent.Runner
@@ -832,7 +833,7 @@ func (h *AgentChatHandler) History(c *gin.Context) {
 		return
 	}
 	if strings.TrimSpace(c.Query("profile")) == summaryWorkspaceProfile {
-		if h == nil || h.workspace == nil || h.workspace.store == nil {
+		if !h.summaryWorkspaceConfigured() {
 			c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50300, Message: "summary workspace is not configured"})
 			return
 		}

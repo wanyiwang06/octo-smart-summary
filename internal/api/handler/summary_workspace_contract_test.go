@@ -80,7 +80,10 @@ func TestSummaryWorkspaceCapabilitiesAdvertisesTimeRangeLimit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
-	handler := &AgentChatHandler{workspace: &summaryWorkspaceCoordinator{}}
+	handler := &AgentChatHandler{
+		workspaceEntryEnabled: true,
+		workspace:             &summaryWorkspaceCoordinator{store: &AgentWorkspaceStore{}},
+	}
 
 	handler.SummaryWorkspaceCapabilities(context)
 
@@ -106,6 +109,36 @@ func TestSummaryWorkspaceCapabilitiesAdvertisesTimeRangeLimit(t *testing.T) {
 	}
 	if !payload.Data.DirectTeamWorkflow {
 		t.Fatal("direct_team_workflow = false, want true")
+	}
+}
+
+func TestSummaryWorkspaceCapabilitiesFailsClosedWhenRolloutDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	handler := &AgentChatHandler{
+		workspace: &summaryWorkspaceCoordinator{store: &AgentWorkspaceStore{}},
+	}
+
+	handler.SummaryWorkspaceCapabilities(context)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	var payload struct {
+		Data struct {
+			Enabled            bool `json:"enabled"`
+			DirectTeamWorkflow bool `json:"direct_team_workflow"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode capabilities: %v", err)
+	}
+	if payload.Data.Enabled || payload.Data.DirectTeamWorkflow {
+		t.Fatalf("disabled rollout advertised enabled capabilities: %#v", payload.Data)
+	}
+	if !handler.summaryWorkspaceConfigured() {
+		t.Fatal("disabled entry must keep workspace APIs configured for an already-mounted flow")
 	}
 }
 

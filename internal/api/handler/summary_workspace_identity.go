@@ -5,9 +5,9 @@ import (
 	"encoding/hex"
 	"strconv"
 	"strings"
-)
 
-const summaryWorkspaceAgentSessionPrefix = "summaryws:"
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
+)
 
 // summaryWorkspaceAgentSessionID is the internal identity used by the legacy
 // Agent run/evidence stores. Those tables predate space-aware workspaces and
@@ -16,7 +16,7 @@ const summaryWorkspaceAgentSessionPrefix = "summaryws:"
 // existing schemas while keeping the value deterministic and below varchar(128).
 func summaryWorkspaceAgentSessionID(spaceID, sessionID string, scopeVersion int) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(spaceID) + "\x00" + strings.TrimSpace(sessionID) + "\x00" + strconv.Itoa(scopeVersion)))
-	return summaryWorkspaceAgentSessionPrefix + hex.EncodeToString(sum[:])
+	return pipeline.WorkspaceAgentSessionPrefix + hex.EncodeToString(sum[:])
 }
 
 func persistedOrDerivedWorkspaceAgentSessionID(persisted, spaceID, sessionID string, scopeVersion int) string {

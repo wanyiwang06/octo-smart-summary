@@ -13,9 +13,9 @@ const (
 )
 
 // SummaryAction is the trusted UI action attached to a request. Chat asks the
-// policy to derive a route. Direct team starts still require an explicit
-// generate intent, while proposal confirmation must satisfy persisted-state
-// guards before a side effect is allowed.
+// policy to derive a route. A trusted direct-team action bypasses natural-
+// language intent classification, while proposal confirmation must satisfy
+// persisted-state guards before a side effect is allowed.
 type SummaryAction string
 
 const (

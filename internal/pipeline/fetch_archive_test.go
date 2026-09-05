@@ -272,15 +272,32 @@ func TestResolveAndFetch_WorkspacePersonalKeepsOnlyParticipantSources(t *testing
 	if _, _, err := ResolveAndFetchMessagesForPersonal(
 		context.Background(), "member-a", nil, nil, sources, "",
 		start, end, db, echoOctoClient("member-a"), "batch", nil, nil,
-		1, 0, 2, 1, &ChannelScopeOptions{SpaceID: "space-a"}, nil,
+		1, 0, 2, 1, &ChannelScopeOptions{SpaceID: "space-a", WorkspaceTask: true}, nil,
 	); err == nil {
 		t.Fatal("strict explicit-source coverage unexpectedly accepted group-b for member-a")
+	}
+
+	legacyMessages, _, err := ResolveAndFetchMessagesForPersonal(
+		context.Background(), "member-a", nil, nil, sources, "",
+		start, end, db, echoOctoClient("member-a"), "batch", nil, nil,
+		1, 0, 2, 1, &ChannelScopeOptions{SpaceID: "space-a"}, nil,
+	)
+	if err != nil {
+		t.Fatalf("legacy partial-source fetch: %v", err)
+	}
+	if len(legacyMessages) == 0 {
+		t.Fatal("legacy partial-source fetch returned no messages")
+	}
+	for _, message := range legacyMessages {
+		if message.ChannelID != "group-a" {
+			t.Fatalf("legacy task kept inaccessible source %q; want only group-a", message.ChannelID)
+		}
 	}
 
 	messages, _, err := ResolveAndFetchMessagesForPersonal(
 		context.Background(), "member-a", nil, nil, sources, "",
 		start, end, db, echoOctoClient("member-a"), "batch", nil, nil,
-		1, 0, 2, 1, &ChannelScopeOptions{SpaceID: "space-a", ParticipantSourceSubset: true}, nil,
+		1, 0, 2, 1, &ChannelScopeOptions{SpaceID: "space-a", ParticipantSourceSubset: true, WorkspaceTask: true}, nil,
 	)
 	if err != nil {
 		t.Fatalf("participant-subset fetch: %v", err)
