@@ -31,6 +31,7 @@ type TerminalToolFactory func() (Tool, TerminalHandler)
 var toolFactories = map[string]ToolFactory{
 	"get_current_time":   GetCurrentTimeTool,
 	"extract_time_range": ExtractTimeRangeTool,
+	"set_summary_scope":  SetSummaryScopeTool,
 	// Summary tools (Stage 2)
 	"list_channels":            ListChannelsTool,
 	"narrow_channels_by_topic": NarrowChannelsByTopicTool,
@@ -90,6 +91,7 @@ var profiles = map[string]Profile{
 		PromptFile: "summary_workspace",
 		Tools: []string{
 			"get_current_time", "extract_time_range",
+			"set_summary_scope",
 			"list_channels", "narrow_channels_by_topic", "find_shared_channels",
 			"peek_channel", "fetch_channel", "search_messages",
 			"filter_relevant", "summarize_chunk", "merge_summaries",

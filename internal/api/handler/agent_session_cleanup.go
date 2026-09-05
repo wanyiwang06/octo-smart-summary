@@ -40,8 +40,11 @@ const (
 	// cleanupJitter 首次执行前等一段随机时间,避免多实例撞车 & 冷启动瞬间打 DB
 	cleanupInitialDelay = 30 * time.Second
 	// workspaceCleanupBatchSize bounds each cleanup transaction so a large
-	// backlog does not hold locks across the entire workspace history table.
+	// backlog does not keep one scheduler pass focused on a single page.
 	workspaceCleanupBatchSize = 200
+	// workspaceCleanupINBatchSize keeps per-session cleanup below database
+	// placeholder and packet limits even when one session has a long history.
+	workspaceCleanupINBatchSize = 500
 )
 
 // StartAgentSessionCleanup 启动 24h 定时清理 goroutine。
@@ -234,6 +237,7 @@ func cleanupExpiredSummaryWorkspaces(db *gorm.DB, now time.Time) (int64, error) 
 	legacyCutoff := now.Add(-summaryWorkspaceRetention)
 	var cleaned int64
 	var afterID int64
+	var cleanupErrs []error
 	for {
 		var sessions []model.AgentSummarySession
 		if err := db.Where("id > ? AND (expires_at <= ? OR (expires_at IS NULL AND updated_at <= ?))", afterID, now, legacyCutoff).
@@ -247,7 +251,9 @@ func cleanupExpiredSummaryWorkspaces(db *gorm.DB, now time.Time) (int64, error) 
 			afterID = session.ID
 			deleted, err := deleteExpiredWorkspaceSessionState(db, session.ID, now, legacyCutoff)
 			if err != nil {
-				return cleaned, err
+				cleanupErrs = append(cleanupErrs, err)
+				log.Printf("[agent-cleanup] workspace session %d cleanup failed: %v", session.ID, err)
+				continue
 			}
 			if deleted {
 				cleaned++
@@ -270,9 +276,9 @@ func cleanupExpiredSummaryWorkspaces(db *gorm.DB, now time.Time) (int64, error) 
 			  AND summary_task.deleted_at IS NULL
 		  )
 	`, legacyCutoff).Error; err != nil {
-		return cleaned, fmt.Errorf("clean workflow idempotency tombstones: %w", err)
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("clean workflow idempotency tombstones: %w", err))
 	}
-	return cleaned, nil
+	return cleaned, errors.Join(cleanupErrs...)
 }
 
 func deleteExpiredWorkspaceSessionState(db *gorm.DB, sessionID int64, now, legacyCutoff time.Time) (bool, error) {
@@ -357,18 +363,35 @@ func deleteWorkspaceSessionState(tx *gorm.DB, session model.AgentSummarySession)
 		seenRunIDs[runID] = struct{}{}
 	}
 	var runs []model.AgentSummaryRun
-	query := tx.Select("run_id", "session_id").Where("user_id = ?", session.UserID)
-	if len(evidenceSessions) > 0 && len(runIDs) > 0 {
-		query = query.Where("session_id IN ? OR run_id IN ?", evidenceSessions, runIDs)
-	} else if len(evidenceSessions) > 0 {
-		query = query.Where("session_id IN ?", evidenceSessions)
-	} else if len(runIDs) > 0 {
-		query = query.Where("run_id IN ?", runIDs)
-	}
-	if len(evidenceSessions) > 0 || len(runIDs) > 0 {
-		if err := query.Find(&runs).Error; err != nil {
-			return fmt.Errorf("load workspace runs for session %d: %w", session.ID, err)
+	seenLoadedRuns := make(map[string]struct{})
+	appendRuns := func(batch []model.AgentSummaryRun) {
+		for _, run := range batch {
+			if _, exists := seenLoadedRuns[run.RunID]; exists {
+				continue
+			}
+			seenLoadedRuns[run.RunID] = struct{}{}
+			runs = append(runs, run)
 		}
+	}
+	for start := 0; start < len(evidenceSessions); start += workspaceCleanupINBatchSize {
+		end := min(start+workspaceCleanupINBatchSize, len(evidenceSessions))
+		var batch []model.AgentSummaryRun
+		if err := tx.Select("run_id", "session_id").
+			Where("user_id = ? AND session_id IN ?", session.UserID, evidenceSessions[start:end]).
+			Find(&batch).Error; err != nil {
+			return fmt.Errorf("load workspace runs by session for session %d: %w", session.ID, err)
+		}
+		appendRuns(batch)
+	}
+	for start := 0; start < len(runIDs); start += workspaceCleanupINBatchSize {
+		end := min(start+workspaceCleanupINBatchSize, len(runIDs))
+		var batch []model.AgentSummaryRun
+		if err := tx.Select("run_id", "session_id").
+			Where("user_id = ? AND run_id IN ?", session.UserID, runIDs[start:end]).
+			Find(&batch).Error; err != nil {
+			return fmt.Errorf("load workspace runs by id for session %d: %w", session.ID, err)
+		}
+		appendRuns(batch)
 	}
 	for _, run := range runs {
 		addEvidenceSession(run.SessionID)
@@ -378,22 +401,29 @@ func deleteWorkspaceSessionState(tx *gorm.DB, session model.AgentSummarySession)
 		}
 	}
 	if len(runIDs) > 0 {
-		if err := tx.Where("run_id IN ?", runIDs).Delete(&model.AgentCitationManifest{}).Error; err != nil {
-			return fmt.Errorf("delete workspace citation manifests for session %d: %w", session.ID, err)
-		}
-		if err := tx.Where("run_id IN ?", runIDs).Delete(&model.AgentEvidenceArtifact{}).Error; err != nil {
-			return fmt.Errorf("delete workspace evidence artifacts for session %d: %w", session.ID, err)
-		}
-		if err := tx.Where("run_id IN ?", runIDs).Delete(&model.AgentSummarySpec{}).Error; err != nil {
-			return fmt.Errorf("delete workspace specs for session %d: %w", session.ID, err)
-		}
-		if err := tx.Where("user_id = ? AND run_id IN ?", session.UserID, runIDs).Delete(&model.AgentSummaryRun{}).Error; err != nil {
-			return fmt.Errorf("delete workspace runs for session %d: %w", session.ID, err)
+		for start := 0; start < len(runIDs); start += workspaceCleanupINBatchSize {
+			end := min(start+workspaceCleanupINBatchSize, len(runIDs))
+			batch := runIDs[start:end]
+			if err := tx.Where("run_id IN ?", batch).Delete(&model.AgentCitationManifest{}).Error; err != nil {
+				return fmt.Errorf("delete workspace citation manifests for session %d: %w", session.ID, err)
+			}
+			if err := tx.Where("run_id IN ?", batch).Delete(&model.AgentEvidenceArtifact{}).Error; err != nil {
+				return fmt.Errorf("delete workspace evidence artifacts for session %d: %w", session.ID, err)
+			}
+			if err := tx.Where("run_id IN ?", batch).Delete(&model.AgentSummarySpec{}).Error; err != nil {
+				return fmt.Errorf("delete workspace specs for session %d: %w", session.ID, err)
+			}
+			if err := tx.Where("user_id = ? AND run_id IN ?", session.UserID, batch).Delete(&model.AgentSummaryRun{}).Error; err != nil {
+				return fmt.Errorf("delete workspace runs for session %d: %w", session.ID, err)
+			}
 		}
 	}
 	if len(evidenceSessions) > 0 {
-		if err := tx.Where("user_id = ? AND session_id IN ?", session.UserID, evidenceSessions).Delete(&model.AgentMessageEvidence{}).Error; err != nil {
-			return fmt.Errorf("delete workspace evidence for session %d: %w", session.ID, err)
+		for start := 0; start < len(evidenceSessions); start += workspaceCleanupINBatchSize {
+			end := min(start+workspaceCleanupINBatchSize, len(evidenceSessions))
+			if err := tx.Where("user_id = ? AND session_id IN ?", session.UserID, evidenceSessions[start:end]).Delete(&model.AgentMessageEvidence{}).Error; err != nil {
+				return fmt.Errorf("delete workspace evidence for session %d: %w", session.ID, err)
+			}
 		}
 	}
 	if err := tx.Where("space_id = ? AND user_id = ? AND session_id = ?", session.SpaceID, session.UserID, session.SessionID).

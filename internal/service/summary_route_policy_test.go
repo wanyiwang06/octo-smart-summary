@@ -61,6 +61,17 @@ func TestDeriveSummaryRoute(t *testing.T) {
 			want: SummaryRoutePersonalWorkflow,
 		},
 		{
+			name: "personal workflow accepts a typed requirement without a template",
+			in: SummaryRouteInput{
+				Intent:               SummaryIntentGenerate,
+				HasExplicitRunIntent: true,
+				HasSelectedSource:    true,
+				HasValidSource:       true,
+				HasRequirement:       true,
+			},
+			want: SummaryRoutePersonalWorkflow,
+		},
+		{
 			name: "inferred source never creates a personal workflow directly",
 			in: SummaryRouteInput{
 				Intent:                     SummaryIntentGenerate,

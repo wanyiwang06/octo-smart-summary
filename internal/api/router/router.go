@@ -181,6 +181,7 @@ func SetupPublic(db *gorm.DB, imDB *gorm.DB, hub *ws.Hub, authResolver middlewar
 	// (The old /summaries/:id/refine route was removed in favor of the
 	// reference-based chat flow — see CHAT-REFERENCE-BASED-DESIGN-v1.)
 	agentSummaryH := handler.NewAgentSummaryHandler(db, imDB, llmApiURL, llmApiKey, llmModel, llmTimeout, llmMaxTokens)
+	agentSummaryH.ConfigureSummaryWorkspace(summaryWorkbenchEnabled)
 	v1.POST("/summaries/agent", agentSummaryH.CreateAgentSummary)
 	// Document "AI 速览": ephemeral streaming quick-glance, never persisted. See
 	// handler/document_preview.go.

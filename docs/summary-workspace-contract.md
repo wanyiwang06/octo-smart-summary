@@ -24,18 +24,22 @@ resolved scope without changing `scope_version`. The response returns the same
 scope in `state.summary_context`; the client must use it for the next turn and
 must replace its local chat chips with the returned `selected_channels`.
 
-Conversational source replacement/extension is two-phase. Ordinary requests
-such as “总结这个群” keep the picker scope. An explicit source instruction first
-resolves candidate chats through server-authorised discovery; the server then
-applies contract limits, actor membership, and team-scope checks before
-atomically replacing the stored scope. Until those checks pass, the previous
-scope remains authoritative. A source-changing turn cannot directly dispatch a
-Workflow; the trusted start action may run after the resolved scope is returned.
+Conversational source replacement/extension is two-phase. The Agent first
+resolves candidate chats through server-authorised discovery, then calls
+`set_summary_scope` with one final `keep`, `replace`, or `extend` decision. The
+server accepts only discovered channels and applies contract limits, actor
+membership, and team-scope checks before atomically replacing the stored scope.
+Ordinary edits, questions, negations, and historical references do not call the
+scope tool and therefore keep the picker scope. A source-changing turn cannot
+directly dispatch a Workflow; the trusted start action may run after the
+resolved scope is returned.
 
 `time_range.source` records whether the current range came from the picker,
-the server default, or a conversational instruction. A picker range is changed
-by conversation only when the user gives an explicit range-change command;
-incidental or negated range mentions do not replace it.
+the server default, or a conversational instruction. Explicit conversational
+ranges, including non-preset ranges such as three days or two weeks, are parsed
+by the Agent and declared through `set_summary_scope` before message retrieval.
+Incidental, questioned, negated, complained-about, or historical mentions do
+not replace the current range.
 
 A pending team proposal also stores its resolved `time_range`. Confirmation
 uses that stored value, so the displayed range and the dispatched workflow

@@ -161,9 +161,9 @@ type Config struct {
 	// (API rejects multi-person schedules with 40015, worker disables them).
 	FeatureTeamSchedule bool
 
-	// SummaryWorkbenchEnabled gates new entry into the unified smart-summary
-	// workbench. Default false keeps the legacy entry available for a fail-closed
-	// rollout; enable per deployment with SUMMARY_WORKBENCH_ENABLED.
+	// SummaryWorkbenchEnabled gates both entry discovery and workspace writes.
+	// Default false keeps the legacy entry available and provides a hard
+	// environment rollback; enable per deployment with SUMMARY_WORKBENCH_ENABLED.
 	SummaryWorkbenchEnabled bool
 
 	// Intent recognition shortcut (skip LLM for simple topics)

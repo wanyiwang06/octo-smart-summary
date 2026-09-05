@@ -128,8 +128,9 @@ type AgentCreateSummaryWorkflowInput struct {
 	AgentSessionID string
 }
 
-// CreateSummaryWorkflowResult contains the committed task and the worker
-// dispatch to perform after commit. Replayed requests never return a trigger.
+// CreateSummaryWorkflowResult contains the committed task and any worker
+// dispatch needed after commit. A replay may return a trigger when its worker
+// row is still pending so the caller can recover a previously lost dispatch.
 type CreateSummaryWorkflowResult struct {
 	Task                 model.SummaryTask
 	CreatorParticipantID int64
@@ -199,7 +200,8 @@ type normalizedSummaryWorkflowInput struct {
 // call this compatibility entry point.
 //
 // This method never performs network I/O. The Handler dispatches WorkerTrigger
-// only when Replayed is false.
+// after it has durably bound the workflow result to its caller state. Pending
+// replays may intentionally return a trigger for recovery.
 func (s *SummaryWorkflowService) CreateFromLegacyHTTP(ctx context.Context, in LegacyCreateSummaryWorkflowInput) (CreateSummaryWorkflowResult, error) {
 	var zero CreateSummaryWorkflowResult
 	if s == nil || s.db == nil {
@@ -402,7 +404,7 @@ func (s *SummaryWorkflowService) normalize(in LegacyCreateSummaryWorkflowInput, 
 		actorID:             in.ActorID,
 		creatorID:           creatorID,
 		spaceID:             in.SpaceID,
-		title:               in.Title,
+		title:               strings.TrimSpace(in.Title),
 		topic:               in.Topic,
 		timeStart:           timeStart,
 		timeEnd:             timeEnd,

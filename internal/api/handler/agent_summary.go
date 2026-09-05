@@ -59,6 +59,15 @@ type AgentSummaryHandler struct {
 	// beforeDraftLoad is a test-only synchronization hook used to exercise
 	// the race where another request commits after idempotency preflight.
 	beforeDraftLoad func()
+	// nil preserves legacy/test construction. Production sets this explicitly;
+	// false rejects workspace preview saves while leaving legacy saves intact.
+	workspaceEnabled *bool
+}
+
+func (h *AgentSummaryHandler) ConfigureSummaryWorkspace(enabled bool) {
+	if h != nil {
+		h.workspaceEnabled = &enabled
+	}
 }
 
 // refineRunner is the minimal subset of *agent.Runner used by RefineAgentSummary.
@@ -162,6 +171,10 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		return
 	}
 	workspaceSave := isWorkspacePreviewSave(req)
+	if workspaceSave && h.workspaceEnabled != nil && !*h.workspaceEnabled {
+		c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50300, Message: "summary workspace is disabled"})
+		return
+	}
 	if err := validateWorkspacePreviewSaveRequest(req); err != nil {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: err.Error()})
 		return

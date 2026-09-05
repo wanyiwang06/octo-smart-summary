@@ -833,8 +833,8 @@ func (h *AgentChatHandler) History(c *gin.Context) {
 		return
 	}
 	if strings.TrimSpace(c.Query("profile")) == summaryWorkspaceProfile {
-		if !h.summaryWorkspaceConfigured() {
-			c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50300, Message: "summary workspace is not configured"})
+		if !h.summaryWorkspaceEntryAvailable() {
+			c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50300, Message: "summary workspace is disabled"})
 			return
 		}
 		// Workspace route: lowercase-only session ids (collation divergence

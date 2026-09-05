@@ -23,6 +23,20 @@ type workspaceSaveFixture struct {
 	Body    map[string]interface{}
 }
 
+func TestCreateAgentSummary_WorkspaceSaveFailsClosedWhenRolloutDisabled(t *testing.T) {
+	h := NewAgentSummaryHandler(nil, nil, "", "", "", 0, 0)
+	h.ConfigureSummaryWorkspace(false)
+	r := setupAgentSummaryRouter(h)
+	w := doAgentSave(t, r, map[string]interface{}{
+		"session_id":                "workspace-disabled",
+		"scope_version":             1,
+		"expected_artifact_version": 1,
+	}, nil)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("workspace save status=%d, want %d: %s", w.Code, http.StatusServiceUnavailable, w.Body.String())
+	}
+}
+
 func workspaceSaveInt(value int) *int { return &value }
 
 func seedWorkspaceSaveFixture(t *testing.T, db *gorm.DB, sessionID string) workspaceSaveFixture {

@@ -138,7 +138,20 @@ func TestSummaryWorkspaceCapabilitiesFailsClosedWhenRolloutDisabled(t *testing.T
 		t.Fatalf("disabled rollout advertised enabled capabilities: %#v", payload.Data)
 	}
 	if !handler.summaryWorkspaceConfigured() {
-		t.Fatal("disabled entry must keep workspace APIs configured for an already-mounted flow")
+		t.Fatal("disabled rollout should keep dependencies configured for later enablement")
+	}
+}
+
+func TestSummaryWorkspaceChatFailsClosedWhenRolloutDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	handler := &AgentChatHandler{
+		workspace: &summaryWorkspaceCoordinator{store: &AgentWorkspaceStore{}},
+	}
+	handler.handleSummaryWorkspaceChat(context, agentChatRequest{}, false)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
 	}
 }
 

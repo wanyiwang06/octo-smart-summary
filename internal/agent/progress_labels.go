@@ -19,6 +19,7 @@ var ToolLabels = map[string]struct {
 	"peek_channel":             {Phase: "understand", Label: "预览频道"},
 	"get_current_time":         {Phase: "understand", Label: "获取当前时间"},
 	"extract_time_range":       {Phase: "understand", Label: "解析时间范围"},
+	"set_summary_scope":        {Phase: "understand", Label: "确认总结范围"},
 	"fetch_channel":            {Phase: "retrieve", Label: "抓取消息"},
 	"search_messages":          {Phase: "retrieve", Label: "搜索消息"},
 	"filter_relevant":          {Phase: "filter", Label: "筛选相关消息"},

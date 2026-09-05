@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 )
@@ -34,6 +35,82 @@ func TestEmitSummaryResponseSeparatesReplyFromPreview(t *testing.T) {
 	}
 	if payload.Preview == nil || payload.Preview.Content != "# 风险总结\n正文" {
 		t.Fatalf("preview payload lost: %+v", payload.Preview)
+	}
+}
+
+func TestSetSummaryScopeUsesOnlyDiscoveredChannelsAndOverridesTimeRange(t *testing.T) {
+	_, handler := SetSummaryScopeTool()
+	ctx := context.WithValue(context.Background(), ContextKeyUID, "actor")
+	ctx = WithDiscoverableChannelScopeForUser(ctx, "actor", []ChannelScope{{ChannelID: "group-a", ChannelType: 2, ChannelName: "A群"}})
+	AuthorizeDiscoveredChannels(ctx, []pipeline.ChannelInfo{{ChannelID: "group-b", ChannelType: 2, ChannelName: "B群"}})
+
+	_, err := handler(ctx, json.RawMessage(`{
+		"source_mode":"replace",
+		"channels":[{"channel_id":"group-b","channel_type":2}],
+		"time_range":{"start":"2026-08-22T00:00:00+08:00","end":"2026-09-04T23:59:59+08:00","label":"最近两周"}
+	}`))
+	if err != nil {
+		t.Fatalf("set scope: %v", err)
+	}
+	change, ok := DeclaredWorkspaceScopeChange(ctx)
+	if !ok || change.SourceMode != WorkspaceSourceReplace || len(change.Channels) != 1 || change.Channels[0].ChannelID != "group-b" {
+		t.Fatalf("declared change = %#v", change)
+	}
+	start, end := ResolveAllowedTimeRange(ctx, time.Time{}, time.Time{})
+	if start.Format(time.RFC3339) != "2026-08-22T00:00:00+08:00" || end.Format(time.RFC3339) != "2026-09-04T23:59:59+08:00" {
+		t.Fatalf("resolved range = %s..%s", start, end)
+	}
+	allowed := AllowedChannelScopes(ctx)
+	if len(allowed) != 1 || allowed[0].ChannelID != "group-b" {
+		t.Fatalf("allowed channels = %#v", allowed)
+	}
+}
+
+func TestSetSummaryScopeRejectsUndiscoveredChannel(t *testing.T) {
+	_, handler := SetSummaryScopeTool()
+	ctx := context.WithValue(context.Background(), ContextKeyUID, "actor")
+	ctx = WithDiscoverableChannelScopeForUser(ctx, "actor", []ChannelScope{{ChannelID: "group-a", ChannelType: 2}})
+	_, err := handler(ctx, json.RawMessage(`{"source_mode":"replace","channels":[{"channel_id":"group-b","channel_type":2}]}`))
+	if err == nil || !strings.Contains(err.Error(), "not authorized") {
+		t.Fatalf("undiscovered channel error = %v", err)
+	}
+}
+
+func TestSetSummaryScopeRejectsChangesAfterMessageFetch(t *testing.T) {
+	_, handler := SetSummaryScopeTool()
+	ctx := context.WithValue(context.Background(), ContextKeyUID, "actor")
+	ctx = WithDiscoverableChannelScopeForUser(ctx, "actor", []ChannelScope{{ChannelID: "group-a", ChannelType: 2}})
+	ctx = WithSummaryCitationTracking(ctx)
+	markSummaryCitationEvidence(ctx, citationTestMessages("group-a", 1, 1))
+
+	_, err := handler(ctx, json.RawMessage(`{
+		"source_mode":"keep",
+		"time_range":{"start":"2026-09-01T00:00:00+08:00","end":"2026-09-04T23:59:59+08:00"}
+	}`))
+	if err == nil || !strings.Contains(err.Error(), "before fetching messages") {
+		t.Fatalf("post-fetch scope change error = %v", err)
+	}
+}
+
+func TestSetSummaryScopeExtendExcludesUnselectedDiscoveryResults(t *testing.T) {
+	_, handler := SetSummaryScopeTool()
+	ctx := context.WithValue(context.Background(), ContextKeyUID, "actor")
+	ctx = WithDiscoverableChannelScopeForUser(ctx, "actor", []ChannelScope{{ChannelID: "group-a", ChannelType: 2}})
+	AuthorizeDiscoveredChannels(ctx, []pipeline.ChannelInfo{
+		{ChannelID: "group-b", ChannelType: 2},
+		{ChannelID: "group-c", ChannelType: 2},
+	})
+
+	_, err := handler(ctx, json.RawMessage(`{
+		"source_mode":"extend",
+		"channels":[{"channel_id":"group-c","channel_type":2}]
+	}`))
+	if err != nil {
+		t.Fatalf("set scope: %v", err)
+	}
+	allowed := AllowedChannelScopes(ctx)
+	if len(allowed) != 2 || allowed[0].ChannelID != "group-a" || allowed[1].ChannelID != "group-c" {
+		t.Fatalf("allowed channels = %#v, want initial plus final declared extension", allowed)
 	}
 }
 

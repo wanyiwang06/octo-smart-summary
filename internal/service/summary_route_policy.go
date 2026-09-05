@@ -119,7 +119,7 @@ func DeriveSummaryRoute(in SummaryRouteInput) SummaryRoute {
 			}
 			return SummaryRouteTeamConfirmation
 		}
-		if in.HasExplicitRunIntent && in.HasSelectedSource && in.HasValidSource && in.HasSelectedTemplate {
+		if in.HasExplicitRunIntent && in.HasSelectedSource && in.HasValidSource && (in.HasSelectedTemplate || in.HasRequirement) {
 			return SummaryRoutePersonalWorkflow
 		}
 		if in.HasEnoughContextForPreview {

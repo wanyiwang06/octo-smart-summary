@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -157,9 +159,37 @@ type ChannelScope struct {
 type contextKeyAllowedChannelScope struct{}
 
 type mutableChannelScope struct {
-	mu            sync.RWMutex
-	allowed       map[int]map[string]ChannelScope
-	discoveryOpen bool
+	mu               sync.RWMutex
+	allowed          map[int]map[string]ChannelScope
+	initial          []ChannelScope
+	discoveryOpen    bool
+	declaredMode     string
+	declaredChannels []ChannelScope
+	declaredRange    *WorkspaceTimeRange
+}
+
+const (
+	WorkspaceSourceKeep    = "keep"
+	WorkspaceSourceReplace = "replace"
+	WorkspaceSourceExtend  = "extend"
+)
+
+// WorkspaceTimeRange is a model-declared candidate range. The application
+// layer remains authoritative: it validates and normalizes this value before
+// persisting it as workspace scope.
+type WorkspaceTimeRange struct {
+	Start string
+	End   string
+	Label string
+}
+
+// WorkspaceScopeChange is the final structured scope decision made during a
+// workspace turn. Channel entries can only be selected from channels already
+// authorized by trusted discovery tools in the same request.
+type WorkspaceScopeChange struct {
+	SourceMode string
+	Channels   []ChannelScope
+	TimeRange  *WorkspaceTimeRange
 }
 
 func newMutableChannelScope(channels []ChannelScope, discoveryOpen bool, uid string) *mutableChannelScope {
@@ -168,6 +198,9 @@ func newMutableChannelScope(channels []ChannelScope, discoveryOpen bool, uid str
 		discoveryOpen: discoveryOpen,
 	}
 	scope.add(channels, uid)
+	scope.mu.RLock()
+	scope.initial = scope.channelsLocked()
+	scope.mu.RUnlock()
 	return scope
 }
 
@@ -197,6 +230,22 @@ func (s *mutableChannelScope) addLocked(channels []ChannelScope, uid string) {
 	}
 }
 
+func (s *mutableChannelScope) channelsLocked() []ChannelScope {
+	channels := make([]ChannelScope, 0)
+	for _, byID := range s.allowed {
+		for _, channel := range byID {
+			channels = append(channels, channel)
+		}
+	}
+	sort.Slice(channels, func(i, j int) bool {
+		if channels[i].ChannelType != channels[j].ChannelType {
+			return channels[i].ChannelType < channels[j].ChannelType
+		}
+		return channels[i].ChannelID < channels[j].ChannelID
+	})
+	return channels
+}
+
 // WithAllowedChannelScopeForUser is WithAllowedChannelScope with the uid
 // passed explicitly instead of read from context. The production call site
 // (materializeWorkspaceAgentContext) runs before the per-tool wrapper injects
@@ -222,11 +271,102 @@ func WithAllowedChannelScope(ctx context.Context, channels []ChannelScope) conte
 // all-visible-channels decision; exploratory listing remains read-only.
 func WithDiscoverableChannelScope(ctx context.Context, initial ...[]ChannelScope) context.Context {
 	uid, _ := ctx.Value(ContextKeyUID).(string)
+	return WithDiscoverableChannelScopeForUser(ctx, uid, initial...)
+}
+
+// WithDiscoverableChannelScopeForUser is the explicit-user variant used by
+// application handlers before tool wrappers inject ContextKeyUID.
+func WithDiscoverableChannelScopeForUser(ctx context.Context, uid string, initial ...[]ChannelScope) context.Context {
 	var channels []ChannelScope
 	if len(initial) > 0 {
 		channels = initial[0]
 	}
 	return context.WithValue(ctx, contextKeyAllowedChannelScope{}, newMutableChannelScope(channels, true, uid))
+}
+
+// DeclareWorkspaceScopeChange records the Agent's final scope decision after
+// checking that every selected channel was authorized by trusted discovery.
+func DeclareWorkspaceScopeChange(ctx context.Context, change WorkspaceScopeChange) error {
+	scope, ok := ctx.Value(contextKeyAllowedChannelScope{}).(*mutableChannelScope)
+	if !ok || scope == nil || !scope.discoveryOpen {
+		return errors.New("workspace scope changes are not allowed for this request")
+	}
+	uid, _ := ctx.Value(ContextKeyUID).(string)
+	scope.mu.Lock()
+	defer scope.mu.Unlock()
+
+	mode := change.SourceMode
+	if mode == "" {
+		mode = WorkspaceSourceKeep
+	}
+	if mode != WorkspaceSourceKeep && mode != WorkspaceSourceReplace && mode != WorkspaceSourceExtend {
+		return fmt.Errorf("invalid workspace source mode %q", mode)
+	}
+	if mode == WorkspaceSourceKeep && len(change.Channels) > 0 {
+		return errors.New("keep source mode cannot include channels")
+	}
+	if mode != WorkspaceSourceKeep && len(change.Channels) == 0 {
+		return errors.New("replace or extend source mode requires channels")
+	}
+
+	selected := make([]ChannelScope, 0, len(change.Channels))
+	seen := make(map[string]struct{}, len(change.Channels))
+	for _, channel := range change.Channels {
+		channel.ChannelID = pipeline.NormalizeDMChannelID(channel.ChannelID, uid, channel.ChannelType)
+		allowed, exists := scope.allowed[channel.ChannelType][channel.ChannelID]
+		if !exists {
+			return fmt.Errorf("channel %d:%s was not authorized by discovery", channel.ChannelType, channel.ChannelID)
+		}
+		key := fmt.Sprintf("%d:%s", channel.ChannelType, channel.ChannelID)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		selected = append(selected, allowed)
+	}
+
+	scope.allowed = make(map[int]map[string]ChannelScope)
+	switch mode {
+	case WorkspaceSourceKeep:
+		scope.addLocked(scope.initial, uid)
+	case WorkspaceSourceReplace:
+		scope.addLocked(selected, uid)
+	case WorkspaceSourceExtend:
+		scope.addLocked(scope.initial, uid)
+		scope.addLocked(selected, uid)
+	}
+	scope.declaredMode = mode
+	scope.declaredChannels = append([]ChannelScope(nil), selected...)
+	if change.TimeRange != nil {
+		rangeCopy := *change.TimeRange
+		scope.declaredRange = &rangeCopy
+	} else {
+		scope.declaredRange = nil
+	}
+	return nil
+}
+
+// DeclaredWorkspaceScopeChange returns a copy of the Agent's final structured
+// decision. No declaration means the existing authoritative scope is kept.
+func DeclaredWorkspaceScopeChange(ctx context.Context) (WorkspaceScopeChange, bool) {
+	scope, ok := ctx.Value(contextKeyAllowedChannelScope{}).(*mutableChannelScope)
+	if !ok || scope == nil {
+		return WorkspaceScopeChange{}, false
+	}
+	scope.mu.RLock()
+	defer scope.mu.RUnlock()
+	if scope.declaredMode == "" && scope.declaredRange == nil {
+		return WorkspaceScopeChange{}, false
+	}
+	change := WorkspaceScopeChange{
+		SourceMode: scope.declaredMode,
+		Channels:   append([]ChannelScope(nil), scope.declaredChannels...),
+	}
+	if scope.declaredRange != nil {
+		rangeCopy := *scope.declaredRange
+		change.TimeRange = &rangeCopy
+	}
+	return change, true
 }
 
 // AuthorizeDiscoveredChannels adds channels returned by a trusted discovery
@@ -260,19 +400,7 @@ func AllowedChannelScopes(ctx context.Context) []ChannelScope {
 	}
 	scope.mu.RLock()
 	defer scope.mu.RUnlock()
-	channels := make([]ChannelScope, 0)
-	for _, byID := range scope.allowed {
-		for _, channel := range byID {
-			channels = append(channels, channel)
-		}
-	}
-	sort.Slice(channels, func(i, j int) bool {
-		if channels[i].ChannelType != channels[j].ChannelType {
-			return channels[i].ChannelType < channels[j].ChannelType
-		}
-		return channels[i].ChannelID < channels[j].ChannelID
-	})
-	return channels
+	return scope.channelsLocked()
 }
 
 // RestrictDiscoveredChannels keeps discovery results inside a closed UI scope.
@@ -342,6 +470,21 @@ func WithAllowedTimeRange(ctx context.Context, start, end time.Time) context.Con
 // ResolveAllowedTimeRange returns the trusted workspace range when present;
 // otherwise it preserves the caller-provided values.
 func ResolveAllowedTimeRange(ctx context.Context, requestedStart, requestedEnd time.Time) (time.Time, time.Time) {
+	if scope, ok := ctx.Value(contextKeyAllowedChannelScope{}).(*mutableChannelScope); ok && scope != nil {
+		scope.mu.RLock()
+		declared := scope.declaredRange
+		if declared != nil {
+			declaredCopy := *declared
+			scope.mu.RUnlock()
+			start, startErr := time.Parse(time.RFC3339, declaredCopy.Start)
+			end, endErr := time.Parse(time.RFC3339, declaredCopy.End)
+			if startErr == nil && endErr == nil {
+				return start, end
+			}
+		} else {
+			scope.mu.RUnlock()
+		}
+	}
 	allowed, ok := ctx.Value(contextKeyAllowedTimeRange{}).(allowedTimeRange)
 	if !ok || allowed.start.IsZero() || allowed.end.IsZero() {
 		return requestedStart, requestedEnd

@@ -105,7 +105,7 @@ func TestMaterializeWorkspaceAgentContextKeepsExplicitPickerRange(t *testing.T) 
 	}
 }
 
-func TestMaterializeWorkspaceAgentContextLetsExplicitCommandReplacePickerRange(t *testing.T) {
+func TestMaterializeWorkspaceAgentContextDefersExplicitCommandToAgentScopeTool(t *testing.T) {
 	now := time.Date(2026, 9, 4, 16, 30, 0, 0, time.UTC)
 	coordinator := &summaryWorkspaceCoordinator{now: func() time.Time { return now }}
 	contextValue := emptySummaryWorkspaceContext()
@@ -122,12 +122,12 @@ func TestMaterializeWorkspaceAgentContextLetsExplicitCommandReplacePickerRange(t
 	if err != nil {
 		t.Fatalf("materialize context: %v", err)
 	}
-	if got.TimeRange == nil || got.TimeRange.Label != "最近一个月" || got.TimeRange.Source != summaryWorkspaceTimeRangeSourceConversation {
-		t.Fatalf("time range=%#v, want conversational month", got.TimeRange)
+	if got.TimeRange == nil || got.TimeRange.Label != contextValue.TimeRange.Label || got.TimeRange.Source != summaryWorkspaceTimeRangeSourcePicker {
+		t.Fatalf("time range=%#v, want picker range until Agent declaration", got.TimeRange)
 	}
 }
 
-func TestMaterializeWorkspaceAgentContextLetsDirectRequestReplacePickerRange(t *testing.T) {
+func TestMaterializeWorkspaceAgentContextDefersDirectRequestToAgentScopeTool(t *testing.T) {
 	now := time.Date(2026, 9, 4, 16, 30, 0, 0, time.UTC)
 	coordinator := &summaryWorkspaceCoordinator{now: func() time.Time { return now }}
 	contextValue := emptySummaryWorkspaceContext()
@@ -144,12 +144,12 @@ func TestMaterializeWorkspaceAgentContextLetsDirectRequestReplacePickerRange(t *
 	if err != nil {
 		t.Fatalf("materialize context: %v", err)
 	}
-	if got.TimeRange == nil || got.TimeRange.Label != "最近一个月" || got.TimeRange.Source != summaryWorkspaceTimeRangeSourceConversation {
-		t.Fatalf("time range=%#v, want direct conversational month", got.TimeRange)
+	if got.TimeRange == nil || got.TimeRange.Label != contextValue.TimeRange.Label || got.TimeRange.Source != summaryWorkspaceTimeRangeSourcePicker {
+		t.Fatalf("time range=%#v, want picker range until Agent declaration", got.TimeRange)
 	}
 }
 
-func TestMaterializeWorkspaceAgentContextLetsExplicitFollowUpReplacePersistedRange(t *testing.T) {
+func TestMaterializeWorkspaceAgentContextKeepsPersistedRangeUntilAgentScopeTool(t *testing.T) {
 	now := time.Date(2026, 9, 4, 16, 30, 0, 0, time.UTC)
 	coordinator := &summaryWorkspaceCoordinator{now: func() time.Time { return now }}
 	contextValue := emptySummaryWorkspaceContext()
@@ -167,8 +167,8 @@ func TestMaterializeWorkspaceAgentContextLetsExplicitFollowUpReplacePersistedRan
 	if err != nil {
 		t.Fatalf("materialize context: %v", err)
 	}
-	if got.TimeRange == nil || got.TimeRange.Label != "最近 7 天" {
-		t.Fatalf("time range=%#v, want 最近 7 天", got.TimeRange)
+	if got.TimeRange == nil || got.TimeRange.Label != "最近一个月" {
+		t.Fatalf("time range=%#v, want persisted range until Agent declaration", got.TimeRange)
 	}
 }
 
@@ -191,7 +191,7 @@ func TestMaterializeWorkspaceAgentContextMaterializesTeamDefaultRange(t *testing
 	}
 }
 
-func TestMaterializeWorkspaceAgentContextAppliesFollowUpTimeRange(t *testing.T) {
+func TestMaterializeWorkspaceAgentContextDoesNotHeuristicallyApplyFollowUpTimeRange(t *testing.T) {
 	now := time.Date(2026, 9, 4, 16, 30, 0, 0, time.UTC)
 	coordinator := &summaryWorkspaceCoordinator{now: func() time.Time { return now }}
 	contextValue := emptySummaryWorkspaceContext()
@@ -212,8 +212,8 @@ func TestMaterializeWorkspaceAgentContextAppliesFollowUpTimeRange(t *testing.T) 
 	if inferred {
 		t.Fatal("explicit source must not be inferred")
 	}
-	if got.TimeRange == nil || got.TimeRange.Label != "最近一个月" {
-		t.Fatalf("time range=%#v, want 最近一个月", got.TimeRange)
+	if got.TimeRange == nil || got.TimeRange.Label != "最近 7 天（默认）" {
+		t.Fatalf("time range=%#v, want existing range until Agent declaration", got.TimeRange)
 	}
 }
 

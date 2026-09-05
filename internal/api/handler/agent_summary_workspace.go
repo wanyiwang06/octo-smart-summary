@@ -147,10 +147,9 @@ func classifySummaryWorkspaceServiceError(err error, fallback string) (httpStatu
 	return http.StatusInternalServerError, 50000, fallback, true, nil
 }
 
-// ConfigureSummaryWorkspace installs the v1 workbench contract and records the
-// environment-level entry rollout decision. The API remains configured while
-// entry is disabled so an already-mounted workbench can finish safely; newly
-// mounted clients observe capabilities.enabled=false and use the legacy entry.
+// ConfigureSummaryWorkspace installs the v2 workbench contract and records the
+// environment-level rollout decision. Disabled means both entry discovery and
+// workspace operations fail closed, providing an actual environment rollback.
 func (h *AgentChatHandler) ConfigureSummaryWorkspace(imDB *gorm.DB, workerTriggerURL string, enabled bool) {
 	if h == nil {
 		return
@@ -195,8 +194,8 @@ func (h *AgentChatHandler) SummaryWorkspaceCapabilities(c *gin.Context) {
 }
 
 func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentChatRequest, stream bool) {
-	if !h.summaryWorkspaceConfigured() {
-		c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50300, Message: "summary workspace is not configured"})
+	if !h.summaryWorkspaceEntryAvailable() {
+		c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50300, Message: "summary workspace is disabled"})
 		return
 	}
 	action := service.SummaryAction(req.Action)
@@ -295,8 +294,8 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	if begin.Snapshot.CurrentPreview != nil && hasExplicitSummaryExecutionCommand(req.Message) {
 		intent = service.SummaryIntentGenerate
 	}
-	sourceUpdate := summaryWorkspaceRequestedSourceUpdate(req.Message, req.InputOrigin, intent)
-	selectedSourceExplicit := len(contextValue.SelectedChannels) > 0 && sourceUpdate != summaryWorkspaceSourceReplace
+	sourceUpdate := summaryWorkspaceSourceUnchanged
+	selectedSourceExplicit := len(contextValue.SelectedChannels) > 0
 	hasRequirement := summaryWorkspaceHasRequirement(contextValue, req.Message, req.InputOrigin)
 	contextValue, inferredSource, err := h.workspace.materializeWorkspaceAgentContext(
 		c.Request.Context(), spaceID, uid, contextValue, begin.Snapshot, req.Message, intent, req.InputOrigin,
@@ -322,11 +321,10 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 		responder.fail(http.StatusInternalServerError, 50000, "查找最近聊天失败", true)
 		return
 	}
-	// A normal revision keeps the previous preview's closed allowlist. An
-	// explicit source replacement/extension re-opens discovery for this request;
-	// trusted discovery tools still constrain every result to the current Space
-	// and the actor's channel membership.
-	openScopeAgent := sourceUpdate != summaryWorkspaceSourceUnchanged ||
+	// Natural-language scope changes are decided by the Agent through the
+	// structured set_summary_scope tool. This broad cue check only makes trusted
+	// discovery available; it never mutates the authoritative scope itself.
+	openScopeAgent := summaryWorkspaceMayRequestScopeChange(req.Message, req.InputOrigin, intent) ||
 		(len(contextValue.SelectedChannels) == 0 && len(contextValue.Participants) == 0 &&
 			len(contextValue.ReferencedTaskIDs) == 0 && summaryWorkspaceUserRequirement(req.Message, req.InputOrigin) != "")
 
@@ -339,12 +337,15 @@ func (h *AgentChatHandler) handleSummaryWorkspaceChat(c *gin.Context, req agentC
 	}
 	explicitRunIntent := intent == service.SummaryIntentGenerate && summaryWorkspaceExecutionAuthorized(req.InputOrigin)
 	route := deriveWorkspaceRoute(contextValue, action, intent, explicitRunIntent, selectedSourceExplicit, hasRequirement, openScopeAgent, begin.Snapshot, validation.participantsValid, validation.sourcesValid, validation.referencesValid)
-	// Natural-language source changes must resolve to a concrete, authorised
-	// channel set before a side-effecting Workflow can consume them. The Agent
-	// turn commits that scope atomically; a later trusted action may launch it.
-	route = summaryWorkspaceRouteAfterSourceUpdate(
-		route, sourceUpdate, begin.Snapshot.CurrentPreview != nil, len(contextValue.Participants) > 0,
-	)
+	// A possible conversational scope change must pass through the Agent before
+	// any side-effecting workflow consumes it.
+	if openScopeAgent && route != service.SummaryRouteClarification && route != service.SummaryRouteExplanation {
+		if begin.Snapshot.CurrentPreview != nil && len(contextValue.Participants) == 0 {
+			route = service.SummaryRouteAgentRevision
+		} else {
+			route = service.SummaryRouteAgentPreview
+		}
+	}
 
 	var snapshot WorkspaceSnapshot
 	// The chat contract accepts request ids the workflow idempotency-key
@@ -542,13 +543,6 @@ func (h *AgentChatHandler) completeWorkspaceWorkflow(
 	if err != nil {
 		return WorkspaceSnapshot{}, err
 	}
-	if created.WorkerTrigger != nil {
-		go func(trigger model.WorkerTriggerRequest) {
-			if triggerErr := h.workspace.triggerWorker(trigger); triggerErr != nil {
-				log.Printf("[summary-workspace] worker trigger failed task=%d: %v", trigger.TaskID, triggerErr)
-			}
-		}(*created.WorkerTrigger)
-	}
 	resultType := workspaceResultWorkflowStarted
 	reply := startedReply
 	saved := false
@@ -559,7 +553,7 @@ func (h *AgentChatHandler) completeWorkspaceWorkflow(
 		saved = true
 		terminal = true
 	}
-	return h.completeWorkspaceResponse(ctx, key, turnID, attempt, userMessage, scopeVersion, &contextValue, agent.SummaryResponsePayload{
+	snapshot, err := h.completeWorkspaceResponse(ctx, key, turnID, attempt, userMessage, scopeVersion, &contextValue, agent.SummaryResponsePayload{
 		ResultType:      resultType,
 		Reply:           reply,
 		ExecutionTarget: string(target),
@@ -569,6 +563,17 @@ func (h *AgentChatHandler) completeWorkspaceWorkflow(
 			Saved:  saved,
 		},
 	}, nil, &WorkspaceWorkflowMutation{TaskID: created.Task.ID, Scope: workflowScope, Terminal: terminal, ConfirmsProposal: confirmsProposal})
+	if err != nil {
+		return WorkspaceSnapshot{}, err
+	}
+	if created.WorkerTrigger != nil {
+		go func(trigger model.WorkerTriggerRequest) {
+			if triggerErr := h.workspace.triggerWorker(trigger); triggerErr != nil {
+				log.Printf("[summary-workspace] worker trigger failed task=%d: %v", trigger.TaskID, triggerErr)
+			}
+		}(*created.WorkerTrigger)
+	}
+	return snapshot, nil
 }
 
 func workspacePersistAgentMessages(messages []agent.Message, resultType string, payload json.RawMessage, scopeVersion, snapshotVersion, parentMessageID int) []WorkspacePersistMessage {
@@ -597,10 +602,10 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	if agentSessionID == "" {
 		agentSessionID = summaryWorkspaceAgentSessionID(key.SpaceID, key.SessionID, req.ScopeVersion)
 	}
-	if sourceUpdate == summaryWorkspaceSourceReplace {
-		// A replacement gets a fresh evidence/cache identity. Historical tool
-		// handles from the old channel set therefore cannot be redeemed after the
-		// scope changes, while a failed replacement leaves the old identity intact.
+	if openScopeAgent {
+		// Scope-resolving turns get an isolated evidence/cache identity. Historical
+		// handles from the previous scope therefore cannot be redeemed while the
+		// Agent decides whether to keep, replace, or extend the scope.
 		agentSessionID = summaryWorkspaceReplacementAgentSessionID(key.SpaceID, key.SessionID, req.ScopeVersion, req.RequestID)
 	}
 	runner, system, err := h.buildRunnerForProfile(summaryWorkspaceProfile, key.UserID, agentSessionID, false)
@@ -608,11 +613,6 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 		return WorkspaceSnapshot{}, err
 	}
 	runChannels := contextValue.SelectedChannels
-	if sourceUpdate == summaryWorkspaceSourceReplace {
-		// Preserve the old persisted scope until a replacement has been resolved
-		// and validated, but do not make old-channel handles available to this run.
-		runChannels = nil
-	}
 	selected := make([]selectedChannel, 0, len(runChannels))
 	allowedChannels := make([]agent.ChannelScope, 0, len(runChannels))
 	for _, channel := range runChannels {
@@ -632,7 +632,7 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	ctx, system = applySelectedChannelContext(ctx, system, selected)
 	ctx = agent.WithWorkspaceSpaceID(ctx, key.SpaceID)
 	if openScopeAgent {
-		ctx = agent.WithDiscoverableChannelScope(ctx, allowedChannels)
+		ctx = agent.WithDiscoverableChannelScopeForUser(ctx, key.UserID, allowedChannels)
 	} else {
 		// Explicit uid: this runs before the per-tool wrapper injects
 		// ContextKeyUID, so the context-based variant leaves DM ids
@@ -715,6 +715,19 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 	if !slices.Contains(allowedResults, payload.ResultType) {
 		return WorkspaceSnapshot{}, fmt.Errorf("unexpected terminal result %q for route %q", payload.ResultType, route)
 	}
+	declaredScope, hasDeclaredScope := agent.DeclaredWorkspaceScopeChange(ctx)
+	if hasDeclaredScope {
+		switch declaredScope.SourceMode {
+		case agent.WorkspaceSourceReplace:
+			sourceUpdate = summaryWorkspaceSourceReplace
+		case agent.WorkspaceSourceExtend:
+			sourceUpdate = summaryWorkspaceSourceExtend
+		case "", agent.WorkspaceSourceKeep:
+			sourceUpdate = summaryWorkspaceSourceUnchanged
+		default:
+			return WorkspaceSnapshot{}, fmt.Errorf("unsupported declared source mode %q", declaredScope.SourceMode)
+		}
+	}
 	parentMessageID := 0
 	snapshotVersion := 0
 	persistedAgentSessionID := strings.TrimSpace(before.Session.AgentSessionID)
@@ -722,8 +735,23 @@ func (h *AgentChatHandler) completeWorkspaceAgentTurn(ctx context.Context, respo
 		persistedAgentSessionID = summaryWorkspaceAgentSessionID(key.SpaceID, key.SessionID, req.ScopeVersion)
 	}
 	if payload.Preview != nil {
+		if hasDeclaredScope && declaredScope.TimeRange != nil {
+			label := strings.TrimSpace(declaredScope.TimeRange.Label)
+			if label == "" {
+				label = declaredScope.TimeRange.Start + " 至 " + declaredScope.TimeRange.End
+			}
+			contextValue.TimeRange = &summaryWorkspaceTimeRange{
+				Start: declaredScope.TimeRange.Start, End: declaredScope.TimeRange.End,
+				Label: label, Source: summaryWorkspaceTimeRangeSourceConversation,
+			}
+			normalized, normalizeErr := normalizeSummaryWorkspaceContext(contextValue)
+			if normalizeErr != nil {
+				return WorkspaceSnapshot{}, normalizeErr
+			}
+			contextValue = normalized
+		}
 		effectiveChannels := append([]summaryWorkspaceChannel(nil), contextValue.SelectedChannels...)
-		if openScopeAgent {
+		if sourceUpdate != summaryWorkspaceSourceUnchanged {
 			effectiveChannels = summaryWorkspaceChannelsFromAgentScope(agent.AllowedChannelScopes(ctx))
 		}
 		if len(effectiveChannels) == 0 && len(contextValue.ReferencedTaskIDs) == 0 {
@@ -837,8 +865,8 @@ func workspaceMutationRequestID(kind, idempotencyKey string) string {
 // multi-user proposal into a formal workflow. Proposal version/token, scope and
 // idempotency are checked before creating participant rows or dispatching work.
 func (h *AgentChatHandler) ConfirmSummaryWorkspaceProposal(c *gin.Context) {
-	if !h.summaryWorkspaceConfigured() {
-		c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50300, Message: "summary workspace is not configured"})
+	if !h.summaryWorkspaceEntryAvailable() {
+		c.JSON(http.StatusServiceUnavailable, apiResponse{Code: 50300, Message: "summary workspace is disabled"})
 		return
 	}
 	sessionID := c.Param("session")
@@ -1035,7 +1063,7 @@ func sameSummaryWorkspaceParticipants(left, right []summaryWorkspaceParticipant)
 }
 
 func (h *AgentChatHandler) handleSummaryWorkspaceHistory(c *gin.Context, sessionID, userID string) bool {
-	if !h.summaryWorkspaceConfigured() {
+	if !h.summaryWorkspaceEntryAvailable() {
 		return false
 	}
 	key := WorkspaceSessionKey{SpaceID: middleware.GetSpaceID(c), UserID: userID, SessionID: sessionID}
@@ -1369,11 +1397,6 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 	if w != nil && w.now != nil {
 		now = w.now()
 	}
-	if inputOrigin == summaryWorkspaceInputUser && intent != service.SummaryIntentExplain {
-		if requestedRange, ok := summaryWorkspaceRequestedPresetTimeRange(message, now); ok {
-			contextValue.TimeRange = requestedRange
-		}
-	}
 	needsRecentFallback := intent == service.SummaryIntentGenerate &&
 		len(contextValue.SelectedChannels) == 0 &&
 		len(contextValue.Participants) == 0 &&
@@ -1396,6 +1419,17 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 
 	contextValue = materializeSummaryWorkspaceDefaultTimeRange(contextValue, now)
 	return contextValue, false, nil
+}
+
+func summaryWorkspaceMayRequestScopeChange(message, inputOrigin string, intent service.SummaryIntent) bool {
+	if inputOrigin != summaryWorkspaceInputUser || intent == service.SummaryIntentExplain {
+		return false
+	}
+	normalized := strings.ToLower(strings.Join(strings.Fields(message), ""))
+	return containsAny(normalized,
+		"群", "会话", "私聊", "聊天", "频道", "子区", "thread",
+		"时间", "范围", "窗口", "最近", "过去", "本周", "上周", "今天", "昨天", "前天", "天", "周", "月",
+	)
 }
 
 type summaryWorkspacePresetTimeRange struct {
