@@ -87,9 +87,10 @@ type SummaryResponseChannel struct {
 }
 
 type SummaryResponseTimeRange struct {
-	Start string `json:"start"`
-	End   string `json:"end"`
-	Label string `json:"label,omitempty"`
+	Start  string `json:"start"`
+	End    string `json:"end"`
+	Label  string `json:"label,omitempty"`
+	Source string `json:"source,omitempty"`
 }
 
 type allowedSummaryResultTypesContextKey struct{}

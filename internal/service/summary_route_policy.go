@@ -58,10 +58,10 @@ type SummaryRouteInput struct {
 }
 
 // DeriveSummaryRoute applies the server-side routing boundary for the unified
-// entry. Team impact has priority over personal execution. A direct team start
-// may bypass proposal confirmation only when the trusted UI action is paired
-// with an explicit generate intent; confirmation keeps the persisted proposal
-// guards.
+// entry. Team impact has priority over personal execution. A trusted direct
+// team action bypasses proposal confirmation after the server revalidates the
+// participant, source, permission, and requirement structure; confirmation
+// keeps the persisted proposal guards.
 func DeriveSummaryRoute(in SummaryRouteInput) SummaryRoute {
 	switch in.Action {
 	case SummaryActionConfirmWorkflow:

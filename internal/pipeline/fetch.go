@@ -980,7 +980,10 @@ func FilterMessagesByRelevance(messages []Message, topic string, participantUIDs
 //
 // Returns messages, intent result (for target person filtering), and error.
 func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, participantUIDs []string, participantNames []string, specifiedSources []map[string]interface{}, topic string, timeStart, timeEnd time.Time, imDB *gorm.DB, octoClient octoSearchClient, messageFetchBackend string, toolCallFn LLMToolCallFn, llmFn LLMCallFn, tableCount int, maxPerChannel int, fetchConcurrency int, octoSearchPollSec int, channelScopeOpts *ChannelScopeOptions, reportStage func(string)) ([]Message, *IntentResult, error) {
-	maxDays := MaxTimeRangeDays
+	maxDays := DefaultTimeRangeDays
+	if channelScopeOpts != nil && channelScopeOpts.WorkspaceTask {
+		maxDays = MaxTimeRangeDays
+	}
 	if timeEnd.Sub(timeStart) > time.Duration(maxDays)*24*time.Hour {
 		return nil, nil, fmt.Errorf("时间范围不能超过 %d 天", maxDays)
 	}
@@ -1013,8 +1016,19 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 		if len(specifiedSources) != requestedSourceCount {
 			log.Printf("[pipeline-personal] participant source scope reduced from %d to %d source(s)", requestedSourceCount, len(specifiedSources))
 		}
-	} else if err := validateExplicitSourceCoverage(userChannels, specifiedSources, creatorUID); err != nil {
-		return nil, nil, err
+	} else if channelScopeOpts != nil && channelScopeOpts.WorkspaceTask {
+		if err := validateExplicitSourceCoverage(userChannels, specifiedSources, creatorUID); err != nil {
+			return nil, nil, err
+		}
+	} else {
+		requestedSourceCount := len(specifiedSources)
+		specifiedSources = filterAvailableSpecifiedSources(userChannels, specifiedSources, creatorUID)
+		if requestedSourceCount > 0 && len(specifiedSources) == 0 {
+			return nil, nil, errors.New("explicit summary source is unavailable in the current space")
+		}
+		if len(specifiedSources) != requestedSourceCount {
+			log.Printf("[pipeline-personal] legacy source scope reduced from %d to %d source(s)", requestedSourceCount, len(specifiedSources))
+		}
 	}
 
 	// Convert the effective specifiedSources to a string slice for shortcut
@@ -1036,8 +1050,19 @@ func ResolveAndFetchMessagesForPersonal(ctx context.Context, creatorUID string, 
 		return nil, nil, fmt.Errorf("intersect participant channels: %w", err)
 	}
 	if channelScopeOpts == nil || !channelScopeOpts.ParticipantSourceUnion {
-		if err := validateExplicitParticipantSourceCoverage(userChannels, specifiedSources, creatorUID); err != nil {
-			return nil, nil, err
+		if channelScopeOpts != nil && channelScopeOpts.WorkspaceTask {
+			if err := validateExplicitParticipantSourceCoverage(userChannels, specifiedSources, creatorUID); err != nil {
+				return nil, nil, err
+			}
+		} else {
+			requestedSourceCount := len(specifiedSources)
+			specifiedSources = filterAvailableSpecifiedSources(userChannels, specifiedSources, creatorUID)
+			if requestedSourceCount > 0 && len(specifiedSources) == 0 {
+				return nil, nil, errors.New("explicit summary source is not shared by every participant")
+			}
+			if len(specifiedSources) != requestedSourceCount {
+				log.Printf("[pipeline-personal] legacy participant scope reduced from %d to %d source(s)", requestedSourceCount, len(specifiedSources))
+			}
 		}
 	}
 	log.Printf("[pipeline-personal] Layer 1.5 (participant scope) took %dms (%d channels)",

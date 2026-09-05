@@ -784,10 +784,12 @@ func (p *Processor) executePipeline(task model.SummaryTask) error {
 		}
 	}
 
+	workspaceTask := pipeline.IsWorkspaceAgentSessionID(task.AgentSessionID)
 	channelScopeOpts := &pipeline.ChannelScopeOptions{
 		Enabled:                p.cfg.ChannelScopeEnabled,
 		SpaceID:                task.SpaceID,
-		ParticipantSourceUnion: task.AgentSessionID != "",
+		ParticipantSourceUnion: workspaceTask,
+		WorkspaceTask:          workspaceTask,
 	}
 
 	fetchStart := time.Now()

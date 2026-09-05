@@ -29,6 +29,16 @@ type ChannelScopeOptions struct {
 	// accessible to the participant executing a personal result. It never adds
 	// sources and fails when the participant has no selected source left.
 	ParticipantSourceSubset bool
+	// WorkspaceTask enables strict explicit-source coverage for the unified
+	// workspace contract. Legacy tasks retain best-effort narrowing when only a
+	// subset of their historical sources remains available.
+	WorkspaceTask bool
+}
+
+const WorkspaceAgentSessionPrefix = "summaryws:"
+
+func IsWorkspaceAgentSessionID(sessionID string) bool {
+	return strings.HasPrefix(strings.TrimSpace(sessionID), WorkspaceAgentSessionPrefix)
 }
 
 // ChannelScopeRule represents a single channel scope constraint rule.

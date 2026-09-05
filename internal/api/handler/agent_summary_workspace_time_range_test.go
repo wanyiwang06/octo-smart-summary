@@ -67,20 +67,43 @@ func TestMaterializeWorkspaceAgentContextKeepsExplicitPickerRange(t *testing.T) 
 	contextValue := emptySummaryWorkspaceContext()
 	contextValue.SelectedChannels = []summaryWorkspaceChannel{{ChatID: "group-a", ChatType: "group", Name: "A群"}}
 	contextValue.TimeRange = &summaryWorkspaceTimeRange{
-		Start: now.AddDate(0, 0, -2).Format(time.RFC3339),
-		End:   now.Format(time.RFC3339),
-		Label: "2026-09-02 至 2026-09-04",
+		Start:  now.AddDate(0, 0, -2).Format(time.RFC3339),
+		End:    now.Format(time.RFC3339),
+		Label:  "2026-09-02 至 2026-09-04",
+		Source: summaryWorkspaceTimeRangeSourcePicker,
 	}
 
 	got, _, err := coordinator.materializeWorkspaceAgentContext(
 		t.Context(), "space-a", "actor", contextValue, WorkspaceSnapshot{},
-		"参考最近一个月的背景，但只总结我选的这三天", service.SummaryIntentGenerate, summaryWorkspaceInputUser,
+		"最近一个月的背景我知道，但只总结我选的这三天", service.SummaryIntentGenerate, summaryWorkspaceInputUser,
 	)
 	if err != nil {
 		t.Fatalf("materialize context: %v", err)
 	}
 	if got.TimeRange == nil || got.TimeRange.Label != contextValue.TimeRange.Label {
 		t.Fatalf("time range=%#v, want explicit picker range %#v", got.TimeRange, contextValue.TimeRange)
+	}
+}
+
+func TestMaterializeWorkspaceAgentContextLetsExplicitCommandReplacePickerRange(t *testing.T) {
+	now := time.Date(2026, 9, 4, 16, 30, 0, 0, time.UTC)
+	coordinator := &summaryWorkspaceCoordinator{now: func() time.Time { return now }}
+	contextValue := emptySummaryWorkspaceContext()
+	contextValue.SelectedChannels = []summaryWorkspaceChannel{{ChatID: "group-a", ChatType: "group", Name: "A群"}}
+	contextValue.TimeRange = &summaryWorkspaceTimeRange{
+		Start: now.AddDate(0, 0, -2).Format(time.RFC3339), End: now.Format(time.RFC3339),
+		Label: "2026-09-02 至 2026-09-04", Source: summaryWorkspaceTimeRangeSourcePicker,
+	}
+
+	got, _, err := coordinator.materializeWorkspaceAgentContext(
+		t.Context(), "space-a", "actor", contextValue, WorkspaceSnapshot{},
+		"把时间范围扩大到最近一个月", service.SummaryIntentRevise, summaryWorkspaceInputUser,
+	)
+	if err != nil {
+		t.Fatalf("materialize context: %v", err)
+	}
+	if got.TimeRange == nil || got.TimeRange.Label != "最近一个月" || got.TimeRange.Source != summaryWorkspaceTimeRangeSourceConversation {
+		t.Fatalf("time range=%#v, want conversational month", got.TimeRange)
 	}
 }
 
@@ -189,9 +212,10 @@ func TestApplySummaryWorkspaceProposalScopeUsesConfirmedRange(t *testing.T) {
 		Label: "最近 7 天",
 	}
 	confirmed := &summaryWorkspaceTimeRange{
-		Start: "2026-08-06T00:00:00+08:00",
-		End:   "2026-09-04T23:59:59+08:00",
-		Label: "最近一个月",
+		Start:  "2026-08-06T00:00:00+08:00",
+		End:    "2026-09-04T23:59:59+08:00",
+		Label:  "最近一个月",
+		Source: summaryWorkspaceTimeRangeSourceConversation,
 	}
 
 	got, err := applySummaryWorkspaceProposalScope(persisted, summaryWorkspaceProposal{

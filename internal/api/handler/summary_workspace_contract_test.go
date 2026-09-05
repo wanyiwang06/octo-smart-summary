@@ -151,6 +151,32 @@ func TestNormalizeSummaryWorkspaceContextRejectsInvalidRange(t *testing.T) {
 	}
 }
 
+func TestNormalizeSummaryWorkspaceContextDefaultsAndValidatesRangeSource(t *testing.T) {
+	got, err := normalizeSummaryWorkspaceContext(summaryWorkspaceContext{
+		TimeRange: &summaryWorkspaceTimeRange{
+			Start: "2026-08-27T10:00:00Z",
+			End:   "2026-09-04T10:00:00Z",
+			Label: "最近 7 天",
+		},
+	})
+	if err != nil {
+		t.Fatalf("normalize context: %v", err)
+	}
+	if got.TimeRange == nil || got.TimeRange.Source != summaryWorkspaceTimeRangeSourcePicker {
+		t.Fatalf("time range=%#v, want picker source", got.TimeRange)
+	}
+
+	_, err = normalizeSummaryWorkspaceContext(summaryWorkspaceContext{
+		TimeRange: &summaryWorkspaceTimeRange{
+			Start: "2026-08-27T10:00:00Z",
+			End:   "2026-09-04T10:00:00Z", Label: "最近 7 天", Source: "unknown",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected invalid time range source")
+	}
+}
+
 func TestNormalizeSummaryWorkspaceContextRejectsRangeOverNinetyDays(t *testing.T) {
 	_, err := normalizeSummaryWorkspaceContext(summaryWorkspaceContext{
 		TimeRange: &summaryWorkspaceTimeRange{

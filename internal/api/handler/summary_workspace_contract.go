@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	summaryWorkspaceContractVersion = "1"
+	summaryWorkspaceContractVersion = "2"
 	summaryWorkspaceProfile         = "summary_workspace"
 
 	workspaceResultClarification        = agent.SummaryResultClarification
@@ -64,10 +64,17 @@ type summaryWorkspaceTemplate struct {
 }
 
 type summaryWorkspaceTimeRange struct {
-	Start string `json:"start"`
-	End   string `json:"end"`
-	Label string `json:"label"`
+	Start  string `json:"start"`
+	End    string `json:"end"`
+	Label  string `json:"label"`
+	Source string `json:"source"`
 }
+
+const (
+	summaryWorkspaceTimeRangeSourcePicker       = "picker"
+	summaryWorkspaceTimeRangeSourceDefault      = "default"
+	summaryWorkspaceTimeRangeSourceConversation = "conversation"
+)
 
 // summaryWorkspaceContext is the complete, server-authoritative scope echoed
 // on every turn and History response. Slice fields are normalized to [] rather
@@ -233,9 +240,14 @@ func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorksp
 		timeRange.Start = strings.TrimSpace(timeRange.Start)
 		timeRange.End = strings.TrimSpace(timeRange.End)
 		timeRange.Label = strings.TrimSpace(timeRange.Label)
+		timeRange.Source = strings.TrimSpace(timeRange.Source)
+		if timeRange.Source == "" {
+			timeRange.Source = summaryWorkspaceTimeRangeSourcePicker
+		}
 		start, startErr := time.Parse(time.RFC3339, timeRange.Start)
 		end, endErr := time.Parse(time.RFC3339, timeRange.End)
-		if startErr != nil || endErr != nil || !end.After(start) || timeRange.Label == "" || len([]rune(timeRange.Label)) > maxSummaryWorkspaceLabelLength {
+		if startErr != nil || endErr != nil || !end.After(start) || timeRange.Label == "" || len([]rune(timeRange.Label)) > maxSummaryWorkspaceLabelLength ||
+			(timeRange.Source != summaryWorkspaceTimeRangeSourcePicker && timeRange.Source != summaryWorkspaceTimeRangeSourceDefault && timeRange.Source != summaryWorkspaceTimeRangeSourceConversation) {
 			return out, fmt.Errorf("%w: invalid time_range", errInvalidSummaryWorkspaceContext)
 		}
 		if end.Sub(start) > time.Duration(pipeline.MaxTimeRangeDays)*24*time.Hour {

@@ -1313,7 +1313,9 @@ func (w *summaryWorkspaceCoordinator) materializeWorkspaceAgentContext(
 	}
 	if inputOrigin == summaryWorkspaceInputUser && intent != service.SummaryIntentExplain {
 		if requestedRange, ok := summaryWorkspaceRequestedPresetTimeRange(message, now); ok {
-			contextValue.TimeRange = requestedRange
+			if summaryWorkspaceAllowsRequestedTimeRange(contextValue.TimeRange, message) {
+				contextValue.TimeRange = requestedRange
+			}
 		}
 	}
 	needsRecentFallback := intent == service.SummaryIntentGenerate &&
@@ -1410,10 +1412,33 @@ func summaryWorkspaceRequestedPresetTimeRange(message string, now time.Time) (*s
 	startDay := now.AddDate(0, 0, -(best.days - 1))
 	start := time.Date(startDay.Year(), startDay.Month(), startDay.Day(), 0, 0, 0, 0, location)
 	return &summaryWorkspaceTimeRange{
-		Start: start.Format(time.RFC3339Nano),
-		End:   end.Format(time.RFC3339Nano),
-		Label: best.label,
+		Start:  start.Format(time.RFC3339Nano),
+		End:    end.Format(time.RFC3339Nano),
+		Label:  best.label,
+		Source: summaryWorkspaceTimeRangeSourceConversation,
 	}, true
+}
+
+func summaryWorkspaceAllowsRequestedTimeRange(current *summaryWorkspaceTimeRange, message string) bool {
+	if current == nil || current.Source != summaryWorkspaceTimeRangeSourcePicker {
+		return true
+	}
+	normalized := strings.ToLower(strings.Join(strings.Fields(message), ""))
+	if normalized == "" {
+		return false
+	}
+	for _, preset := range summaryWorkspacePresetTimeRanges {
+		for _, pattern := range preset.patterns {
+			if normalized == pattern {
+				return true
+			}
+		}
+	}
+	return containsAny(normalized,
+		"时间范围", "时间窗口", "取数范围", "统计范围",
+		"扩大到", "扩展到", "缩小到", "调整为", "改为", "改成",
+		"按最近", "按近", "按过去", "用最近", "用近", "用过去",
+	)
 }
 
 func summaryWorkspaceRangeMentionIsExplicit(message string, index, length int) bool {
@@ -1453,9 +1478,10 @@ func materializeSummaryWorkspaceDefaultTimeRange(contextValue summaryWorkspaceCo
 	end := now.Truncate(time.Second)
 	start := end.Add(-time.Duration(service.AgentSummaryDefaultTimeRangeDays) * 24 * time.Hour)
 	contextValue.TimeRange = &summaryWorkspaceTimeRange{
-		Start: start.Format(time.RFC3339),
-		End:   end.Format(time.RFC3339),
-		Label: "最近 7 天（默认）",
+		Start:  start.Format(time.RFC3339),
+		End:    end.Format(time.RFC3339),
+		Label:  "最近 7 天（默认）",
+		Source: summaryWorkspaceTimeRangeSourceDefault,
 	}
 	return contextValue
 }
@@ -1506,9 +1532,10 @@ func hydrateSummaryWorkspaceContextFromPreview(contextValue summaryWorkspaceCont
 	}
 	if effective.TimeRange != nil && strings.TrimSpace(effective.TimeRange.Label) != "" {
 		contextValue.TimeRange = &summaryWorkspaceTimeRange{
-			Start: effective.TimeRange.Start,
-			End:   effective.TimeRange.End,
-			Label: effective.TimeRange.Label,
+			Start:  effective.TimeRange.Start,
+			End:    effective.TimeRange.End,
+			Label:  effective.TimeRange.Label,
+			Source: effective.TimeRange.Source,
 		}
 	}
 	normalized, err := normalizeSummaryWorkspaceContext(contextValue)
@@ -1529,7 +1556,7 @@ func summaryWorkspaceEffectiveScopePayload(contextValue summaryWorkspaceContext,
 	}
 	if contextValue.TimeRange != nil {
 		effective.TimeRange = &agent.SummaryResponseTimeRange{
-			Start: contextValue.TimeRange.Start, End: contextValue.TimeRange.End, Label: contextValue.TimeRange.Label,
+			Start: contextValue.TimeRange.Start, End: contextValue.TimeRange.End, Label: contextValue.TimeRange.Label, Source: contextValue.TimeRange.Source,
 		}
 	}
 	return effective

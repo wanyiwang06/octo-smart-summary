@@ -1,7 +1,7 @@
-# Summary workspace contract v1
+# Summary workspace contract v2
 
 The summary workbench is available when `GET /summary-workbench/capabilities`
-returns `enabled: true` and `contract_version: "1"`.
+returns `enabled: true` and `contract_version: "2"`.
 
 ## Direct team workflow
 
@@ -9,9 +9,9 @@ returns `enabled: true` and `contract_version: "1"`.
   `action: "start_team_workflow"` instead of showing a confirmation card.
 - This capability currently ships together with the v1 workbench; it is not a
   separate rollout flag.
-- The server accepts the action only for a generate intent with a valid team
-  scope and requirement. Source, participant, and reference permissions are
-  revalidated before the workflow is created.
+- The explicit action is treated as the user's execution intent. The server
+  still requires a valid team scope and requirement, and revalidates source,
+  participant, and reference permissions before creating the workflow.
 - Reusing the same `request_id` is idempotent and does not dispatch a second
   workflow.
 
@@ -22,6 +22,11 @@ scope. When the server resolves a default, inferred source, or explicit
 natural-language time-range change, the completed turn stores that resolved
 scope without changing `scope_version`. The response returns the same scope in
 `state.summary_context`; the client must use it for the next turn.
+
+`time_range.source` records whether the current range came from the picker,
+the server default, or a conversational instruction. A picker range is changed
+by conversation only when the user gives an explicit range-change command;
+incidental or negated range mentions do not replace it.
 
 A pending team proposal also stores its resolved `time_range`. Confirmation
 uses that stored value, so the displayed range and the dispatched workflow

@@ -721,10 +721,12 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	}
 
 	// Fetch messages via personal pipeline (Layer 0-5)
+	workspaceTask := pipeline.IsWorkspaceAgentSessionID(task.AgentSessionID)
 	channelScopeOpts := &pipeline.ChannelScopeOptions{
 		Enabled:                 p.cfg.ChannelScopeEnabled,
 		SpaceID:                 task.SpaceID,
-		ParticipantSourceSubset: task.AgentSessionID != "",
+		ParticipantSourceSubset: workspaceTask,
+		WorkspaceTask:           workspaceTask,
 	}
 
 	fetchStart := time.Now()
