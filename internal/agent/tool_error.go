@@ -93,13 +93,6 @@ func classifyToolError(toolName string, err error) ToolErrorEnvelope {
 		env.ErrorCode, env.Retryable, env.Fatal = "REQUEST_TOO_LARGE", false, criticalTools[toolName]
 		return env
 	}
-	// summarize_chunk fan-out ceiling (#241 item 2): the input splits into more
-	// chunks than allowed. Same static-input property — retrying splits the same
-	// way — so NOT retryable; fatal for critical tools. Identity-matched.
-	if errors.Is(err, errTooManyChunks) {
-		env.ErrorCode, env.Retryable, env.Fatal = "TOO_MANY_CHUNKS", false, criticalTools[toolName]
-		return env
-	}
 
 	switch {
 	case strings.Contains(low, "panicked"):

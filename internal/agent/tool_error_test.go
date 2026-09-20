@@ -506,30 +506,18 @@ func TestFatalIsNotSelfSealing(t *testing.T) {
 }
 
 // TestClassifyToolError_SizeGuardsAreNotRetryable pins that the #241 pre-send
-// guards classify as NOT retryable (retrying the same oversized input cannot
+// guard classifies as NOT retryable (retrying the same oversized input cannot
 // help) and fatal for a critical tool — identity-matched, never falling through
 // to the retryable default.
 func TestClassifyToolError_SizeGuardsAreNotRetryable(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		code string
-	}{
-		{"request too large", fmt.Errorf("wrap: %w", service.ErrRequestTooLarge), "REQUEST_TOO_LARGE"},
-		{"too many chunks", fmt.Errorf("wrap: %w", errTooManyChunks), "TOO_MANY_CHUNKS"},
+	env := classifyToolError("summarize_chunk", fmt.Errorf("wrap: %w", service.ErrRequestTooLarge))
+	if env.Retryable {
+		t.Errorf("Retryable = true, want false")
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			env := classifyToolError("summarize_chunk", c.err)
-			if env.Retryable {
-				t.Errorf("%s: Retryable = true, want false", c.name)
-			}
-			if !env.Fatal {
-				t.Errorf("%s: Fatal = false, want true for a critical tool", c.name)
-			}
-			if env.ErrorCode != c.code {
-				t.Errorf("%s: ErrorCode = %q, want %q", c.name, env.ErrorCode, c.code)
-			}
-		})
+	if !env.Fatal {
+		t.Errorf("Fatal = false, want true for a critical tool")
+	}
+	if env.ErrorCode != "REQUEST_TOO_LARGE" {
+		t.Errorf("ErrorCode = %q, want REQUEST_TOO_LARGE", env.ErrorCode)
 	}
 }

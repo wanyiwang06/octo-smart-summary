@@ -139,6 +139,12 @@ func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, 
 	if err != nil {
 		return AssistantTurn{}, llmfallback.Terminal, fmt.Errorf("marshal request: %w", err)
 	}
+	// Pre-send size guard, shared with the service client (#241 item 1): reject a
+	// pathologically large planner request before it hits the model, terminally
+	// (the same body can't shrink on retry / model switch).
+	if len(payload) > service.MaxRequestBodyBytes {
+		return AssistantTurn{}, llmfallback.Terminal, fmt.Errorf("%w: %d bytes > %d", service.ErrRequestTooLarge, len(payload), service.MaxRequestBodyBytes)
+	}
 	diagnostics := beginToolDiagnostics(ctx, msgs, tools)
 
 	reqCtx, cancel := context.WithTimeout(ctx, c.timeout)

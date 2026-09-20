@@ -137,10 +137,11 @@ func TestSummarizeChunksConcurrently_AggregatesCoverageExactly(t *testing.T) {
 	}
 }
 
-// A non-abort chunk failure is TOLERATED (#241 item 2): the summaries already
-// computed for other chunks are kept, the failed slice gets a sentinel, and no
-// error is returned — so a single bad chunk cannot discard a whole run's work.
-func TestSummarizeChunksConcurrently_FailedChunkGetsSentinel(t *testing.T) {
+// A per-chunk failure (run still alive) is TOLERATED (#241 item 2): the failed
+// slices are DROPPED from the reduce input (not replaced with a marker — the
+// gap is disclosed structurally via FailedChunkCount), the successes are kept,
+// and no error is returned — so a single bad chunk cannot discard a whole run.
+func TestSummarizeChunksConcurrently_FailedChunkDropped(t *testing.T) {
 	withMapConcurrency(t, 5)
 
 	errEarly := errors.New("chunk 1 failed")
@@ -161,27 +162,26 @@ func TestSummarizeChunksConcurrently_FailedChunkGetsSentinel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a tolerated chunk failure must not return an error, got %v", err)
 	}
-	if len(got) != 5 {
-		t.Fatalf("want all 5 slots filled (sentinels for failures), got %d", len(got))
+	if len(got) != 3 {
+		t.Fatalf("want the 3 successful summaries (failures dropped), got %d", len(got))
+	}
+	for _, s := range got {
+		if s != "s" {
+			t.Errorf("kept summary = %q, want only successful ones", s)
+		}
+		if strings.Contains(s, service.MapFailedMarker) {
+			t.Errorf("failure marker leaked into reduce input: %q", s)
+		}
 	}
 	if cov.FailedChunkCount != 2 {
 		t.Errorf("FailedChunkCount = %d, want 2", cov.FailedChunkCount)
 	}
-	for _, idx := range []int{1, 4} {
-		if !strings.Contains(got[idx], service.MapFailedMarker) {
-			t.Errorf("chunk %d slot = %q, want a failure sentinel", idx, got[idx])
-		}
-	}
-	for _, idx := range []int{0, 2, 3} {
-		if got[idx] != "s" {
-			t.Errorf("chunk %d slot = %q, want the successful summary preserved", idx, got[idx])
-		}
-	}
 }
 
-// When EVERY chunk fails there is nothing usable to return, so the whole phase
-// errors rather than shipping an all-sentinel deliverable.
-func TestSummarizeChunksConcurrently_AllFailuresError(t *testing.T) {
+// When EVERY chunk fails there is nothing usable, so the whole phase errors —
+// and it WRAPS the lowest-index cause so classifyToolError sees the real
+// (often transient) shape rather than a bare "all failed" string.
+func TestSummarizeChunksConcurrently_AllFailuresErrorWrapsCause(t *testing.T) {
 	withMapConcurrency(t, 3)
 	boom := errors.New("boom")
 	withStubMapCall(t, func(ctx context.Context, chunk []map[string]interface{}, _ string) (string, int, int, error) {
@@ -192,6 +192,9 @@ func TestSummarizeChunksConcurrently_AllFailuresError(t *testing.T) {
 	got, err := summarizeChunksConcurrently(context.Background(), makeChunks(4), "", &cov)
 	if err == nil {
 		t.Fatal("expected an error when all chunks fail, got nil")
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("all-failed error must wrap the cause, got %v", err)
 	}
 	if got != nil {
 		t.Fatalf("expected no summaries when all fail, got %d", len(got))
@@ -243,27 +246,34 @@ func TestSummarizeChunksConcurrently_CancelReleasesQueuedChunks(t *testing.T) {
 
 // A panic below Registry.Dispatch's recovery boundary must be recovered (not
 // terminate the process) and then TOLERATED like any other chunk failure
-// (#241 item 2): the panicked slice gets a sentinel, the others are preserved,
-// and no error escapes.
+// (#241 item 2): the panicked slice is dropped, the others are preserved, and
+// no error escapes. Covers BOTH the concurrent goroutine recover and the serial
+// path's summarizeChunkRecovered wrapper.
 func TestSummarizeChunksConcurrently_PanicIsRecoveredAndTolerated(t *testing.T) {
-	withMapConcurrency(t, 2)
-	withStubMapCall(t, func(_ context.Context, chunk []map[string]interface{}, _ string) (string, int, int, error) {
-		if chunk[0]["content"].(string) == "chunk-1" {
-			panic("boom")
-		}
-		return "s", 1, 0, nil
-	})
+	for _, concurrency := range []int{1, 2} {
+		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
+			withMapConcurrency(t, concurrency)
+			withStubMapCall(t, func(_ context.Context, chunk []map[string]interface{}, _ string) (string, int, int, error) {
+				if chunk[0]["content"].(string) == "chunk-1" {
+					panic("boom")
+				}
+				return "s", 1, 0, nil
+			})
 
-	var cov chunkCoverage
-	got, err := summarizeChunksConcurrently(context.Background(), makeChunks(3), "", &cov)
-	if err != nil {
-		t.Fatalf("a recovered panic in one chunk must be tolerated, got err %v", err)
-	}
-	if len(got) != 3 {
-		t.Fatalf("want 3 slots, got %d", len(got))
-	}
-	if cov.FailedChunkCount != 1 || !strings.Contains(got[1], service.MapFailedMarker) {
-		t.Fatalf("panicked chunk 1 slot = %q, FailedChunkCount = %d; want sentinel + 1", got[1], cov.FailedChunkCount)
+			var cov chunkCoverage
+			got, err := summarizeChunksConcurrently(context.Background(), makeChunks(3), "", &cov)
+			if err != nil {
+				t.Fatalf("a recovered panic in one chunk must be tolerated, got err %v", err)
+			}
+			if len(got) != 2 || cov.FailedChunkCount != 1 {
+				t.Fatalf("want 2 kept summaries + FailedChunkCount 1, got %d summaries / %d failed", len(got), cov.FailedChunkCount)
+			}
+			for _, s := range got {
+				if strings.Contains(s, service.MapFailedMarker) {
+					t.Errorf("failure marker leaked: %q", s)
+				}
+			}
+		})
 	}
 }
 
