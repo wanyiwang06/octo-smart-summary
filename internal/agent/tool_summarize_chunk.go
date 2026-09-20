@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -616,6 +617,18 @@ type chunkMapOutcome struct {
 //     each worker must recover locally to preserve the same process-safety
 //     contract as the old serial loop.
 //
+// isFatalChunkError mirrors the worker's isFatalMapError
+// (internal/worker/personal_processor.go): an output-truncation or
+// reasoning-budget-exhaustion result is NOT a droppable transient — the model
+// could not produce a complete chunk summary — so the whole Map phase aborts
+// rather than silently omitting that slice. Keeps the agent path's tolerance
+// class aligned with the worker's.
+func isFatalChunkError(err error) bool {
+	return errors.Is(err, service.ErrOutputTruncated) ||
+		errors.Is(err, service.ErrStreamOutputTruncated) ||
+		errors.Is(err, service.ErrReasoningBudgetExhausted)
+}
+
 // summarizeChunkRecovered calls summarizeChunkFn and converts a panic below the
 // Registry.Dispatch recovery boundary into an error, so the SERIAL path turns a
 // panicking chunk into a tolerated per-chunk failure exactly like the concurrent
@@ -664,6 +677,11 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 				if ctx.Err() != nil {
 					// The RUN itself is cancelled/expired — abort; continuing is pointless.
 					return nil, fmt.Errorf("summarize chunk %d: %w", i, ctx.Err())
+				}
+				if isFatalChunkError(err) {
+					// Truncation / reasoning-budget exhaustion is fatal, not a
+					// droppable transient (mirrors worker isFatalMapError): abort.
+					return nil, fmt.Errorf("summarize chunk %d: %w", i, err)
 				}
 				// Per-chunk failure with the run still alive: drop this slice and
 				// keep the rest (#241 item 2). Gap disclosed via cov.
@@ -733,6 +751,11 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 			if ctx.Err() != nil {
 				// The RUN's context is cancelled/expired — abort the whole phase.
 				return nil, fmt.Errorf("summarize chunk %d: %w", i, ctx.Err())
+			}
+			if isFatalChunkError(o.err) {
+				// Truncation / reasoning-budget exhaustion is fatal, not a
+				// droppable transient (mirrors worker isFatalMapError): abort.
+				return nil, fmt.Errorf("summarize chunk %d: %w", i, o.err)
 			}
 			// Per-chunk failure (e.g. this chunk's own upstream timeout) with the
 			// run still alive: drop this slice, keep the rest (#241 item 2). The

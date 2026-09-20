@@ -30,12 +30,17 @@ const maxLLMErrorBodyBytes = 4096
 // structurally upstream by token-aware chunking (#241 item 3); this only stops
 // a pathological single oversized message from being sent — so it fails fast
 // with a clear error here instead of reactively as an upstream context-length
-// error. Deliberately generous: a legitimate max-context-window request
-// serializes well under this (a ~300k-token window is ~1–2 MB of text). It is a
-// request-body ceiling, independent of the per-request summary-handle text cap
-// in the agent handle store. Exported so the agent planner client (agent/llm.go)
-// shares the same threshold.
-const MaxRequestBodyBytes = 10 << 20 // 10 MiB
+// error. Exported so the agent planner client (agent/llm.go) shares it.
+//
+// Sized as 2× the agent per-request summary-handle text cap (8 MiB =
+// agent.maxSummaryHandleText). merge_summaries joins up to that much text into
+// ONE Reduce prompt, and json.Marshal HTML-escapes &<> to 6-byte \u00XX, so a
+// near-cap Reduce body serializes above the raw 8 MiB. Keeping the guard at 2×
+// that cap leaves room for realistic escaping + the messages/prompt framing, so
+// a LEGITIMATE max-size Reduce never false-trips REQUEST_TOO_LARGE — which, on
+// the critical merge_summaries tool, would discard a fully successful Map phase
+// — while still catching a genuinely oversized single message.
+const MaxRequestBodyBytes = 16 << 20 // 16 MiB (2× agent.maxSummaryHandleText)
 
 // ErrRequestTooLarge marks a request rejected before sending because its
 // serialized body exceeds MaxRequestBodyBytes. It is terminal — retrying or
