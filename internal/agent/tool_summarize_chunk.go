@@ -24,7 +24,12 @@ import (
 // 历史 bug：chunk_size 默认 500，但 formatChunkForLLM 每片只格式化前 200 条，
 // 满片时静默丢弃 300/500（60%）。SS-01 先把默认值与硬上限收敛到 200 止血；
 // SS-06b 随后引入 token-aware 分片并删除了 200 格式化上限，分片改由 token 预算
-// （按渲染行计费）+ hardMessageBackstop 双重约束，覆盖恒为 100%。
+// （按渲染行计费）+ hardMessageBackstop 双重约束。
+//
+// #241 item 2 之后覆盖不再恒为 100%：单块 LLM 调用失败会被容忍并从 reduce 输入
+// 剔除，且扇出超过 maxChunkCalls 时截断最旧的分片——两种缺口都经 cov
+// （failed_chunk_count / chunk_calls_capped / dropped_count / truncated）披露，
+// 并在合并文本里追加一条 mapCoverageGapNotice，使缺口在 V2 关闭时也对用户可见。
 const (
 	// defaultChunkSize 是 chunk_size 缺省（<=0）时使用的每片消息数基准，
 	// 与 SS-01 止血值一致。
@@ -39,10 +44,20 @@ const (
 	// may fan out (#241 item 2). Chunk COUNT was previously unbounded — with
 	// MaxSafetyLimit=100000 messages upstream a single call could dispatch
 	// hundreds of LLM requests with no wall-clock or cost bound. Beyond this the
-	// input is pathological; reject with an actionable error rather than silently
-	// truncating (which would drop data) or spending unbounded tokens.
+	// input splits are TRUNCATED to the most recent maxChunkCalls (not rejected:
+	// a rejection latches the run FAILED with no planner recovery), and the drop
+	// is disclosed via cov.ChunkCallsCapped + the inline mapCoverageGapNotice.
 	maxChunkCalls = 256
 )
+
+// mapCoverageGapNotice is appended to the combined Map output when some chunks
+// were dropped (a tolerated per-chunk failure, or the maxChunkCalls truncation),
+// so the gap is disclosed IN the summary text — independent of the V2 run-row
+// disclosure (recordDroppedMessages → finishgate PARTIAL), which ships dark by
+// default, meaning the combined text alone would otherwise read complete
+// (#256 P1). merge_summaries treats it as ordinary text; the reduce prompt
+// (prompts/summary.md) lists the coverage fields the planner must act on.
+const mapCoverageGapNotice = "\n\n---\n\n（注意：部分聊天内容未能纳入本次总结，结果可能不完整。）"
 
 // chunkCoverage 汇总 summarize_chunk 实际喂给模型的消息覆盖情况，随工具结果
 // 返回，让 Runner/Planner 能判断是否发生丢弃或截断，而不是只看到 chunk_count。
@@ -52,6 +67,7 @@ type chunkCoverage struct {
 	DroppedCount          int  `json:"dropped_count"`
 	OversizedMessageCount int  `json:"oversized_message_count"`
 	FailedChunkCount      int  `json:"failed_chunk_count"`
+	ChunkCallsCapped      bool `json:"chunk_calls_capped"`
 	Truncated             bool `json:"truncated"`
 	ChunkSize             int  `json:"chunk_size"`
 }
@@ -246,7 +262,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 					},
 					"chunk_size": map[string]interface{}{
 						"type":        "integer",
-						"description": fmt.Sprintf("可选：每片最大消息数（叠加在 token 预算之上，取值收敛到 [1, %d]，<=0 按 %d）；分片同时受 token 预算与消息数双重约束。返回值含 input_count/processed_count/dropped_count/oversized_message_count/failed_chunk_count/truncated/chunk_size。", hardMessageBackstop, defaultChunkSize),
+						"description": fmt.Sprintf("可选：每片最大消息数（叠加在 token 预算之上，取值收敛到 [1, %d]，<=0 按 %d）；分片同时受 token 预算与消息数双重约束，且单次调用最多 %d 个分片，超出时保留最近的分片、丢弃更早的（chunk_calls_capped=true）。返回值含 input_count/processed_count/dropped_count/oversized_message_count/failed_chunk_count/chunk_calls_capped/truncated/chunk_size；truncated 或 failed_chunk_count>0 或 chunk_calls_capped 时表示覆盖不完整。", hardMessageBackstop, defaultChunkSize, maxChunkCalls),
 					},
 				},
 				"required": []string{"messages_handle"},
@@ -379,22 +395,16 @@ func SummarizeChunkTool() (Tool, Handler) {
 		chunks := splitMsgMapsByTokenBudget(msgMaps, budget, msgsPerChunk, cfg.ResolveCharsPerTokenCJK(), cfg.CharsPerTokenASCII)
 
 		// Bound the LLM-call fan-out (#241 item 2). Beyond maxChunkCalls, TRUNCATE
-		// to the first maxChunkCalls chunks rather than rejecting the whole call:
-		// a rejection is a critical-tool error that latches the run FAILED, and the
-		// planner cannot shrink a static input to recover, so it strands the run.
-		// Truncation still bounds the calls, yields a partial deliverable, and the
-		// dropped tail is disclosed via the coverage counters below
-		// (DroppedCount/Truncated → recordDroppedMessages → PARTIAL).
-		if len(chunks) > maxChunkCalls {
-			log.Printf("[summarize_chunk] input split into %d chunks > limit %d; truncating to the first %d and disclosing the dropped tail (#241)",
-				len(chunks), maxChunkCalls, maxChunkCalls)
-			chunks = chunks[:maxChunkCalls]
+		// rather than rejecting the whole call (a rejection is a critical-tool
+		// error that latches the run FAILED with no planner recovery). capChunks
+		// keeps the MOST RECENT chunks (see its doc); the drop is disclosed below.
+		chunks, capped := capChunks(chunks)
+		if capped {
+			log.Printf("[summarize_chunk] fan-out capped at %d chunks; kept the most recent, dropped the older tail, disclosed via chunk_calls_capped (#241)", maxChunkCalls)
 		}
 
-		// Summarize each chunk and aggregate honest coverage counts. Token
-		// chunking + no format cap means processed == input, so dropped_count is
-		// 0; the counters stay truthful if a future change reintroduces a cap.
-		cov := chunkCoverage{InputCount: inputCount, ChunkSize: msgsPerChunk}
+		// Summarize each chunk and aggregate honest coverage counts.
+		cov := chunkCoverage{InputCount: inputCount, ChunkSize: msgsPerChunk, ChunkCallsCapped: capped}
 		// SS-06: load the run's SummarySpec-derived guidance once so every Map
 		// call summarizes toward the user's actual requirements. Empty when V2 is
 		// off / no run / no spec → legacy generic prompt.
@@ -414,7 +424,17 @@ func SummarizeChunkTool() (Tool, Handler) {
 		recordDroppedMessages(ctx, uid, runID, cov.DroppedCount)
 
 		combinedSummary := strings.Join(summaries, "\n\n---\n\n")
-		return marshalSummarizeChunkResult(ctx, combinedSummary, len(chunks), cov)
+		// V2-independent disclosure (#256 P1): the run-row disclosure above
+		// (recordDroppedMessages → finishgate PARTIAL) is inert when V2 ships
+		// dark, so a dropped chunk (failed or capped) would otherwise yield a
+		// summary that reads complete. Append an inline notice that reaches the
+		// user regardless of the flag.
+		if cov.FailedChunkCount > 0 || capped {
+			combinedSummary += mapCoverageGapNotice
+		}
+		// chunk_count reports the summaries actually stored (successful chunks),
+		// not attempted, so it does not over-report by FailedChunkCount.
+		return marshalSummarizeChunkResult(ctx, combinedSummary, len(summaries), cov)
 	}
 
 	return schema, handler
@@ -428,6 +448,7 @@ type summarizeChunkToolResult struct {
 	DroppedCount          int    `json:"dropped_count"`
 	OversizedMessageCount int    `json:"oversized_message_count"`
 	FailedChunkCount      int    `json:"failed_chunk_count"`
+	ChunkCallsCapped      bool   `json:"chunk_calls_capped"`
 	Truncated             bool   `json:"truncated"`
 	ChunkSize             int    `json:"chunk_size"`
 }
@@ -449,6 +470,7 @@ func marshalSummarizeChunkResult(ctx context.Context, summary string, chunkCount
 		DroppedCount:          cov.DroppedCount,
 		OversizedMessageCount: cov.OversizedMessageCount,
 		FailedChunkCount:      cov.FailedChunkCount,
+		ChunkCallsCapped:      cov.ChunkCallsCapped,
 		Truncated:             cov.Truncated,
 		ChunkSize:             cov.ChunkSize,
 	})
@@ -617,6 +639,19 @@ type chunkMapOutcome struct {
 //     each worker must recover locally to preserve the same process-safety
 //     contract as the old serial loop.
 //
+// capChunks bounds the summarize_chunk fan-out to maxChunkCalls, keeping the
+// MOST RECENT chunks (the tail): the message pool is ascending by timestamp and
+// the splitter preserves order, so the newest conversation — usually where the
+// current decisions / action items live — is retained and the OLDER tail is
+// dropped. Returns capped=true when truncation occurred so the caller discloses
+// it (cov.ChunkCallsCapped + mapCoverageGapNotice). Pure + testable (#256 P2).
+func capChunks(chunks [][]map[string]interface{}) (kept [][]map[string]interface{}, capped bool) {
+	if len(chunks) <= maxChunkCalls {
+		return chunks, false
+	}
+	return chunks[len(chunks)-maxChunkCalls:], true
+}
+
 // isFatalChunkError mirrors the worker's isFatalMapError
 // (internal/worker/personal_processor.go): an output-truncation or
 // reasoning-budget-exhaustion result is NOT a droppable transient — the model

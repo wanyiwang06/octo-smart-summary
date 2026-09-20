@@ -342,3 +342,31 @@ func TestSummarizeChunksConcurrently_FatalChunkErrorAborts(t *testing.T) {
 		})
 	}
 }
+
+// TestCapChunks pins the #241 fan-out bound: at or under the cap nothing is
+// dropped; over it, the MOST RECENT maxChunkCalls chunks are kept (newest
+// conversation) and capped is reported so the caller can disclose the gap.
+func TestCapChunks(t *testing.T) {
+	t.Run("under cap: unchanged", func(t *testing.T) {
+		in := makeChunks(maxChunkCalls)
+		got, capped := capChunks(in)
+		if capped || len(got) != maxChunkCalls {
+			t.Fatalf("got capped=%v len=%d, want false / %d", capped, len(got), maxChunkCalls)
+		}
+	})
+	t.Run("over cap: keeps the most recent, reports capped", func(t *testing.T) {
+		in := makeChunks(maxChunkCalls + 5)
+		got, capped := capChunks(in)
+		if !capped {
+			t.Fatal("capped = false, want true")
+		}
+		if len(got) != maxChunkCalls {
+			t.Fatalf("len = %d, want %d", len(got), maxChunkCalls)
+		}
+		// makeChunks tags content "chunk-<i>"; the kept slice must start at the
+		// 5th chunk (oldest dropped), proving the newest tail is retained.
+		if first := got[0][0]["content"].(string); first != fmt.Sprintf("chunk-%d", 5) {
+			t.Fatalf("kept slice starts at %q, want chunk-5 (older tail dropped)", first)
+		}
+	})
+}
