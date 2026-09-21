@@ -370,3 +370,37 @@ func TestCapChunks(t *testing.T) {
 		}
 	})
 }
+
+// TestAssembleMapOutput pins the #256 P1-R4 empty-Map guard + the disclosure
+// contract on the production assembly path: real content + a drop appends the
+// notice; all-blank output errors (recoverable) instead of shipping a
+// notice-only body; a clean full-coverage run gets no notice.
+func TestAssembleMapOutput(t *testing.T) {
+	t.Run("drop with real content: notice appended", func(t *testing.T) {
+		out, err := assembleMapOutput([]string{"real summary"}, 1, false, 2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(out, "real summary") || !strings.Contains(out, mapCoverageGapNotice) {
+			t.Fatalf("want content + gap notice, got %q", out)
+		}
+	})
+	t.Run("capped with real content: notice appended", func(t *testing.T) {
+		out, err := assembleMapOutput([]string{"s"}, 0, true, 300)
+		if err != nil || !strings.Contains(out, mapCoverageGapNotice) {
+			t.Fatalf("want notice on cap, got %q err %v", out, err)
+		}
+	})
+	t.Run("all-blank output errors (no notice-only body ships)", func(t *testing.T) {
+		out, err := assembleMapOutput([]string{"", "  "}, 1, false, 3)
+		if err == nil {
+			t.Fatalf("want a no-usable-Map error, got %q", out)
+		}
+	})
+	t.Run("full coverage: no notice", func(t *testing.T) {
+		out, err := assembleMapOutput([]string{"a", "b"}, 0, false, 2)
+		if err != nil || strings.Contains(out, mapCoverageGapNotice) {
+			t.Fatalf("clean run must not carry a gap notice, got %q err %v", out, err)
+		}
+	})
+}

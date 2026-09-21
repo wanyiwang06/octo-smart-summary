@@ -423,14 +423,9 @@ func SummarizeChunkTool() (Tool, Handler) {
 		cov.Truncated = cov.DroppedCount > 0
 		recordDroppedMessages(ctx, uid, runID, cov.DroppedCount)
 
-		combinedSummary := strings.Join(summaries, "\n\n---\n\n")
-		// V2-independent disclosure (#256 P1): the run-row disclosure above
-		// (recordDroppedMessages → finishgate PARTIAL) is inert when V2 ships
-		// dark, so a dropped chunk (failed or capped) would otherwise yield a
-		// summary that reads complete. Append an inline notice that reaches the
-		// user regardless of the flag.
-		if cov.FailedChunkCount > 0 || capped {
-			combinedSummary += mapCoverageGapNotice
+		combinedSummary, err := assembleMapOutput(summaries, cov.FailedChunkCount, capped, len(chunks))
+		if err != nil {
+			return "", err
 		}
 		// chunk_count reports the summaries actually stored (successful chunks),
 		// not attempted, so it does not over-report by FailedChunkCount.
@@ -639,6 +634,36 @@ type chunkMapOutcome struct {
 //     each worker must recover locally to preserve the same process-safety
 //     contract as the old serial loop.
 //
+// assembleMapOutput joins the successful chunk summaries and, when coverage was
+// incomplete (a dropped/capped chunk), appends the V2-independent gap notice —
+// but ONLY when there is real content to ship. Empty joined output (every kept
+// summary blank — e.g. a chunk whose upstream returned empty content as a
+// non-error "success" alongside a tolerated failure) is a no-usable-Map result,
+// returned as an error so classifyToolError makes it fatal-and-retryable and the
+// planner can recover, rather than shipping a "summary" whose entire body is the
+// notice (which would slip past the handle store's empty guard and reduce into a
+// vacuous deliverable — #256 P1-R4). Pure + testable (#256 P2).
+func assembleMapOutput(summaries []string, failedChunks int, capped bool, totalChunks int) (string, error) {
+	// Emptiness must be judged on the SUMMARIES, not the joined string: the
+	// "\n\n---\n\n" separator is itself non-whitespace, so a TrimSpace on the
+	// join would never see an all-blank set as empty.
+	hasContent := false
+	for _, s := range summaries {
+		if strings.TrimSpace(s) != "" {
+			hasContent = true
+			break
+		}
+	}
+	if !hasContent {
+		return "", fmt.Errorf("summarize_chunk: no usable Map output (%d/%d chunks failed)", failedChunks, totalChunks)
+	}
+	combined := strings.Join(summaries, "\n\n---\n\n")
+	if failedChunks > 0 || capped {
+		combined += mapCoverageGapNotice
+	}
+	return combined, nil
+}
+
 // capChunks bounds the summarize_chunk fan-out to maxChunkCalls, keeping the
 // MOST RECENT chunks (the tail): the message pool is ascending by timestamp and
 // the splitter preserves order, so the newest conversation — usually where the
