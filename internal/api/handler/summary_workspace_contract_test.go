@@ -109,7 +109,7 @@ func TestSummaryWorkspaceCapabilitiesAdvertisesTimeRangeLimit(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode capabilities: %v", err)
 	}
-	if !payload.Data.Enabled || payload.Data.ContractVersion != summaryWorkspaceContractVersion {
+	if !payload.Data.Enabled || payload.Data.ContractVersion != summaryWorkspaceCapabilitiesContractVersion {
 		t.Fatalf("unexpected capabilities: %#v", payload.Data)
 	}
 	if payload.Data.MaxTimeRangeDays != 90 {
