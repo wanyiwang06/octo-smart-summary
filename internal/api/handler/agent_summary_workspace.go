@@ -196,6 +196,10 @@ func (h *AgentChatHandler) summaryWorkspaceEntryAvailable() bool {
 	return h.summaryWorkspaceConfigured() && h.workspaceEntryEnabled
 }
 
+func (h *AgentChatHandler) documentSourcesAvailable() bool {
+	return h != nil && h.documentClient != nil
+}
+
 // SummaryWorkspaceCapabilities is intentionally unactionable metadata. It lets
 // the frontend gate the new entry before creating a session or sending a turn.
 func (h *AgentChatHandler) SummaryWorkspaceCapabilities(c *gin.Context) {
@@ -205,6 +209,7 @@ func (h *AgentChatHandler) SummaryWorkspaceCapabilities(c *gin.Context) {
 		"contract_version":     summaryWorkspaceContractVersion,
 		"max_time_range_days":  pipeline.MaxTimeRangeDays,
 		"direct_team_workflow": enabled,
+		"document_sources":     h.documentSourcesAvailable(),
 	}})
 }
 

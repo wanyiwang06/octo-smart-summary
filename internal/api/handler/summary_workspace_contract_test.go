@@ -16,6 +16,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+type capabilityDocumentSourceClient struct{}
+
+func (*capabilityDocumentSourceClient) FetchSummarySource(context.Context, string, string, string, string, http.Header) (*documentSummarySource, error) {
+	return nil, nil
+}
+
 func TestSummaryWorkspaceHistoryPreservesEveryPreview(t *testing.T) {
 	scopeJSON, _, err := marshalSummaryWorkspaceContext(emptySummaryWorkspaceContext())
 	if err != nil {
@@ -83,6 +89,7 @@ func TestSummaryWorkspaceCapabilitiesAdvertisesTimeRangeLimit(t *testing.T) {
 	handler := &AgentChatHandler{
 		workspaceEntryEnabled: true,
 		workspace:             &summaryWorkspaceCoordinator{store: &AgentWorkspaceStore{}},
+		documentClient:        &capabilityDocumentSourceClient{},
 	}
 
 	handler.SummaryWorkspaceCapabilities(context)
@@ -96,6 +103,7 @@ func TestSummaryWorkspaceCapabilitiesAdvertisesTimeRangeLimit(t *testing.T) {
 			ContractVersion    string `json:"contract_version"`
 			MaxTimeRangeDays   int    `json:"max_time_range_days"`
 			DirectTeamWorkflow bool   `json:"direct_team_workflow"`
+			DocumentSources    bool   `json:"document_sources"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
@@ -110,6 +118,9 @@ func TestSummaryWorkspaceCapabilitiesAdvertisesTimeRangeLimit(t *testing.T) {
 	if !payload.Data.DirectTeamWorkflow {
 		t.Fatal("direct_team_workflow = false, want true")
 	}
+	if !payload.Data.DocumentSources {
+		t.Fatal("document_sources = false, want true")
+	}
 }
 
 func TestSummaryWorkspaceCapabilitiesFailsClosedWhenRolloutDisabled(t *testing.T) {
@@ -117,7 +128,8 @@ func TestSummaryWorkspaceCapabilitiesFailsClosedWhenRolloutDisabled(t *testing.T
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
 	handler := &AgentChatHandler{
-		workspace: &summaryWorkspaceCoordinator{store: &AgentWorkspaceStore{}},
+		workspace:      &summaryWorkspaceCoordinator{store: &AgentWorkspaceStore{}},
+		documentClient: &capabilityDocumentSourceClient{},
 	}
 
 	handler.SummaryWorkspaceCapabilities(context)
@@ -129,6 +141,7 @@ func TestSummaryWorkspaceCapabilitiesFailsClosedWhenRolloutDisabled(t *testing.T
 		Data struct {
 			Enabled            bool `json:"enabled"`
 			DirectTeamWorkflow bool `json:"direct_team_workflow"`
+			DocumentSources    bool `json:"document_sources"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
@@ -137,8 +150,35 @@ func TestSummaryWorkspaceCapabilitiesFailsClosedWhenRolloutDisabled(t *testing.T
 	if payload.Data.Enabled || payload.Data.DirectTeamWorkflow {
 		t.Fatalf("disabled rollout advertised enabled capabilities: %#v", payload.Data)
 	}
+	if !payload.Data.DocumentSources {
+		t.Fatal("document_sources must remain independent from the workbench rollout")
+	}
 	if !handler.summaryWorkspaceConfigured() {
 		t.Fatal("disabled rollout should keep dependencies configured for later enablement")
+	}
+}
+
+func TestSummaryWorkspaceCapabilitiesDisablesDocumentSourcesWhenUnconfigured(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	handler := &AgentChatHandler{
+		workspaceEntryEnabled: true,
+		workspace:             &summaryWorkspaceCoordinator{store: &AgentWorkspaceStore{}},
+	}
+
+	handler.SummaryWorkspaceCapabilities(context)
+
+	var payload struct {
+		Data struct {
+			DocumentSources bool `json:"document_sources"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode capabilities: %v", err)
+	}
+	if payload.Data.DocumentSources {
+		t.Fatal("document_sources = true without a configured document source client")
 	}
 }
 
