@@ -3,6 +3,18 @@
 The summary workbench is available when `GET /summary-workbench/capabilities`
 returns `enabled: true` and `contract_version: "2"`.
 
+## Capabilities
+
+- `document_sources: true` means the Summary service has a usable document-source
+  API client configured for by-reference document summaries. It is independent
+  from `enabled`, which controls the Workbench entry, and it is not a per-space
+  permission or upstream health check.
+- `document_sources` is an additive v2 field. Older clients may ignore it, and
+  newer clients must treat an absent field from an older server as `false`.
+- Deploy the backend that emits the field before clients that use it. Keeping the
+  endpoint on contract v2 lets existing clients continue to use the Workbench
+  throughout that rollout.
+
 ## Direct team workflow
 
 - `direct_team_workflow: true` means the client may send

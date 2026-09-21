@@ -15,9 +15,8 @@ import (
 )
 
 const (
-	summaryWorkspaceContractVersion             = "2"
-	summaryWorkspaceCapabilitiesContractVersion = "3"
-	summaryWorkspaceProfile                     = "summary_workspace"
+	summaryWorkspaceContractVersion = "2"
+	summaryWorkspaceProfile         = "summary_workspace"
 
 	workspaceResultClarification        = agent.SummaryResultClarification
 	workspaceResultExplanation          = agent.SummaryResultExplanation

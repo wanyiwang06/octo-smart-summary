@@ -12,6 +12,23 @@ import (
 	"unicode/utf8"
 )
 
+func TestNewDefaultDocumentSourceClientRejectsUnusableURLs(t *testing.T) {
+	for name, baseURL := range map[string]string{
+		"empty":          "",
+		"slash":          "/",
+		"double-slash":   "//",
+		"missing-scheme": "document-service",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("DOCUMENT_SUMMARY_SOURCE_API_URL", baseURL)
+			t.Setenv("DOCUMENT_SOURCE_API_URL", "")
+			if client := newDefaultDocumentSourceClient(); client != nil {
+				t.Fatalf("newDefaultDocumentSourceClient() = %T, want nil for %q", client, baseURL)
+			}
+		})
+	}
+}
+
 func TestNormalizeFetchedDocumentSource_ContentAndChunkCaps(t *testing.T) {
 	doc := &documentSummarySource{
 		Content: strings.Repeat("字", maxDocumentPromptRunes+500),

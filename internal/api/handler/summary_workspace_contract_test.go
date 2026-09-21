@@ -109,7 +109,7 @@ func TestSummaryWorkspaceCapabilitiesAdvertisesTimeRangeLimit(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode capabilities: %v", err)
 	}
-	if !payload.Data.Enabled || payload.Data.ContractVersion != summaryWorkspaceCapabilitiesContractVersion {
+	if !payload.Data.Enabled || payload.Data.ContractVersion != "2" {
 		t.Fatalf("unexpected capabilities: %#v", payload.Data)
 	}
 	if payload.Data.MaxTimeRangeDays != 90 {
@@ -123,7 +123,7 @@ func TestSummaryWorkspaceCapabilitiesAdvertisesTimeRangeLimit(t *testing.T) {
 	}
 }
 
-func TestSummaryWorkspaceCapabilitiesFailsClosedWhenRolloutDisabled(t *testing.T) {
+func TestSummaryWorkspaceCapabilitiesKeepsDocumentSourcesIndependentWhenRolloutDisabled(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
@@ -160,11 +160,14 @@ func TestSummaryWorkspaceCapabilitiesFailsClosedWhenRolloutDisabled(t *testing.T
 
 func TestSummaryWorkspaceCapabilitiesDisablesDocumentSourcesWhenUnconfigured(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	t.Setenv("DOCUMENT_SUMMARY_SOURCE_API_URL", "")
+	t.Setenv("DOCUMENT_SOURCE_API_URL", "")
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
 	handler := &AgentChatHandler{
 		workspaceEntryEnabled: true,
 		workspace:             &summaryWorkspaceCoordinator{store: &AgentWorkspaceStore{}},
+		documentClient:        newDefaultDocumentSourceClient(),
 	}
 
 	handler.SummaryWorkspaceCapabilities(context)

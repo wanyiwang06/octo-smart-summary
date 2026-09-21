@@ -206,7 +206,7 @@ func (h *AgentChatHandler) SummaryWorkspaceCapabilities(c *gin.Context) {
 	enabled := h.summaryWorkspaceEntryAvailable()
 	c.JSON(http.StatusOK, apiResponse{Code: 0, Message: "ok", Data: gin.H{
 		"enabled":              enabled,
-		"contract_version":     summaryWorkspaceCapabilitiesContractVersion,
+		"contract_version":     summaryWorkspaceContractVersion,
 		"max_time_range_days":  pipeline.MaxTimeRangeDays,
 		"direct_team_workflow": enabled,
 		"document_sources":     h.documentSourcesAvailable(),

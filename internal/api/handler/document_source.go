@@ -119,11 +119,16 @@ func newDefaultDocumentSourceClient() documentSourceClient {
 	if base == "" {
 		base = strings.TrimSpace(os.Getenv("DOCUMENT_SOURCE_API_URL"))
 	}
+	base = strings.TrimRight(base, "/")
 	if base == "" {
 		return nil
 	}
+	parsed, err := url.Parse(base)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return nil
+	}
 	return &httpDocumentSourceClient{
-		baseURL: strings.TrimRight(base, "/"),
+		baseURL: base,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
