@@ -7,17 +7,17 @@ import (
 )
 
 const documentSectionNumber = `[0-9]+(?:[ \t]*\.[ \t]*[0-9]+)*(?:[ \t]*[-–—][ \t]*[0-9]+)?`
-const documentLabeledSection = `(?:§[ \t]*` + documentSectionNumber + `|第[ \t]*` + documentSectionNumber + `[ \t]*(?:章|节|条|款))`
-const documentDecimalSection = `[0-9]+[ \t]*\.[ \t]*[0-9]+(?:[ \t]*\.[ \t]*[0-9]+)*(?:[ \t]*[-–—][ \t]*[0-9]+)?`
+const documentLabeledSection = `(?:§[ \t]*` + documentSectionNumber + `|第[ \t]*` + documentSectionNumber + `[ \t]*(?:章|节|節|条|條|款))`
 
 var documentBracketCandidate = regexp.MustCompile(`\[[^\]\n]{1,256}\]`)
 var documentLeadingIndex = regexp.MustCompile(`^([0-9]{1,5})(.*)$`)
-var documentDottedSectionTail = regexp.MustCompile(`^[ \t]*\.[ \t]*` + documentSectionNumber + `(?:[ \t]*[,，][ \t]*` + documentSectionNumber + `)*[ \t]*$`)
-var documentCommaSectionTail = regexp.MustCompile(`^[ \t]*[,，][ \t]*(?:` + documentLabeledSection + `|` + documentDecimalSection + `)(?:[ \t]*[,，][ \t]*(?:` + documentLabeledSection + `|` + documentDecimalSection + `))*[ \t]*$`)
+var documentLabeledSectionTail = regexp.MustCompile(`^[ \t]*[,，][ \t]*` + documentLabeledSection + `(?:[ \t]*[,，][ \t]*` + documentLabeledSection + `)*[ \t]*$`)
 
 // NormalizeDocumentSectionMarkers collapses document-section pseudo-citations
 // invented by a model to the source ordinal the product can actually resolve.
-// Examples: [4.14.1], [3, §14.4], and [3, 第14节] all become [4]/[3].
+// Examples: [3, §14.4] and [3, 第14节] become [3]. Bare dotted
+// brackets such as [3.14.1] are intentionally preserved because they are
+// indistinguishable from legitimate versions, decimal ranges, and IP addresses.
 //
 // This is deliberately document-only. Chat summaries and generic Markdown may
 // legitimately contain bracketed dotted numbers, while document generation has
@@ -36,19 +36,20 @@ func NormalizeDocumentSectionMarkers(content string, valid func(int) bool) strin
 		}
 		body := strings.TrimSpace(content[start+1 : end-1])
 		match := documentLeadingIndex.FindStringSubmatch(body)
-		if match == nil || (!documentDottedSectionTail.MatchString(match[2]) && !documentCommaSectionTail.MatchString(match[2])) {
+		if match == nil || !documentLabeledSectionTail.MatchString(match[2]) {
 			continue
 		}
 		index, err := strconv.Atoi(match[1])
 		if err != nil {
 			continue
 		}
-		b.WriteString(content[offset:start])
-		if valid != nil && valid(index) {
-			b.WriteByte('[')
-			b.WriteString(strconv.Itoa(index))
-			b.WriteByte(']')
+		if valid == nil || !valid(index) {
+			continue
 		}
+		b.WriteString(content[offset:start])
+		b.WriteByte('[')
+		b.WriteString(strconv.Itoa(index))
+		b.WriteByte(']')
 		offset = end
 		changed = true
 	}

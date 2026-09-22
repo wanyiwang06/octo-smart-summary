@@ -18,6 +18,12 @@ func TestNewDefaultDocumentSourceClientRejectsUnusableURLs(t *testing.T) {
 		"slash":          "/",
 		"double-slash":   "//",
 		"missing-scheme": "document-service",
+		"missing-host":   "https://",
+		"bare-port":      "http://:8080",
+		"unsupported":    "ftp://documents.example.test",
+		"query":          "https://documents.example.test/base?tenant=x",
+		"force-query":    "https://documents.example.test/base?",
+		"fragment":       "https://documents.example.test/base#section",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("DOCUMENT_SUMMARY_SOURCE_API_URL", baseURL)

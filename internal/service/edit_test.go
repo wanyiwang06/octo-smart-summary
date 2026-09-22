@@ -27,6 +27,23 @@ func TestNormalizeGeneratedCitations(t *testing.T) {
 	}
 }
 
+func TestNormalizeGeneratedCitations_DocumentSectionsOnly(t *testing.T) {
+	citations := []model.Citation{{Index: 1, DocumentID: "doc-1"}, {Index: 3, DocumentID: "doc-3"}}
+	content := "章节 [3, §14.4]，版本 [3.14.1]，金额 [1,234.5] 万元。"
+	got, err := NormalizeGeneratedCitations(content, citations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "章节 [3]，版本 [3.14.1]，金额 [1,234.5] 万元。"; got != want {
+		t.Fatalf("got %q; want %q", got, want)
+	}
+
+	chatCitations := []model.Citation{{Index: 3}}
+	if got, err := NormalizeGeneratedCitations("聊天正文 [3, §14.4]。", chatCitations); err != nil || got != "聊天正文 [3, §14.4]。" {
+		t.Fatalf("chat content changed: %q %v", got, err)
+	}
+}
+
 func TestCleanUnreferencedCitations_KeepsReferenced(t *testing.T) {
 	content := "This is a summary with [1] and [3] references."
 	citations := []model.Citation{

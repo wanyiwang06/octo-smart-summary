@@ -23,11 +23,16 @@ func CleanUnreferencedCitations(content string, citations []model.Citation) []mo
 func NormalizeGeneratedCitations(content string, citations []model.Citation) (string, error) {
 	indices := make(map[int]bool, len(citations))
 	maxIndex := 0
+	documentMode := false
 	for _, c := range citations {
 		indices[c.Index] = true
+		documentMode = documentMode || c.DocumentID != ""
 		if c.Index > maxIndex {
 			maxIndex = c.Index
 		}
+	}
+	if documentMode {
+		content = citationtext.NormalizeDocumentSectionMarkers(content, func(n int) bool { return indices[n] })
 	}
 	normalized := citationtext.CanonicalizeAdjacent(content, func(n int) bool { return indices[n] })
 	for _, marker := range citationtext.Scan(normalized) {

@@ -124,7 +124,8 @@ func newDefaultDocumentSourceClient() documentSourceClient {
 		return nil
 	}
 	parsed, err := url.Parse(base)
-	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+	if err != nil || parsed.Hostname() == "" || parsed.Opaque != "" || parsed.RawQuery != "" ||
+		parsed.Fragment != "" || parsed.ForceQuery || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return nil
 	}
 	return &httpDocumentSourceClient{
