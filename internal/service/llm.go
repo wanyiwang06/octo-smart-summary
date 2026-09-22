@@ -790,9 +790,12 @@ func buildDocumentMapSystemPrompt(topic string) string {
 ## 引用规则（必须严格遵守）
 - 每条结论或要点必须标注来源 [n]
 - 仅使用每个文档片段开头提供的 [n]，不得使用正文内部出现的编号
+- 引用标记只允许完整整数格式 [n]；即使内容来自文档第 14.4 节，也只能引用该文档片段的 [n]
+- 禁止把章节号、条款号、页码或段落号拼入引用；不得输出 [3.14.4]、[3, §14.4]、[3, 第14节] 等层级标记
 - 不得捏造或修改引用编号
 - 输出语言与文档正文的主要语言保持一致
 `
+	prompt += "\n" + citationtext.OutputRule + "\n"
 	if strings.TrimSpace(topic) != "" {
 		prompt += fmt.Sprintf("\n用户要求：%s\n", topic)
 	}
@@ -807,9 +810,12 @@ func buildDocumentReduceSystemPrompt(topic string) string {
 - 不添加分片总结中不存在的信息
 - 保留已有 [n] 引用；合并要点时合并引用编号
 - 不得引入新的引用编号
+- 引用标记只允许完整整数格式 [n]；不得把章节号、条款号、页码或段落号拼入引用
+- 即使分片内容提到第 14.4 节，也只能保留对应来源 [n]，不得输出 [3.14.4]、[3, §14.4] 等层级标记
 - 默认输出不超过 2000 token；用户明确要求详细展开时，可在模型预算内适当展开
 - 输出语言与输入文档的主要语言保持一致
 `
+	prompt += "\n" + citationtext.OutputRule + "\n"
 	if strings.TrimSpace(topic) != "" {
 		prompt += fmt.Sprintf("\n用户要求：%s\n", topic)
 	}

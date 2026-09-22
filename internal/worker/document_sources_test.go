@@ -154,7 +154,7 @@ func TestExecutePersonalPipelineUsesDocumentSnapshotsAndKeepsCoordinates(t *test
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"结论一 [1]，结论二 [2]"}}],"usage":{"total_tokens":12}}`)
+		_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"结论一 [1, §14.4]，结论二 [2.18–19]"}}],"usage":{"total_tokens":12}}`)
 		_, _ = fmt.Fprintln(w, "data: [DONE]")
 	}))
 	defer server.Close()

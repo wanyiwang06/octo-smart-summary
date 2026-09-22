@@ -1357,6 +1357,13 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	for _, message := range userMessages {
 		indices[message.CitationIndex] = true
 	}
+	if documentMode {
+		// Documents commonly contain their own numbered headings. Models sometimes
+		// combine the real source ordinal with those headings ([3, §14.4],
+		// [4.14.1]), creating a precision the citation contract cannot resolve.
+		// Collapse only these document-specific shapes before building metadata.
+		finalContent = citationtext.NormalizeDocumentSectionMarkers(finalContent, func(n int) bool { return indices[n] })
+	}
 	// Normalize compound citation groups the model may have emitted despite the
 	// single-marker OutputRule, but never rewrite ordinary bracketed-number prose
 	// and never abort the whole summary on a group the normalizer cannot resolve.
