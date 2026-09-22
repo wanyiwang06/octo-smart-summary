@@ -103,6 +103,12 @@ func ProbeChunkCoverage(msgMaps []map[string]interface{}, requestedChunkSize, bu
 	}
 	size := clampChunkSize(requestedChunkSize)
 	chunked := splitMsgMapsByTokenBudget(msgMaps, budget, size, cjkRatio, asciiRatio)
+	// The fan-out cap (#241) is part of the SHIPPED chunking chain, so the probe
+	// must apply it too — otherwise the SS-02 no-silent-loss gate would report
+	// dropped=0 while production discards the capped-out tail. capChunks keeps the
+	// kept chunks; the dropped tail's messages simply never get counted into
+	// processed, so dropped = len(msgMaps) - processed reflects them.
+	chunked, _ = capChunks(chunked)
 	for _, c := range chunked {
 		_, p, _ := formatChunkForLLM(c)
 		processed += p
@@ -421,12 +427,16 @@ func SummarizeChunkTool() (Tool, Handler) {
 			time.Since(mapStart).Milliseconds())
 		cov.DroppedCount = cov.InputCount - cov.ProcessedCount
 		cov.Truncated = cov.DroppedCount > 0
-		recordDroppedMessages(ctx, uid, runID, cov.DroppedCount)
 
 		combinedSummary, err := assembleMapOutput(summaries, cov.FailedChunkCount, capped, len(chunks))
 		if err != nil {
 			return "", err
 		}
+		// Persist the dropped-message count only once we have a usable Map output
+		// to return. recordDroppedMessages does `dropped_messages = dropped_messages
+		// + ?`, so recording it before the error return above would double-count on
+		// every retry of an all-blank Map (#256 P2).
+		recordDroppedMessages(ctx, uid, runID, cov.DroppedCount)
 		// chunk_count reports the summaries actually stored (successful chunks),
 		// not attempted, so it does not over-report by FailedChunkCount.
 		return marshalSummarizeChunkResult(ctx, combinedSummary, len(summaries), cov)
@@ -655,7 +665,11 @@ func assembleMapOutput(summaries []string, failedChunks int, capped bool, totalC
 		}
 	}
 	if !hasContent {
-		return "", fmt.Errorf("summarize_chunk: no usable Map output (%d/%d chunks failed)", failedChunks, totalChunks)
+		// attempted = len(kept chunks); failed = errored/dropped; the remainder
+		// "succeeded" but returned blank — spell all three out so the message is
+		// honest even when failedChunks is 0 (blank-but-no-error case).
+		return "", fmt.Errorf("summarize_chunk: no usable Map output (%d chunks attempted, %d failed, %d blank)",
+			totalChunks, failedChunks, len(summaries))
 	}
 	combined := strings.Join(summaries, "\n\n---\n\n")
 	if failedChunks > 0 || capped {

@@ -389,3 +389,25 @@ func TestProbeChunkCoverageDetectsCapRegression(t *testing.T) {
 		t.Fatalf("tighter chunk_size should not reduce chunk count: %d vs %d", chunksTight, chunks)
 	}
 }
+
+// TestProbeChunkCoverageReflectsFanOutCap is the golden case for the #256 P1-a
+// fix: the SS-02 no-silent-loss gate must SEE the fan-out cap. With chunk_size=1
+// every message is its own chunk, so maxChunkCalls+overflow messages split into
+// more chunks than capChunks keeps; the probe applies the same cap the shipped
+// path does, so the capped-out tail must surface as dropped>0 and chunks must be
+// reported post-cap. If the cap were ever silently omitted from the probe (as
+// it was before this fix), dropped would read 0 and the gate could never fire.
+func TestProbeChunkCoverageReflectsFanOutCap(t *testing.T) {
+	const overflow = 44
+	msgs := makeMsgMaps(maxChunkCalls + overflow) // one message per chunk at chunk_size=1
+	processed, dropped, chunks := ProbeChunkCoverageDefault(msgs, 1)
+	if chunks != maxChunkCalls {
+		t.Fatalf("chunks = %d, want %d (probe must report the POST-cap count)", chunks, maxChunkCalls)
+	}
+	if processed != maxChunkCalls {
+		t.Fatalf("processed = %d, want %d (only the kept chunks are covered)", processed, maxChunkCalls)
+	}
+	if dropped != overflow {
+		t.Fatalf("dropped = %d, want %d — the fan-out cap is invisible to the SS-02 gate", dropped, overflow)
+	}
+}

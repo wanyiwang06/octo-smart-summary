@@ -32,15 +32,18 @@ const maxLLMErrorBodyBytes = 4096
 // with a clear error here instead of reactively as an upstream context-length
 // error. Exported so the agent planner client (agent/llm.go) shares it.
 //
-// Sized as 2× the agent per-request summary-handle text cap (8 MiB =
+// Sized at 2× the agent per-request summary-handle text cap (8 MiB =
 // agent.maxSummaryHandleText). merge_summaries joins up to that much text into
-// ONE Reduce prompt, and json.Marshal HTML-escapes &<> to 6-byte \u00XX, so a
-// near-cap Reduce body serializes above the raw 8 MiB. Keeping the guard at 2×
-// that cap leaves room for realistic escaping + the messages/prompt framing, so
-// a LEGITIMATE max-size Reduce never false-trips REQUEST_TOO_LARGE — which, on
-// the critical merge_summaries tool, would discard a fully successful Map phase
-// — while still catching a genuinely oversized single message.
-const MaxRequestBodyBytes = 16 << 20 // 16 MiB (2× agent.maxSummaryHandleText)
+// ONE Reduce prompt, and json.Marshal HTML-escapes &<> to 6-byte \u00XX. The 2×
+// headroom absorbs REALISTIC escaping (chat text is overwhelmingly unescaped
+// runes; metacharacters are a small fraction) plus the messages/prompt framing,
+// so a normal max-size Reduce clears the guard. It is NOT a worst-case guarantee:
+// a pathological body that is mostly &<> escapes ~6×, so a near-cap Reduce made
+// almost entirely of metacharacters could still trip REQUEST_TOO_LARGE and, on
+// the critical merge_summaries tool, discard a successful Map phase. That input
+// is not something real chat produces, and token-aware chunking (#241 item 3) is
+// the structural prevention; this ceiling is only the coarse backstop.
+const MaxRequestBodyBytes = 16 << 20 // 16 MiB (2× agent.maxSummaryHandleText; coarse backstop, not a worst-case guarantee)
 
 // ErrRequestTooLarge marks a request rejected before sending because its
 // serialized body exceeds MaxRequestBodyBytes. It is terminal — retrying or
