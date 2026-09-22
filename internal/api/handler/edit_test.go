@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +19,15 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+func TestBuildRefineSystemPromptKeepsCitationShapeResolvable(t *testing.T) {
+	prompt := buildRefineSystemPrompt()
+	for _, want := range []string{"完整整数格式 [n]", "不得把章节号"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("refine prompt missing %q", want)
+		}
+	}
+}
 
 func setupEditDB(t *testing.T) *gorm.DB {
 	t.Helper()
