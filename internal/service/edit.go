@@ -16,10 +16,10 @@ func CleanUnreferencedCitations(content string, citations []model.Citation) []mo
 	return kept
 }
 
-// NormalizeGeneratedCitations is shared by Agent saves and refinement. Match the
-// generation path's prose-safe policy: only adjacent citation clusters are
-// expanded, while isolated bracketed ranges remain byte-identical prose. Single
-// markers inside the known evidence window must still resolve.
+// NormalizeGeneratedCitations is shared by Agent saves and refinement. Adjacent
+// citation clusters are expanded first so a later document-only section fold
+// cannot turn neighboring numeric prose into a citation cluster. Isolated
+// bracketed ranges remain byte-identical, and error returns preserve the input.
 func NormalizeGeneratedCitations(content string, citations []model.Citation) (string, error) {
 	indices := make(map[int]bool, len(citations))
 	maxIndex := 0
@@ -31,10 +31,10 @@ func NormalizeGeneratedCitations(content string, citations []model.Citation) (st
 			maxIndex = c.Index
 		}
 	}
-	if documentMode {
-		content = citationtext.NormalizeDocumentSectionMarkers(content, func(n int) bool { return indices[n] })
-	}
 	normalized := citationtext.CanonicalizeAdjacent(content, func(n int) bool { return indices[n] })
+	if documentMode {
+		normalized = citationtext.NormalizeDocumentSectionMarkers(normalized, func(n int) bool { return indices[n] })
+	}
 	for _, marker := range citationtext.Scan(normalized) {
 		if marker.Compound || len(marker.Indices) != 1 {
 			continue

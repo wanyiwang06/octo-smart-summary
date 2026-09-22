@@ -1357,14 +1357,6 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	for _, message := range userMessages {
 		indices[message.CitationIndex] = true
 	}
-	if documentMode {
-		// Documents commonly contain their own numbered headings. Models sometimes
-		// combine the real source ordinal with an explicitly labeled heading such
-		// as [3, §14.4], creating precision the citation contract cannot resolve.
-		// Bare dotted brackets stay untouched because versions, decimals, and IP
-		// addresses use the same shape and must never become fabricated citations.
-		finalContent = citationtext.NormalizeDocumentSectionMarkers(finalContent, func(n int) bool { return indices[n] })
-	}
 	// Normalize compound citation groups the model may have emitted despite the
 	// single-marker OutputRule, but never rewrite ordinary bracketed-number prose
 	// and never abort the whole summary on a group the normalizer cannot resolve.
@@ -1374,6 +1366,12 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	// no repair path (PR#248 review B-1/B-2). CanonicalizeAdjacent only expands
 	// real citation clusters and leaves everything else byte-identical.
 	finalContent = citationtext.CanonicalizeAdjacent(finalContent, func(n int) bool { return indices[n] })
+	if documentMode {
+		// Fold explicit section suffixes only after adjacency normalization. Folding
+		// first would create a visible [n] next to numeric prose such as [3-4], then
+		// cause CanonicalizeAdjacent to fabricate citations from that prose range.
+		finalContent = citationtext.NormalizeDocumentSectionMarkers(finalContent, func(n int) bool { return indices[n] })
+	}
 	citations := buildCitations(finalContent, userMessages, messages, nameMap)
 	finalContent, citations = dedupCitations(finalContent, citations)
 	finalContent = stripOrphanCitations(finalContent, citations)

@@ -7,7 +7,10 @@ import (
 )
 
 const documentSectionNumber = `[0-9]+(?:[ \t]*\.[ \t]*[0-9]+)*(?:[ \t]*[-–—][ \t]*[0-9]+)?`
-const documentLabeledSection = `(?:§[ \t]*` + documentSectionNumber + `|第[ \t]*` + documentSectionNumber + `[ \t]*(?:章|节|節|条|條|款))`
+const documentSectionLocator = documentSectionNumber + `(?:[ \t]*\([A-Za-z0-9]+\))*`
+const documentChineseSection = `(?:第[ \t]*` + documentSectionLocator + `[ \t]*(?:章|节|節|条|條|款|页|頁|段))+`
+const documentEnglishSection = `(?i:(?:section|sec\.?|article|art\.?|page|p\.?|paragraph|para\.?))[ \t]*` + documentSectionLocator
+const documentLabeledSection = `(?:§[ \t]*` + documentSectionLocator + `|` + documentChineseSection + `|` + documentEnglishSection + `)`
 
 var documentBracketCandidate = regexp.MustCompile(`\[[^\]\n]{1,256}\]`)
 var documentLeadingIndex = regexp.MustCompile(`^([0-9]{1,5})(.*)$`)

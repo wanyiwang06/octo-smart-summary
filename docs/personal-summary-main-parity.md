@@ -68,6 +68,9 @@ database snapshots are intentionally excluded from the repository.
 Agent saves, Workflow and refinement reuse the same prose-safe generated-content
 normalizer (`citationtext.CanonicalizeAdjacent`), and the Agent draft/emit gates
 validate with its companion `citationtext.ValidAdjacent` (PR#251 review P1-1).
+Document-backed results then fold only explicit labeled section suffixes such as
+`[3, §14.4]` to `[3]`; this second pass runs after adjacency normalization so it
+cannot turn a neighboring prose range into a citation cluster.
 Numeric lists and inclusive ranges become adjacent `[n]` markers only
 inside an adjacent citation cluster and when every index resolves to authorized
 evidence. Isolated bracketed ranges stay byte-identical because they may be dates,

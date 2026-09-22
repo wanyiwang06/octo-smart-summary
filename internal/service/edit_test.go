@@ -37,6 +37,18 @@ func TestNormalizeGeneratedCitations_DocumentSectionsOnly(t *testing.T) {
 	if want := "章节 [3]，版本 [3.14.1]，金额 [1,234.5] 万元。"; got != want {
 		t.Fatalf("got %q; want %q", got, want)
 	}
+	for _, tc := range []struct{ in, want string }{
+		{"预算区间 [1-3][3, §14] 万元。", "预算区间 [1-3][3] 万元。"},
+		{"版本要求 [1-3] [3, §14.4] 完毕。", "版本要求 [1-3] [3] 完毕。"},
+	} {
+		if got, err := NormalizeGeneratedCitations(tc.in, citations); err != nil || got != tc.want {
+			t.Fatalf("adjacent numeric prose changed: got %q err=%v; want %q", got, err, tc.want)
+		}
+	}
+
+	if got, err := NormalizeGeneratedCitations("章节 [3, §14]，无效 [2]。", citations); err == nil || got != "章节 [3, §14]，无效 [2]。" {
+		t.Fatalf("error return must preserve input: got %q err=%v", got, err)
+	}
 
 	chatCitations := []model.Citation{{Index: 3}}
 	if got, err := NormalizeGeneratedCitations("聊天正文 [3, §14.4]。", chatCitations); err != nil || got != "聊天正文 [3, §14.4]。" {
