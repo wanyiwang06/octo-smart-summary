@@ -117,8 +117,7 @@ func splitDocumentEvidence(content string, tok tokenizer.Tokenizer, maxTokens in
 
 func formatDocumentEvidence(message pipeline.Message) string {
 	escapeEvidence := func(content string) string {
-		content = escapeCitationMarkers(content)
-		return citationtext.NeutralizeDocumentEvidenceSectionMarkers(content)
+		return citationtext.DocumentEvidenceForModel(content)
 	}
 	version := ""
 	if message.SourceVersion != "" {

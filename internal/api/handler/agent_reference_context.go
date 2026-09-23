@@ -8,6 +8,7 @@ import (
 	"log"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"gorm.io/gorm"
 )
@@ -113,18 +114,28 @@ func sanitizeCitationsForReference(citations []model.Citation) []model.Citation 
 		citation.SentAt = sanitizeRefBlock(citation.SentAt)
 		citation.Source = sanitizeRefBlock(citation.Source)
 		citation.ChannelID = sanitizeRefBlock(citation.ChannelID)
-		citation.ContextBefore = sanitizeContextMessagesForReference(citation.ContextBefore)
-		citation.ContextAfter = sanitizeContextMessagesForReference(citation.ContextAfter)
+		documentEvidence := citation.DocumentID != ""
+		if documentEvidence {
+			// sanitizeRefBlock runs first because it can manufacture ASCII [n]
+			// from full-width delimiters such as 【3】. The document boundary must
+			// inspect the final prompt-facing representation.
+			citation.Content = citationtext.DocumentEvidenceForModel(citation.Content)
+		}
+		citation.ContextBefore = sanitizeContextMessagesForReference(citation.ContextBefore, documentEvidence)
+		citation.ContextAfter = sanitizeContextMessagesForReference(citation.ContextAfter, documentEvidence)
 		sanitized[i] = citation
 	}
 	return sanitized
 }
 
-func sanitizeContextMessagesForReference(messages []model.ContextMsg) []model.ContextMsg {
+func sanitizeContextMessagesForReference(messages []model.ContextMsg, documentEvidence bool) []model.ContextMsg {
 	sanitized := make([]model.ContextMsg, len(messages))
 	for i, message := range messages {
 		message.Sender = sanitizeRefBlock(message.Sender)
 		message.Content = sanitizeRefBlock(message.Content)
+		if documentEvidence {
+			message.Content = citationtext.DocumentEvidenceForModel(message.Content)
+		}
 		message.SentAt = sanitizeRefBlock(message.SentAt)
 		sanitized[i] = message
 	}

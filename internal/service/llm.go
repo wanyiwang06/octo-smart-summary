@@ -822,6 +822,20 @@ func buildDocumentReduceSystemPrompt(topic string) string {
 	return prompt
 }
 
+func buildDocumentMapUserPrompt(formattedDocuments, sourceName string, evidenceCount int) string {
+	return fmt.Sprintf("文档来源：%s\n证据片段数：%d\n\n文档正文：\n%s",
+		citationtext.DocumentEvidenceForModel(sourceName), evidenceCount, formattedDocuments)
+}
+
+func buildDocumentReduceUserPrompt(chunkSummaries []string, sourceNames string, evidenceCount int) string {
+	parts := make([]string, 0, len(chunkSummaries))
+	for i, summary := range chunkSummaries {
+		parts = append(parts, fmt.Sprintf("【分片 %d】\n%s", i+1, summary))
+	}
+	return fmt.Sprintf("文档来源：%s\n证据片段数：%d\n\n以下是各分片总结，请合并：\n\n%s",
+		citationtext.DocumentEvidenceForModel(sourceNames), evidenceCount, strings.Join(parts, "\n\n---\n\n"))
+}
+
 // CallDocumentMapWithModel summarizes one document-evidence chunk without
 // applying chat-specific person or time-range instructions.
 func (c *LLMClient) CallDocumentMapWithModel(ctx context.Context, formattedDocuments, sourceName string, chunkIndex, evidenceCount int, topic string) (string, int, string, error) {
@@ -829,7 +843,7 @@ func (c *LLMClient) CallDocumentMapWithModel(ctx context.Context, formattedDocum
 	if strings.TrimSpace(formattedDocuments) == "" {
 		return "(文档无正文)", 0, c.model, nil
 	}
-	userPrompt := fmt.Sprintf("文档来源：%s\n证据片段数：%d\n\n文档正文：\n%s", sourceName, evidenceCount, formattedDocuments)
+	userPrompt := buildDocumentMapUserPrompt(formattedDocuments, sourceName, evidenceCount)
 	content, _, tokens, usedModel, err := c.callWithPolicyAndModel(ctx, []ChatMessage{
 		{Role: "system", Content: buildDocumentMapSystemPrompt(topic)},
 		{Role: "user", Content: userPrompt},
@@ -853,7 +867,7 @@ func (c *LLMClient) CallDocumentMapStreamWithModel(ctx context.Context, formatte
 	if strings.TrimSpace(formattedDocuments) == "" {
 		return "(文档无正文)", 0, c.model, nil
 	}
-	userPrompt := fmt.Sprintf("文档来源：%s\n证据片段数：%d\n\n文档正文：\n%s", sourceName, evidenceCount, formattedDocuments)
+	userPrompt := buildDocumentMapUserPrompt(formattedDocuments, sourceName, evidenceCount)
 	var emitted bool
 	wrappedDelta := func(delta string) error {
 		emitted = true
@@ -892,12 +906,7 @@ func (c *LLMClient) CallDocumentReduceStreamWithModel(ctx context.Context, chunk
 		}
 		return chunkSummaries[0], 0, c.model, nil
 	}
-	parts := make([]string, 0, len(chunkSummaries))
-	for i, summary := range chunkSummaries {
-		parts = append(parts, fmt.Sprintf("【分片 %d】\n%s", i+1, summary))
-	}
-	userPrompt := fmt.Sprintf("文档来源：%s\n证据片段数：%d\n\n以下是各分片总结，请合并：\n\n%s",
-		sourceNames, evidenceCount, strings.Join(parts, "\n\n---\n\n"))
+	userPrompt := buildDocumentReduceUserPrompt(chunkSummaries, sourceNames, evidenceCount)
 	return c.callStreamWithModel(ctx, []ChatMessage{
 		{Role: "system", Content: buildDocumentReduceSystemPrompt(topic)},
 		{Role: "user", Content: userPrompt},

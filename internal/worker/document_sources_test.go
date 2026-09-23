@@ -154,7 +154,7 @@ func TestExecutePersonalPipelineUsesDocumentSnapshotsAndKeepsCoordinates(t *test
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"预算区间 [1-2][2, §14] 万元，版本 [2.18–19]，金额 [1,234.5] 万元，结论 [1]，补充 [2]"}}],"usage":{"total_tokens":12}}`)
+		_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"预算区间 [1-2][2, §14] 万元，版本 [2.18–19]，金额 [1,234.5] 万元，结论 [1]，独立条款 [2, §14.4]"}}],"usage":{"total_tokens":12}}`)
 		_, _ = fmt.Fprintln(w, "data: [DONE]")
 	}))
 	defer server.Close()
@@ -171,7 +171,7 @@ func TestExecutePersonalPipelineUsesDocumentSnapshotsAndKeepsCoordinates(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result != "预算区间 [1-2][2, §14] 万元，版本 [2.18–19]，金额 [1,234.5] 万元，结论 [1]，补充 [2]" || msgCount != 2 || len(citations) != 2 {
+	if result != "预算区间 [1-2][2, §14] 万元，版本 [2.18–19]，金额 [1,234.5] 万元，结论 [1]，独立条款 [2]" || msgCount != 2 || len(citations) != 2 {
 		t.Fatalf("result=%q msgCount=%d citations=%#v", result, msgCount, citations)
 	}
 	if citations[0].DocumentID != "docA" || citations[1].DocumentID != "docB" {
@@ -237,16 +237,16 @@ func TestFormatDocumentEvidenceEscapesMetadataCitationMarkers(t *testing.T) {
 	got := formatDocumentEvidence(pipeline.Message{
 		CitationIndex: 5,
 		SourceName:    "Roadmap [2] [3, §14]",
-		SourceVersion: "v9 [7]",
+		SourceVersion: "v9 [7] [2, 第一章]",
 		MessageSeq:    1,
 		Content:       "正文 [3]，依据 [3, 第14条] 执行",
 	})
-	for _, marker := range []string{"[2]", "[7]", "[3]", "[3, §14]", "[3, 第14条]"} {
+	for _, marker := range []string{"[2]", "[7]", "[3]", "[3, §14]", "[3, 第14条]", "[2, 第一章]"} {
 		if strings.Contains(got, marker) {
 			t.Fatalf("formatted evidence contains raw marker %s: %q", marker, got)
 		}
 	}
-	for _, prose := range []string{"(3, §14)", "(3, 第14条)"} {
+	for _, prose := range []string{"(3, §14)", "(3, 第14条)", "(2, 第一章)"} {
 		if !strings.Contains(got, prose) {
 			t.Fatalf("formatted evidence lost source prose %s: %q", prose, got)
 		}

@@ -4,7 +4,37 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 )
+
+func TestSanitizeCitationsForReferenceNeutralizesDocumentEvidenceOnly(t *testing.T) {
+	document := model.Citation{
+		DocumentID: "doc-1",
+		Content:    "正文 [3, §14] 【4】",
+		ContextBefore: []model.ContextMsg{{
+			Content: "上文 [1-2]",
+		}},
+		ContextAfter: []model.ContextMsg{{
+			Content: "下文 [3.14.1]",
+		}},
+	}
+	chat := model.Citation{
+		Content: "聊天 [3] [3, §14] [3.14.1]",
+		ContextBefore: []model.ContextMsg{{
+			Content: "上文 [1-2]",
+		}},
+	}
+
+	got := sanitizeCitationsForReference([]model.Citation{document, chat})
+	if got[0].Content != "正文 (3, §14) (4)" || got[0].ContextBefore[0].Content != "上文 (1-2)" ||
+		got[0].ContextAfter[0].Content != "下文 [3.14.1]" {
+		t.Fatalf("document citation was not safely neutralized: %#v", got[0])
+	}
+	if got[1].Content != chat.Content || got[1].ContextBefore[0].Content != chat.ContextBefore[0].Content {
+		t.Fatalf("chat citation changed: got=%#v want=%#v", got[1], chat)
+	}
+}
 
 // TestSanitizeRef verifies the prompt-injection hardening for referenced
 // summary text (SUM-158 blocker 3): untrusted reference content must not be

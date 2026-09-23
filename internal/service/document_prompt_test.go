@@ -29,3 +29,18 @@ func TestDocumentPromptsUseDocumentSemanticsAndCitationRules(t *testing.T) {
 		t.Fatal("document reduce prompt missing shared citation output rule")
 	}
 }
+
+func TestDocumentUserPromptsNeutralizeOnlyRawSourceNames(t *testing.T) {
+	mapPrompt := buildDocumentMapUserPrompt("[7]【文档：A】\n正文", "Roadmap [3] [3, §14]", 1)
+	if !strings.Contains(mapPrompt, "文档来源：Roadmap (3) (3, §14)") {
+		t.Fatalf("map source name was not neutralized: %q", mapPrompt)
+	}
+	if !strings.Contains(mapPrompt, "[7]【文档：A】") {
+		t.Fatalf("formatter-owned evidence marker was changed: %q", mapPrompt)
+	}
+
+	reducePrompt := buildDocumentReduceUserPrompt([]string{"结论 [7]"}, "A [1-2]", 1)
+	if !strings.Contains(reducePrompt, "文档来源：A (1-2)") || !strings.Contains(reducePrompt, "结论 [7]") {
+		t.Fatalf("reduce boundary mismatch: %q", reducePrompt)
+	}
+}

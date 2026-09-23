@@ -1,6 +1,9 @@
 package citationtext
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNormalizeDocumentSectionMarkers(t *testing.T) {
 	valid := func(n int) bool { return n >= 1 && n <= 4 }
@@ -31,10 +34,57 @@ func TestNormalizeDocumentSectionMarkers(t *testing.T) {
 	}
 }
 
-func TestNeutralizeDocumentEvidenceSectionMarkers(t *testing.T) {
-	in := "原文 [3, §14]、[3, 第14条]、[3, Section 14.4]，产品引用 [3]，版本 [3.14.1]。"
-	want := "原文 (3, §14)、(3, 第14条)、(3, Section 14.4)，产品引用 [3]，版本 [3.14.1]。"
-	if got := NeutralizeDocumentEvidenceSectionMarkers(in); got != want {
+func TestDocumentEvidenceForModel(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{
+			"原文 [3, §14]、[3, 第十四条]、[3, Section 14.4]，引用 [3]，范围 [1-2]，列表 [1,2]，版本 [3.14.1]。",
+			"原文 (3, §14)、(3, 第十四条)、(3, Section 14.4)，引用 (3)，范围 (1-2)，列表 (1,2)，版本 [3.14.1]。",
+		},
+		{
+			"`[3]` [3](https://example.test) ![4](image.png) \\[5] 日期 [2026-09-14] GB/T [50011-2010]",
+			"`(3)` (3)(https://example.test) !(4)(image.png) \\(5) 日期 (2026-09-14) GB/T (50011-2010)",
+		},
+	} {
+		got := DocumentEvidenceForModel(tc.in)
+		if got != tc.want {
+			t.Fatalf("got %q; want %q", got, tc.want)
+		}
+		if twice := DocumentEvidenceForModel(got); twice != got {
+			t.Fatalf("not idempotent: once=%q twice=%q", got, twice)
+		}
+	}
+}
+
+func FuzzDocumentEvidenceForModelIsIdempotent(f *testing.F) {
+	for _, seed := range []string{
+		"plain text",
+		"[3] [1-2] [1,2] [3, §14] [3, 第十四条]",
+		"`[3]` ![4](image.png) \\[5] [3.14.1]",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, input string) {
+		once := DocumentEvidenceForModel(input)
+		if twice := DocumentEvidenceForModel(once); twice != once {
+			t.Fatalf("not idempotent: input=%q once=%q twice=%q", input, once, twice)
+		}
+	})
+}
+
+func BenchmarkNormalizeDocumentSectionMarkersLarge(b *testing.B) {
+	content := strings.Repeat("条款 [3, §14.4] 普通 [1-2]\n", 16_000)
+	valid := func(n int) bool { return n >= 1 && n <= 3 }
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		NormalizeDocumentSectionMarkers(content, valid)
+	}
+}
+
+func TestNormalizeDocumentSectionMarkersSupportsChineseNumbers(t *testing.T) {
+	valid := func(n int) bool { return n == 3 }
+	in := "条款 [3, 第十四条]，章节 [3, 第一章第二节]。"
+	want := "条款 [3]，章节 [3]。"
+	if got := NormalizeDocumentSectionMarkers(in, valid); got != want {
 		t.Fatalf("got %q; want %q", got, want)
 	}
 }
