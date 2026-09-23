@@ -16,6 +16,35 @@ var documentBracketCandidate = regexp.MustCompile(`\[[^\]\n]{1,256}\]`)
 var documentLeadingIndex = regexp.MustCompile(`^([0-9]{1,5})(.*)$`)
 var documentLabeledSectionTail = regexp.MustCompile(`^[ \t]*[,，][ \t]*` + documentLabeledSection + `(?:[ \t]*[,，][ \t]*` + documentLabeledSection + `)*[ \t]*$`)
 
+// NeutralizeDocumentEvidenceSectionMarkers marks bracketed section references
+// copied from a source document as prose before the document is sent to the
+// model. Their leading number belongs to the source text and must never be
+// mistaken for the summary evidence ordinal with the same value.
+func NeutralizeDocumentEvidenceSectionMarkers(content string) string {
+	var b strings.Builder
+	offset := 0
+	changed := false
+	for _, loc := range documentBracketCandidate.FindAllStringIndex(content, -1) {
+		start, end := loc[0], loc[1]
+		body := strings.TrimSpace(content[start+1 : end-1])
+		match := documentLeadingIndex.FindStringSubmatch(body)
+		if match == nil || !documentLabeledSectionTail.MatchString(match[2]) {
+			continue
+		}
+		b.WriteString(content[offset:start])
+		b.WriteByte('(')
+		b.WriteString(content[start+1 : end-1])
+		b.WriteByte(')')
+		offset = end
+		changed = true
+	}
+	if !changed {
+		return content
+	}
+	b.WriteString(content[offset:])
+	return b.String()
+}
+
 // NormalizeDocumentSectionMarkers collapses document-section pseudo-citations
 // invented by a model to the source ordinal the product can actually resolve.
 // Examples: [3, §14.4] and [3, 第14节] become [3]. Bare dotted
@@ -68,22 +97,14 @@ func NormalizeDocumentSectionMarkers(content string, valid func(int) bool) strin
 }
 
 func adjacentToCompoundMarker(content string, markers []Marker, start, end int) bool {
-	onlyHorizontalSpace := func(a, b int) bool {
-		for ; a < b; a++ {
-			if content[a] != ' ' && content[a] != '\t' {
-				return false
-			}
-		}
-		return true
-	}
 	for _, marker := range markers {
 		if !marker.Compound {
 			continue
 		}
-		if marker.End <= start && onlyHorizontalSpace(marker.End, start) {
+		if marker.End <= start && onlyHorizontalSpace(content, marker.End, start) {
 			return true
 		}
-		if marker.Start >= end && onlyHorizontalSpace(end, marker.Start) {
+		if marker.Start >= end && onlyHorizontalSpace(content, end, marker.Start) {
 			return true
 		}
 	}

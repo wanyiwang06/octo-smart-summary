@@ -30,3 +30,11 @@ func TestNormalizeDocumentSectionMarkers(t *testing.T) {
 		})
 	}
 }
+
+func TestNeutralizeDocumentEvidenceSectionMarkers(t *testing.T) {
+	in := "原文 [3, §14]、[3, 第14条]、[3, Section 14.4]，产品引用 [3]，版本 [3.14.1]。"
+	want := "原文 (3, §14)、(3, 第14条)、(3, Section 14.4)，产品引用 [3]，版本 [3.14.1]。"
+	if got := NeutralizeDocumentEvidenceSectionMarkers(in); got != want {
+		t.Fatalf("got %q; want %q", got, want)
+	}
+}

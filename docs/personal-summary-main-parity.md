@@ -72,6 +72,10 @@ Document-backed results then fold only explicit labeled section suffixes such as
 `[3, §14.4]` to `[3]`. When such a marker is adjacent to a compound bracket like
 `[1-2]`, the labeled marker is preserved so the persisted output remains stable
 across later edit/refine normalization instead of creating a citation cluster.
+Before document evidence is sent to the model, source-authored shapes such as
+`[3, §14.4]` are rendered as prose `(3, §14.4)`. This preserves the source's
+section information without letting its leading number impersonate summary
+evidence ordinal 3; only the formatter-owned `[n]` prefix remains a citation.
 Numeric lists and inclusive ranges become adjacent `[n]` markers only
 inside an adjacent citation cluster and when every index resolves to authorized
 evidence. Isolated bracketed ranges stay byte-identical because they may be dates,

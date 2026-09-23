@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/pipeline"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/tokenizer"
@@ -115,11 +116,15 @@ func splitDocumentEvidence(content string, tok tokenizer.Tokenizer, maxTokens in
 }
 
 func formatDocumentEvidence(message pipeline.Message) string {
+	escapeEvidence := func(content string) string {
+		content = escapeCitationMarkers(content)
+		return citationtext.NeutralizeDocumentEvidenceSectionMarkers(content)
+	}
 	version := ""
 	if message.SourceVersion != "" {
-		version = "｜版本：" + escapeCitationMarkers(message.SourceVersion)
+		version = "｜版本：" + escapeEvidence(message.SourceVersion)
 	}
 	return fmt.Sprintf("[%d]【文档：%s%s｜片段：%d】\n%s",
-		message.CitationIndex, escapeCitationMarkers(message.SourceName), version, message.MessageSeq,
-		escapeCitationMarkers(message.Content))
+		message.CitationIndex, escapeEvidence(message.SourceName), version, message.MessageSeq,
+		escapeEvidence(message.Content))
 }

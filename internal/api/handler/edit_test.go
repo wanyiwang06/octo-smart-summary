@@ -21,11 +21,15 @@ import (
 )
 
 func TestBuildRefineSystemPromptKeepsCitationShapeResolvable(t *testing.T) {
-	prompt := buildRefineSystemPrompt()
+	prompt := buildRefineSystemPrompt([]model.Citation{{Index: 1, DocumentID: "doc-1"}})
 	for _, want := range []string{"完整整数格式 [n]", "不得把章节号"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("refine prompt missing %q", want)
 		}
+	}
+	chatPrompt := buildRefineSystemPrompt([]model.Citation{{Index: 1}})
+	if strings.Contains(chatPrompt, "不得把章节号") {
+		t.Fatalf("chat refine prompt contains document-only citation rule: %q", chatPrompt)
 	}
 }
 

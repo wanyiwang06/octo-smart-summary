@@ -110,7 +110,7 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 		llmfallback.WithPath(c.Request.Context(), llmfallback.PathAPIRefine), refineTimeout())
 	defer cancel()
 	newContent, tokens, usedModel, err := h.llm.CallWithModel(llmCtx, []service.ChatMessage{
-		{Role: "system", Content: buildRefineSystemPrompt()},
+		{Role: "system", Content: buildRefineSystemPrompt(pr.GetCitations())},
 		{Role: "user", Content: fmt.Sprintf("当前总结：\n%s\n\n用户修改意见：\n%s", pr.Content, feedback)},
 	}, 0.1)
 	if err != nil {
@@ -351,7 +351,7 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 		llmfallback.WithPath(c.Request.Context(), llmfallback.PathAPIRefine), refineTimeout())
 	defer cancel()
 	newContent, tokens, usedModel, err := h.llm.CallStreamWithModel(llmCtx, []service.ChatMessage{
-		{Role: "system", Content: buildRefineSystemPrompt()},
+		{Role: "system", Content: buildRefineSystemPrompt(pr.GetCitations())},
 		{Role: "user", Content: fmt.Sprintf("当前总结：\n%s\n\n用户修改意见：\n%s", pr.Content, feedback)},
 	}, 0.1, func(delta string) error {
 		if delta == "" {

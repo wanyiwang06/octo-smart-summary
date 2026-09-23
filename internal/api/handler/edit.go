@@ -277,7 +277,7 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 		llmfallback.WithPath(c.Request.Context(), llmfallback.PathAPIRefine), refineTimeout())
 	defer cancel()
 	newContent, tokens, usedModel, err := h.llm.CallWithModel(llmCtx, []service.ChatMessage{
-		{Role: "system", Content: buildRefineSystemPrompt()},
+		{Role: "system", Content: buildRefineSystemPrompt(baseResult.GetCitations())},
 		{Role: "user", Content: fmt.Sprintf("当前总结：\n%s\n\n用户修改意见：\n%s", baseResult.Content, feedback)},
 	}, 0.1)
 	if err != nil {
@@ -453,7 +453,7 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 		llmfallback.WithPath(c.Request.Context(), llmfallback.PathAPIRefine), refineTimeout())
 	defer cancel()
 	newContent, tokens, usedModel, err := h.llm.CallStreamWithModel(llmCtx, []service.ChatMessage{
-		{Role: "system", Content: buildRefineSystemPrompt()},
+		{Role: "system", Content: buildRefineSystemPrompt(baseResult.GetCitations())},
 		{Role: "user", Content: fmt.Sprintf("当前总结：\n%s\n\n用户修改意见：\n%s", baseResult.Content, feedback)},
 	}, 0.1, func(delta string) error {
 		if delta == "" {
@@ -788,14 +788,20 @@ func cleanUnreferencedTeamCitations(content string, citations []model.TeamCitati
 	return kept
 }
 
-func buildRefineSystemPrompt() string {
+func buildRefineSystemPrompt(citations []model.Citation) string {
+	documentCitationRule := ""
+	for _, citation := range citations {
+		if citation.DocumentID != "" {
+			documentCitationRule = "\n- 若保留或输出引用，引用标记只允许完整整数格式 [n]；不得把章节号、条款号、页码或段落号拼入引用。"
+			break
+		}
+	}
 	return `你是专业的工作总结编辑助手。请根据用户的修改意见，对“当前总结”做局部调整。
 
 要求：
 - 尽量保留用户没有要求修改的内容、结构和引用编号。
 - 不要重新发散总结，不要补充当前总结里没有依据的新事实。
-- 如果只是语气、长短、结构调整，应保持事实含义不变。
-- 若保留或输出引用，引用标记只允许完整整数格式 [n]；不得把章节号、条款号、页码或段落号拼入引用。
+- 如果只是语气、长短、结构调整，应保持事实含义不变。` + documentCitationRule + `
 - 保留 Markdown 格式。
 - 只输出修改后的完整总结正文，不要输出解释、前后缀或代码块。`
 }

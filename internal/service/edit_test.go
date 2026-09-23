@@ -41,10 +41,12 @@ func TestNormalizeGeneratedCitations_DocumentSectionsOnly(t *testing.T) {
 		{Index: 1, DocumentID: "doc-1"},
 		{Index: 2, DocumentID: "doc-2"},
 		{Index: 3, DocumentID: "doc-3"},
+		{Index: 4, DocumentID: "doc-4"},
 	}
 	for _, tc := range []struct{ in, want string }{
 		{"预算区间 [1-2][2, §14] 万元。", "预算区间 [1-2][2, §14] 万元。"},
 		{"版本要求 [2, §14.4] [1-2] 完毕。", "版本要求 [2, §14.4] [1-2] 完毕。"},
+		{"结论 [4][1-2][3, §14]。", "结论 [4][1][2][3]。"},
 	} {
 		got, err := NormalizeGeneratedCitations(tc.in, compositionCitations)
 		if err != nil || got != tc.want {

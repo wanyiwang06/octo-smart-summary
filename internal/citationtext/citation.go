@@ -167,21 +167,22 @@ func CanonicalizeAdjacent(content string, valid func(int) bool) string {
 // only optional spaces/tabs between them — the shape of a citation cluster
 // ("[1][2]", "[1] [3-5]") as opposed to a bracketed number sitting in prose.
 func adjacentToMarker(content string, markers []Marker, i int) bool {
-	onlySpace := func(a, b int) bool {
-		for ; a < b; a++ {
-			if content[a] != ' ' && content[a] != '\t' {
-				return false
-			}
-		}
+	if i > 0 && onlyHorizontalSpace(content, markers[i-1].End, markers[i].Start) {
 		return true
 	}
-	if i > 0 && onlySpace(markers[i-1].End, markers[i].Start) {
-		return true
-	}
-	if i+1 < len(markers) && onlySpace(markers[i].End, markers[i+1].Start) {
+	if i+1 < len(markers) && onlyHorizontalSpace(content, markers[i].End, markers[i+1].Start) {
 		return true
 	}
 	return false
+}
+
+func onlyHorizontalSpace(content string, start, end int) bool {
+	for ; start < end; start++ {
+		if content[start] != ' ' && content[start] != '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 func Valid(content string, valid func(int) bool, maxIndex int, requireMarker bool) bool {
