@@ -18,6 +18,10 @@ func TestNormalizeDocumentSectionMarkers(t *testing.T) {
 		{"日期 [2026-09-14]，标准 GB/T [50011-2010]。", "日期 [2026-09-14]，标准 GB/T [50011-2010]。"},
 		{"代码 `[3, §14]` 和链接 [3, §14](https://example.test)。", "代码 `[3, §14]` 和链接 [3, §14](https://example.test)。"},
 		{"转义 \\[3, §14]，图片 ![3, §14](image.png)。", "转义 \\[3, §14]，图片 ![3, §14](image.png)。"},
+		{"预算 [1-2][3, §14] 万元。", "预算 [1-2][3, §14] 万元。"},
+		{"预算 [3, §14]\t [1-2] 万元。", "预算 [3, §14]\t [1-2] 万元。"},
+		{"普通引用 [1][3, §14]。", "普通引用 [1][3]。"},
+		{"换行 [1-2]\n[3, §14]。", "换行 [1-2]\n[3]。"},
 	} {
 		t.Run(tc.in, func(t *testing.T) {
 			if got := NormalizeDocumentSectionMarkers(tc.in, valid); got != tc.out {

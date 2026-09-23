@@ -17,9 +17,10 @@ func CleanUnreferencedCitations(content string, citations []model.Citation) []mo
 }
 
 // NormalizeGeneratedCitations is shared by Agent saves and refinement. Adjacent
-// citation clusters are expanded first so a later document-only section fold
-// cannot turn neighboring numeric prose into a citation cluster. Isolated
-// bracketed ranges remain byte-identical, and error returns preserve the input.
+// citation clusters are expanded before the document-only section fold. The
+// fold preserves labeled markers next to compound brackets, making its output
+// stable when a persisted result is normalized again. Isolated bracketed ranges
+// remain byte-identical, and error returns preserve the input.
 func NormalizeGeneratedCitations(content string, citations []model.Citation) (string, error) {
 	indices := make(map[int]bool, len(citations))
 	maxIndex := 0

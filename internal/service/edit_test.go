@@ -37,12 +37,22 @@ func TestNormalizeGeneratedCitations_DocumentSectionsOnly(t *testing.T) {
 	if want := "章节 [3]，版本 [3.14.1]，金额 [1,234.5] 万元。"; got != want {
 		t.Fatalf("got %q; want %q", got, want)
 	}
+	compositionCitations := []model.Citation{
+		{Index: 1, DocumentID: "doc-1"},
+		{Index: 2, DocumentID: "doc-2"},
+		{Index: 3, DocumentID: "doc-3"},
+	}
 	for _, tc := range []struct{ in, want string }{
-		{"预算区间 [1-3][3, §14] 万元。", "预算区间 [1-3][3] 万元。"},
-		{"版本要求 [1-3] [3, §14.4] 完毕。", "版本要求 [1-3] [3] 完毕。"},
+		{"预算区间 [1-2][2, §14] 万元。", "预算区间 [1-2][2, §14] 万元。"},
+		{"版本要求 [2, §14.4] [1-2] 完毕。", "版本要求 [2, §14.4] [1-2] 完毕。"},
 	} {
-		if got, err := NormalizeGeneratedCitations(tc.in, citations); err != nil || got != tc.want {
+		got, err := NormalizeGeneratedCitations(tc.in, compositionCitations)
+		if err != nil || got != tc.want {
 			t.Fatalf("adjacent numeric prose changed: got %q err=%v; want %q", got, err, tc.want)
+		}
+		gotAgain, err := NormalizeGeneratedCitations(got, compositionCitations)
+		if err != nil || gotAgain != got {
+			t.Fatalf("normalization is not stable: first=%q second=%q err=%v", got, gotAgain, err)
 		}
 	}
 

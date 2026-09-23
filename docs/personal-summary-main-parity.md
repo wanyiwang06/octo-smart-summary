@@ -69,8 +69,9 @@ Agent saves, Workflow and refinement reuse the same prose-safe generated-content
 normalizer (`citationtext.CanonicalizeAdjacent`), and the Agent draft/emit gates
 validate with its companion `citationtext.ValidAdjacent` (PR#251 review P1-1).
 Document-backed results then fold only explicit labeled section suffixes such as
-`[3, §14.4]` to `[3]`; this second pass runs after adjacency normalization so it
-cannot turn a neighboring prose range into a citation cluster.
+`[3, §14.4]` to `[3]`. When such a marker is adjacent to a compound bracket like
+`[1-2]`, the labeled marker is preserved so the persisted output remains stable
+across later edit/refine normalization instead of creating a citation cluster.
 Numeric lists and inclusive ranges become adjacent `[n]` markers only
 inside an adjacent citation cluster and when every index resolves to authorized
 evidence. Isolated bracketed ranges stay byte-identical because they may be dates,

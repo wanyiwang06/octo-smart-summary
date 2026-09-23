@@ -1367,9 +1367,9 @@ func (p *Processor) executePersonalPipeline(ctx context.Context, task model.Summ
 	// real citation clusters and leaves everything else byte-identical.
 	finalContent = citationtext.CanonicalizeAdjacent(finalContent, func(n int) bool { return indices[n] })
 	if documentMode {
-		// Fold explicit section suffixes only after adjacency normalization. Folding
-		// first would create a visible [n] next to numeric prose such as [3-4], then
-		// cause CanonicalizeAdjacent to fabricate citations from that prose range.
+		// Fold explicit section suffixes after adjacency normalization, except next
+		// to compound brackets. Keeping those labeled markers makes the persisted
+		// result stable when edit/refine paths normalize the whole content again.
 		finalContent = citationtext.NormalizeDocumentSectionMarkers(finalContent, func(n int) bool { return indices[n] })
 	}
 	citations := buildCitations(finalContent, userMessages, messages, nameMap)

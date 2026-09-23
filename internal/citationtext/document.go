@@ -27,6 +27,7 @@ var documentLabeledSectionTail = regexp.MustCompile(`^[ \t]*[,，][ \t]*` + docu
 // an explicit [N]-only citation contract and a known source-index set.
 func NormalizeDocumentSectionMarkers(content string, valid func(int) bool) string {
 	protected := protectedSpans(content)
+	markers := Scan(content)
 	var b strings.Builder
 	offset := 0
 	changed := false
@@ -46,6 +47,12 @@ func NormalizeDocumentSectionMarkers(content string, valid func(int) bool) strin
 		if err != nil || valid == nil || !valid(index) {
 			continue
 		}
+		// Folding next to a compound bracket would make that bracket look like a
+		// citation cluster to a later normalization pass. Preserve the labeled
+		// marker so repeated save/refine normalization remains byte-stable.
+		if adjacentToCompoundMarker(content, markers, start, end) {
+			continue
+		}
 		b.WriteString(content[offset:start])
 		b.WriteByte('[')
 		b.WriteString(strconv.Itoa(index))
@@ -58,4 +65,27 @@ func NormalizeDocumentSectionMarkers(content string, valid func(int) bool) strin
 	}
 	b.WriteString(content[offset:])
 	return b.String()
+}
+
+func adjacentToCompoundMarker(content string, markers []Marker, start, end int) bool {
+	onlyHorizontalSpace := func(a, b int) bool {
+		for ; a < b; a++ {
+			if content[a] != ' ' && content[a] != '\t' {
+				return false
+			}
+		}
+		return true
+	}
+	for _, marker := range markers {
+		if !marker.Compound {
+			continue
+		}
+		if marker.End <= start && onlyHorizontalSpace(marker.End, start) {
+			return true
+		}
+		if marker.Start >= end && onlyHorizontalSpace(end, marker.Start) {
+			return true
+		}
+	}
+	return false
 }

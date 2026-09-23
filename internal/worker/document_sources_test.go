@@ -171,11 +171,15 @@ func TestExecutePersonalPipelineUsesDocumentSnapshotsAndKeepsCoordinates(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result != "预算区间 [1-2][2] 万元，版本 [2.18–19]，金额 [1,234.5] 万元，结论 [1]" || msgCount != 2 || len(citations) != 2 {
+	if result != "预算区间 [1-2][2, §14] 万元，版本 [2.18–19]，金额 [1,234.5] 万元，结论 [1]" || msgCount != 2 || len(citations) != 1 {
 		t.Fatalf("result=%q msgCount=%d citations=%#v", result, msgCount, citations)
 	}
-	if citations[0].DocumentID != "docA" || citations[1].DocumentID != "docB" {
+	if citations[0].DocumentID != "docA" {
 		t.Fatalf("document coordinates=%#v", citations)
+	}
+	renormalized, err := service.NormalizeGeneratedCitations(result, citations)
+	if err != nil || renormalized != result {
+		t.Fatalf("persisted result is not stable: first=%q second=%q err=%v", result, renormalized, err)
 	}
 }
 
