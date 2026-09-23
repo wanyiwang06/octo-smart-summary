@@ -37,11 +37,15 @@ const maxLLMErrorBodyBytes = 4096
 // ONE Reduce prompt. Outbound bodies are serialized with MarshalRequestBody,
 // which disables Go's HTML escaping (#256 P2-5), so &<> cost one byte each rather
 // than the 6-byte \u00XX json.Marshal would emit — a near-cap Reduce made almost
-// entirely of metacharacters can no longer inflate ~6× and trip REQUEST_TOO_LARGE
-// on the critical merge_summaries tool, discarding a successful Map phase. The 2×
-// headroom then only has to absorb the messages/prompt framing, so a normal
-// max-size Reduce clears the guard. token-aware chunking (#241 item 3) remains
-// the structural prevention; this ceiling is the coarse backstop.
+// entirely of those metacharacters can no longer inflate ~6× and trip
+// REQUEST_TOO_LARGE on the critical merge_summaries tool, discarding a successful
+// Map phase. It does NOT remove all inflation: the encoder still escapes U+2028 /
+// U+2029 unconditionally (3 UTF-8 bytes → a 6-byte escape), so the worst case is
+// ~2×, not 1× — an 8 MiB body made entirely of line/paragraph separators still
+// approaches the ceiling before framing. That input is not something real chat
+// produces (those runes are vanishingly rare in messages), so the 2× headroom
+// covers realistic Reduce bodies plus framing; token-aware chunking (#241 item 3)
+// remains the structural prevention and this ceiling is the coarse backstop.
 const MaxRequestBodyBytes = 16 << 20 // 16 MiB (2× agent.maxSummaryHandleText; coarse backstop, not a worst-case guarantee)
 
 // MarshalRequestBody serializes an outbound chat request body WITHOUT Go's

@@ -17,8 +17,8 @@ import (
 // Map-phase concurrency tests. All of them swap summarizeChunkFn, so none of
 // them touches a real LLM; they assert the properties the concurrent Map path
 // must preserve relative to the previous serial loop: bounded fan-out, original
-// output order, an all-failed error that preserves every cause, and prompt
-// cancellation.
+// output order, an all-failed error classified on the lowest-index cause, and
+// prompt cancellation.
 
 // withMapConcurrency installs cfg.AgentMapConcurrency for the duration of a
 // test and restores whatever deps were set before.
@@ -219,35 +219,74 @@ func TestSummarizeChunksConcurrently_BlankSuccessDropped(t *testing.T) {
 	}
 }
 
-// When EVERY chunk fails there is nothing usable, so the whole phase errors —
-// and it wraps errors.Join of ALL the per-chunk causes so classifyToolError sees
-// the real (often transient) shapes and nothing is lost for triage (#256 P2-6).
-// Two DISTINCT sentinels are essential: a single shared error would make
-// errors.Is trivially true and pin nothing about which causes survive.
-func TestSummarizeChunksConcurrently_AllFailuresJoinAllCauses(t *testing.T) {
-	withMapConcurrency(t, 3)
-	errFirst := errors.New("cause for the first chunk")
-	errRest := errors.New("cause for the other chunks")
-	withStubMapCall(t, func(ctx context.Context, chunk []map[string]interface{}, _ string) (string, int, int, error) {
-		if chunk[0]["content"].(string) == "chunk-0" {
-			return "", 0, 0, errFirst
+// When no usable summary survives, the phase errors — and the error must be
+// keyed on the LOWEST-INDEX cause ALONE, never a union of every cause.
+// classifyToolError matches on both errors.Is and the error TEXT, so wrapping
+// errors.Join would let a single non-transient cause (a recovered panic, an
+// oversized chunk) anywhere in the set drag the whole Map phase to
+// fatal+non-retryable — a recoverable transient storm latching a FAILED run
+// (#256 round-7 P1-1). Pin: idx0 is a retryable 429, the later chunks panic
+// (fatal-shaped); classification must follow idx0 and stay retryable/non-fatal.
+func TestSummarizeChunksConcurrently_AllFailedClassifiesOnLowestIndex(t *testing.T) {
+	for _, concurrency := range []int{1, 3} {
+		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
+			withMapConcurrency(t, concurrency)
+			errRetryable := errors.New("rate limited: status 429")
+			withStubMapCall(t, func(_ context.Context, chunk []map[string]interface{}, _ string) (string, int, int, error) {
+				if chunk[0]["content"].(string) == "chunk-0" {
+					return "", 0, 0, errRetryable
+				}
+				panic("boom in a later chunk") // recovered → tolerated per-chunk failure
+			})
+
+			var cov chunkCoverage
+			got, err := summarizeChunksConcurrently(context.Background(), makeChunks(3), "", &cov)
+			if err == nil || got != nil {
+				t.Fatalf("expected an error and no summaries, got err=%v summaries=%d", err, len(got))
+			}
+			// Lowest-index cause drives errors.Is; the later panic must NOT be unioned in.
+			if !errors.Is(err, errRetryable) {
+				t.Fatalf("all-failed error must be keyed on the lowest-index cause, got %v", err)
+			}
+			if strings.Contains(err.Error(), "panicked") {
+				t.Fatalf("a later chunk's fatal cause leaked into the classified error text: %v", err)
+			}
+			// The whole point: classification follows idx0 (429 → retryable), not the
+			// later panic (→ fatal+non-retryable). A union would fail this.
+			env := classifyToolError("summarize_chunk", err)
+			if !env.Retryable || env.Fatal {
+				t.Fatalf("lowest-index 429 must classify retryable/non-fatal; got retryable=%v fatal=%v — a later cause poisoned it", env.Retryable, env.Fatal)
+			}
+		})
+	}
+}
+
+// Mixed failed + blank-but-successful with no usable content must still surface a
+// failure cause (not a bare nil error), so classifyToolError keys on a real shape
+// rather than the generic no-usable-output string (#256 round-7 P2-2). The guard
+// is len(summaries)==0 && len(errs)>0, not "every chunk failed".
+func TestSummarizeChunksConcurrently_MixedFailedAndBlankSurfacesCause(t *testing.T) {
+	withMapConcurrency(t, 4)
+	errCause := errors.New("upstream: status 503")
+	withStubMapCall(t, func(_ context.Context, chunk []map[string]interface{}, _ string) (string, int, int, error) {
+		switch chunk[0]["content"].(string) {
+		case "chunk-0":
+			return "", 0, 0, errCause // failure
+		default:
+			return "   ", 1, 0, nil // blank successes
 		}
-		return "", 0, 0, errRest
 	})
 
 	var cov chunkCoverage
-	got, err := summarizeChunksConcurrently(context.Background(), makeChunks(4), "", &cov)
-	if err == nil {
-		t.Fatal("expected an error when all chunks fail, got nil")
+	got, err := summarizeChunksConcurrently(context.Background(), makeChunks(3), "", &cov)
+	if err == nil || got != nil {
+		t.Fatalf("mixed failed+blank with nothing usable must error, got err=%v summaries=%d", err, len(got))
 	}
-	if !errors.Is(err, errFirst) {
-		t.Errorf("all-failed error dropped the chunk-0 cause: %v", err)
+	if !errors.Is(err, errCause) {
+		t.Fatalf("the failure cause must survive on the mixed path, got %v", err)
 	}
-	if !errors.Is(err, errRest) {
-		t.Errorf("all-failed error dropped the later chunks' cause — errors.Join must keep every cause: %v", err)
-	}
-	if got != nil {
-		t.Fatalf("expected no summaries when all fail, got %d", len(got))
+	if env := classifyToolError("summarize_chunk", err); !env.Retryable {
+		t.Fatalf("a 503 cause must stay retryable, got %+v", env)
 	}
 }
 
@@ -388,6 +427,37 @@ func TestSummarizeChunksConcurrently_FatalChunkErrorAborts(t *testing.T) {
 			}
 			if got != nil {
 				t.Fatalf("expected no summaries on fatal abort, got %d", len(got))
+			}
+		})
+	}
+}
+
+// TestFinalizeDropCounts pins the handler's coverage arithmetic (#256 round-7
+// P2-1/P2-5): DroppedCount is accidental loss only (input − processed − capped),
+// but Truncated — the loudest model-facing boolean — flags ANY real gap, so a
+// cap-only run (the single largest loss this tool can produce) must still read
+// truncated=true even though its DroppedCount is 0.
+func TestFinalizeDropCounts(t *testing.T) {
+	cases := []struct {
+		name          string
+		cov           chunkCoverage
+		wantDropped   int
+		wantTruncated bool
+	}{
+		{"clean full coverage", chunkCoverage{InputCount: 100, ProcessedCount: 100}, 0, false},
+		{"accidental loss only", chunkCoverage{InputCount: 100, ProcessedCount: 80}, 20, true},
+		{"cap only: dropped 0 but truncated", chunkCoverage{InputCount: 100, ProcessedCount: 60, CappedDroppedCount: 40}, 0, true},
+		{"both accidental + cap", chunkCoverage{InputCount: 100, ProcessedCount: 55, CappedDroppedCount: 30}, 15, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cov := c.cov
+			cov.finalizeDropCounts()
+			if cov.DroppedCount != c.wantDropped {
+				t.Errorf("DroppedCount = %d, want %d", cov.DroppedCount, c.wantDropped)
+			}
+			if cov.Truncated != c.wantTruncated {
+				t.Errorf("Truncated = %v, want %v (a disclosed cap must still raise the loudest gap boolean)", cov.Truncated, c.wantTruncated)
 			}
 		})
 	}
