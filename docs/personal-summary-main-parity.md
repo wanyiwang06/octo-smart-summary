@@ -72,15 +72,21 @@ Document-backed results then fold only explicit labeled section suffixes such as
 `[3, §14.4]` to `[3]`. When such a marker is adjacent to a compound bracket like
 `[1-2]`, the labeled marker is preserved so the persisted output remains stable
 across later edit/refine normalization instead of creating a citation cluster.
-Before document evidence is sent to the model, source-authored shapes such as
-`[3, §14.4]` are rendered as prose `(3, §14.4)`. This preserves the source's
-section information without letting its leading number impersonate summary
-evidence ordinal 3; only the formatter-owned `[n]` prefix remains a citation.
-Numeric lists and inclusive ranges become adjacent `[n]` markers only
-inside an adjacent citation cluster and when every index resolves to authorized
-evidence. Isolated bracketed ranges stay byte-identical because they may be dates,
-standards, page ranges or counts. Single markers inside the known evidence window
-must resolve; the Agent writer remains the strict fail-closed repair boundary.
+Before document evidence is sent to the model, source-authored citation-like
+brackets are rendered as prose: `[3, §14.4]` becomes `(3, §14.4)`, while bare
+markers and numeric groups such as `[3]` and `[1-2]` become `(3)` and `(1-2)`.
+This deliberate prompt-only fidelity trade-off also applies inside Markdown
+code, links, images and escapes: preventing source punctuation from becoming a
+clickable fabricated citation is more important than preserving bracket style
+in model input. Bracketed ISO dates remain unchanged because citation scanning
+already classifies them as prose. Formatter-owned `[n]` prefixes are added only
+after this boundary and remain citations.
+During generated-summary normalization, numeric lists and inclusive ranges
+become adjacent `[n]` markers only inside an adjacent citation cluster and when
+every index resolves to authorized evidence. Isolated generated bracketed ranges
+stay byte-identical because they may be dates, standards, page ranges or counts.
+Single markers inside the known evidence window must resolve; the Agent writer
+remains the strict fail-closed repair boundary.
 Groups are capped at 128 entries and normalization growth is bounded. Message
 identity stays unchanged: reading-order numbering is a frontend concern.
 

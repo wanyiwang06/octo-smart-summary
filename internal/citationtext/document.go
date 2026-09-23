@@ -13,11 +13,13 @@ const documentSectionLocator = documentSectionNumber + `(?:[ \t]*\([A-Za-z0-9]+\
 const documentChineseSection = `(?:第[ \t]*` + documentSectionLocator + `[ \t]*(?:章|节|節|条|條|款|页|頁|段))+`
 const documentEnglishSection = `(?i:(?:section|sec\.?|article|art\.?|page|p\.?|paragraph|para\.?))[ \t]*` + documentSectionLocator
 const documentLabeledSection = `(?:§[ \t]*` + documentSectionLocator + `|` + documentChineseSection + `|` + documentEnglishSection + `)`
+const documentSectionSeparator = `[,，、;；]`
+const documentLabeledSectionList = documentLabeledSection + `(?:[ \t]*` + documentSectionSeparator + `[ \t]*` + documentLabeledSection + `)*`
 
-var documentBracketCandidate = regexp.MustCompile(`\[[^\]\n]{1,256}\]`)
-var documentNumericBracketBody = regexp.MustCompile(`^[ \t]*[0-9][0-9 \t,，;；\-–—]*[ \t]*$`)
+var documentLabeledBracketCandidate = regexp.MustCompile(`\[[ \t]*(?:[0-9]{1,5}[ \t]*` + documentSectionSeparator + `[ \t]*)?` + documentLabeledSectionList + `[ \t]*\]`)
 var documentLeadingIndex = regexp.MustCompile(`^([0-9]{1,5})(.*)$`)
-var documentLabeledSectionTail = regexp.MustCompile(`^[ \t]*[,，][ \t]*` + documentLabeledSection + `(?:[ \t]*[,，][ \t]*` + documentLabeledSection + `)*[ \t]*$`)
+var documentLabeledSectionTail = regexp.MustCompile(`^[ \t]*` + documentSectionSeparator + `[ \t]*` + documentLabeledSectionList + `[ \t]*$`)
+var documentLabeledSectionOnly = regexp.MustCompile(`^[ \t]*` + documentLabeledSectionList + `[ \t]*$`)
 
 // DocumentEvidenceForModel is the single document-provenance boundary for raw
 // text entering a model prompt. It turns citation-looking source prose into
@@ -30,15 +32,25 @@ var documentLabeledSectionTail = regexp.MustCompile(`^[ \t]*[,，][ \t]*` + docu
 // syntax here: protecting those spans would reopen a path by which a model can
 // repeat a source-owned bracket as a fabricated clickable citation.
 func DocumentEvidenceForModel(content string) string {
+	// Use the exact numeric candidate consumed by Scan. This is intentionally a
+	// direct package-level dependency: the safety boundary must not maintain a
+	// second, subtly narrower grammar. In particular, candidate can find the
+	// inner marker in nested text such as [[1]] and has no body-length cap.
+	content = replaceDocumentPromptBrackets(content, candidate, func(body string) bool {
+		return !dateShape.MatchString(strings.TrimSpace(body))
+	})
+	return replaceDocumentPromptBrackets(content, documentLabeledBracketCandidate, func(string) bool {
+		return true
+	})
+}
+
+func replaceDocumentPromptBrackets(content string, pattern *regexp.Regexp, replace func(body string) bool) string {
 	var b strings.Builder
 	offset := 0
 	changed := false
-	for _, loc := range documentBracketCandidate.FindAllStringIndex(content, -1) {
+	for _, loc := range pattern.FindAllStringIndex(content, -1) {
 		start, end := loc[0], loc[1]
-		body := strings.TrimSpace(content[start+1 : end-1])
-		match := documentLeadingIndex.FindStringSubmatch(body)
-		labeled := match != nil && documentLabeledSectionTail.MatchString(match[2])
-		if !documentNumericBracketBody.MatchString(content[start+1:end-1]) && !labeled {
+		if !replace(content[start+1 : end-1]) {
 			continue
 		}
 		b.WriteString(content[offset:start])
@@ -71,7 +83,7 @@ func NormalizeDocumentSectionMarkers(content string, valid func(int) bool) strin
 	var b strings.Builder
 	offset := 0
 	changed := false
-	for _, loc := range documentBracketCandidate.FindAllStringIndex(content, -1) {
+	for _, loc := range documentLabeledBracketCandidate.FindAllStringIndex(content, -1) {
 		start, end := loc[0], loc[1]
 		for markerCursor < len(markers) && markers[markerCursor].End <= start {
 			markerCursor++
@@ -81,9 +93,32 @@ func NormalizeDocumentSectionMarkers(content string, valid func(int) bool) strin
 			(end < len(content) && (content[end] == '(' || content[end] == ':')) {
 			continue
 		}
+		if (start > 0 && content[start-1] == '[') || (end < len(content) && content[end] == ']') {
+			// Folding an inner labeled marker would turn nested source prose such
+			// as [[3, §14]] into the live citation [[3]]. Keep the section text
+			// but remove its citation syntax instead.
+			b.WriteString(content[offset:start])
+			b.WriteByte('(')
+			b.WriteString(content[start+1 : end-1])
+			b.WriteByte(')')
+			offset = end
+			changed = true
+			continue
+		}
 		body := strings.TrimSpace(content[start+1 : end-1])
 		match := documentLeadingIndex.FindStringSubmatch(body)
-		if match == nil || !documentLabeledSectionTail.MatchString(match[2]) {
+		if match == nil {
+			if documentLabeledSectionOnly.MatchString(body) {
+				b.WriteString(content[offset:start])
+				b.WriteByte('(')
+				b.WriteString(content[start+1 : end-1])
+				b.WriteByte(')')
+				offset = end
+				changed = true
+			}
+			continue
+		}
+		if !documentLabeledSectionTail.MatchString(match[2]) {
 			continue
 		}
 		index, err := strconv.Atoi(match[1])

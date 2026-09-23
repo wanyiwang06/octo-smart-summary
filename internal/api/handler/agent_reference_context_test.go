@@ -10,10 +10,17 @@ import (
 
 func TestSanitizeCitationsForReferenceNeutralizesDocumentEvidenceOnly(t *testing.T) {
 	document := model.Citation{
-		DocumentID: "doc-1",
-		Content:    "正文 [3, §14] 【4】",
+		DocumentID:      "doc-1",
+		Sender:          "【3】合同.pdf",
+		Content:         "正文 [3, §14] 【4】",
+		SentAt:          "[2026-09-14]",
+		Source:          "Roadmap [3, §14]",
+		ChannelID:       "channel-【3】",
+		DocumentVersion: "v【3】",
 		ContextBefore: []model.ContextMsg{{
+			Sender:  "【2】起草人",
 			Content: "上文 [1-2]",
+			SentAt:  "[2026-09-14]",
 		}},
 		ContextAfter: []model.ContextMsg{{
 			Content: "下文 [3.14.1]",
@@ -30,6 +37,12 @@ func TestSanitizeCitationsForReferenceNeutralizesDocumentEvidenceOnly(t *testing
 	if got[0].Content != "正文 (3, §14) (4)" || got[0].ContextBefore[0].Content != "上文 (1-2)" ||
 		got[0].ContextAfter[0].Content != "下文 [3.14.1]" {
 		t.Fatalf("document citation was not safely neutralized: %#v", got[0])
+	}
+	if got[0].Sender != "(3)合同.pdf" || got[0].Source != "Roadmap (3, §14)" ||
+		got[0].ChannelID != "channel-(3)" || got[0].DocumentVersion != "v(3)" ||
+		got[0].SentAt != "[2026-09-14]" || got[0].ContextBefore[0].Sender != "(2)起草人" ||
+		got[0].ContextBefore[0].SentAt != "[2026-09-14]" {
+		t.Fatalf("document citation metadata was not safely neutralized: %#v", got[0])
 	}
 	if got[1].Content != chat.Content || got[1].ContextBefore[0].Content != chat.ContextBefore[0].Content {
 		t.Fatalf("chat citation changed: got=%#v want=%#v", got[1], chat)

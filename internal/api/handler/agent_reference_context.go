@@ -114,12 +114,18 @@ func sanitizeCitationsForReference(citations []model.Citation) []model.Citation 
 		citation.SentAt = sanitizeRefBlock(citation.SentAt)
 		citation.Source = sanitizeRefBlock(citation.Source)
 		citation.ChannelID = sanitizeRefBlock(citation.ChannelID)
+		citation.DocumentVersion = sanitizeRefBlock(citation.DocumentVersion)
 		documentEvidence := citation.DocumentID != ""
 		if documentEvidence {
 			// sanitizeRefBlock runs first because it can manufacture ASCII [n]
 			// from full-width delimiters such as 【3】. The document boundary must
 			// inspect the final prompt-facing representation.
+			citation.Sender = citationtext.DocumentEvidenceForModel(citation.Sender)
 			citation.Content = citationtext.DocumentEvidenceForModel(citation.Content)
+			citation.SentAt = citationtext.DocumentEvidenceForModel(citation.SentAt)
+			citation.Source = citationtext.DocumentEvidenceForModel(citation.Source)
+			citation.ChannelID = citationtext.DocumentEvidenceForModel(citation.ChannelID)
+			citation.DocumentVersion = citationtext.DocumentEvidenceForModel(citation.DocumentVersion)
 		}
 		citation.ContextBefore = sanitizeContextMessagesForReference(citation.ContextBefore, documentEvidence)
 		citation.ContextAfter = sanitizeContextMessagesForReference(citation.ContextAfter, documentEvidence)
@@ -133,10 +139,12 @@ func sanitizeContextMessagesForReference(messages []model.ContextMsg, documentEv
 	for i, message := range messages {
 		message.Sender = sanitizeRefBlock(message.Sender)
 		message.Content = sanitizeRefBlock(message.Content)
-		if documentEvidence {
-			message.Content = citationtext.DocumentEvidenceForModel(message.Content)
-		}
 		message.SentAt = sanitizeRefBlock(message.SentAt)
+		if documentEvidence {
+			message.Sender = citationtext.DocumentEvidenceForModel(message.Sender)
+			message.Content = citationtext.DocumentEvidenceForModel(message.Content)
+			message.SentAt = citationtext.DocumentEvidenceForModel(message.SentAt)
+		}
 		sanitized[i] = message
 	}
 	return sanitized

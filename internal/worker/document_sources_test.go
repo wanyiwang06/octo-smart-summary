@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -136,6 +137,9 @@ func TestExecutePersonalPipelineUsesDocumentSnapshotsAndKeepsCoordinates(t *test
 	}
 	for i, docID := range []string{"docA", "docB"} {
 		content := "共同前缀：" + strings.Repeat("内容", 120) + fmt.Sprintf(" 文档%d", i+1)
+		if i == 0 {
+			content += " 嵌套来源 [[2]]"
+		}
 		hash := sha256.Sum256([]byte(content))
 		hashText := hex.EncodeToString(hash[:])
 		source := model.SummarySource{
@@ -152,7 +156,10 @@ func TestExecutePersonalPipelineUsesDocumentSnapshotsAndKeepsCoordinates(t *test
 		}
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	promptBodies := make(chan string, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		promptBodies <- string(body)
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"预算区间 [1-2][2, §14] 万元，版本 [2.18–19]，金额 [1,234.5] 万元，结论 [1]，独立条款 [2, §14.4]"}}],"usage":{"total_tokens":12}}`)
 		_, _ = fmt.Fprintln(w, "data: [DONE]")
@@ -176,6 +183,14 @@ func TestExecutePersonalPipelineUsesDocumentSnapshotsAndKeepsCoordinates(t *test
 	}
 	if citations[0].DocumentID != "docA" || citations[1].DocumentID != "docB" {
 		t.Fatalf("document coordinates=%#v", citations)
+	}
+	select {
+	case promptBody := <-promptBodies:
+		if strings.Contains(promptBody, "[[2]]") || !strings.Contains(promptBody, "[(2)]") {
+			t.Fatalf("document map prompt retained nested source marker: %s", promptBody)
+		}
+	default:
+		t.Fatal("document map request was not captured")
 	}
 	renormalized, err := service.NormalizeGeneratedCitations(result, citations)
 	if err != nil || renormalized != result {
@@ -239,7 +254,7 @@ func TestFormatDocumentEvidenceEscapesMetadataCitationMarkers(t *testing.T) {
 		SourceName:    "Roadmap [2] [3, §14]",
 		SourceVersion: "v9 [7] [2, 第一章]",
 		MessageSeq:    1,
-		Content:       "正文 [3]，依据 [3, 第14条] 执行",
+		Content:       "正文 [3]，嵌套 [[3]]，依据 [3, 第14条] 执行",
 	})
 	for _, marker := range []string{"[2]", "[7]", "[3]", "[3, §14]", "[3, 第14条]", "[2, 第一章]"} {
 		if strings.Contains(got, marker) {
@@ -250,6 +265,9 @@ func TestFormatDocumentEvidenceEscapesMetadataCitationMarkers(t *testing.T) {
 		if !strings.Contains(got, prose) {
 			t.Fatalf("formatted evidence lost source prose %s: %q", prose, got)
 		}
+	}
+	if !strings.Contains(got, "嵌套 [(3)]") {
+		t.Fatalf("formatted evidence retained a nested citation marker: %q", got)
 	}
 	if !strings.HasPrefix(got, "[5]") {
 		t.Fatalf("formatted evidence lost canonical marker: %q", got)
