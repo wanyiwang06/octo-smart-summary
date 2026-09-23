@@ -34,16 +34,37 @@ const maxLLMErrorBodyBytes = 4096
 //
 // Sized at 2× the agent per-request summary-handle text cap (8 MiB =
 // agent.maxSummaryHandleText). merge_summaries joins up to that much text into
-// ONE Reduce prompt, and json.Marshal HTML-escapes &<> to 6-byte \u00XX. The 2×
-// headroom absorbs REALISTIC escaping (chat text is overwhelmingly unescaped
-// runes; metacharacters are a small fraction) plus the messages/prompt framing,
-// so a normal max-size Reduce clears the guard. It is NOT a worst-case guarantee:
-// a pathological body that is mostly &<> escapes ~6×, so a near-cap Reduce made
-// almost entirely of metacharacters could still trip REQUEST_TOO_LARGE and, on
-// the critical merge_summaries tool, discard a successful Map phase. That input
-// is not something real chat produces, and token-aware chunking (#241 item 3) is
-// the structural prevention; this ceiling is only the coarse backstop.
+// ONE Reduce prompt. Outbound bodies are serialized with MarshalRequestBody,
+// which disables Go's HTML escaping (#256 P2-5), so &<> cost one byte each rather
+// than the 6-byte \u00XX json.Marshal would emit — a near-cap Reduce made almost
+// entirely of metacharacters can no longer inflate ~6× and trip REQUEST_TOO_LARGE
+// on the critical merge_summaries tool, discarding a successful Map phase. The 2×
+// headroom then only has to absorb the messages/prompt framing, so a normal
+// max-size Reduce clears the guard. token-aware chunking (#241 item 3) remains
+// the structural prevention; this ceiling is the coarse backstop.
 const MaxRequestBodyBytes = 16 << 20 // 16 MiB (2× agent.maxSummaryHandleText; coarse backstop, not a worst-case guarantee)
+
+// MarshalRequestBody serializes an outbound chat request body WITHOUT Go's
+// default HTML escaping. json.Marshal rewrites the three metacharacters < > &
+// into their six-byte backslash-u escape forms, which is meaningless for an
+// application/json API body (that escaping only matters when embedding JSON
+// inside HTML) and inflates the serialized size up to ~6× for metacharacter-heavy
+// content. That inflation is not free: the pre-send size guard (ErrRequestTooLarge)
+// measures these exact bytes, so a completed but metacharacter-heavy Map/Reduce
+// body could be pushed past MaxRequestBodyBytes and the whole run discarded purely
+// by escaping (#256 P2-5). Leaving < > & unescaped is valid JSON per RFC 8259, so
+// the model API parses it fine. Encoder.Encode appends a trailing newline; trim it
+// so the body and the size it is judged by are byte-exact. Exported so the agent
+// planner client shares it.
+func MarshalRequestBody(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
 
 // ErrRequestTooLarge marks a request rejected before sending because its
 // serialized body exceeds MaxRequestBodyBytes. It is terminal — retrying or
@@ -329,7 +350,7 @@ func (c *LLMClient) callWithPolicyAndModel(ctx context.Context, messages []ChatM
 		reqBody.Thinking = thinking
 		reqBody.ChatTemplateKwargs = kwargs
 
-		body, err := json.Marshal(reqBody)
+		body, err := MarshalRequestBody(reqBody)
 		if err != nil {
 			return result{}, llmfallback.Terminal, err
 		}
@@ -464,7 +485,7 @@ func (c *LLMClient) callStreamWithModel(ctx context.Context, messages []ChatMess
 		reqBody.Thinking = thinking
 		reqBody.ChatTemplateKwargs = kwargs
 
-		body, err := json.Marshal(reqBody)
+		body, err := MarshalRequestBody(reqBody)
 		if err != nil {
 			return result{}, llmfallback.Terminal, err
 		}
@@ -628,7 +649,7 @@ func (c *LLMClient) CallWithTools(ctx context.Context, messages []ChatMessage, t
 		reqBody.Thinking = thinking
 		reqBody.ChatTemplateKwargs = kwargs
 
-		body, err := json.Marshal(reqBody)
+		body, err := MarshalRequestBody(reqBody)
 		if err != nil {
 			return result{}, llmfallback.Terminal, fmt.Errorf("marshal request: %w", err)
 		}

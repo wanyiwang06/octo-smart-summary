@@ -50,26 +50,41 @@ const (
 	maxChunkCalls = 256
 )
 
-// mapCoverageGapNotice is appended to the combined Map output when some chunks
-// were dropped (a tolerated per-chunk failure, or the maxChunkCalls truncation),
-// so the gap is disclosed IN the summary text — independent of the V2 run-row
-// disclosure (recordDroppedMessages → finishgate PARTIAL), which ships dark by
-// default, meaning the combined text alone would otherwise read complete
-// (#256 P1). merge_summaries treats it as ordinary text; the reduce prompt
-// (prompts/summary.md) lists the coverage fields the planner must act on.
+// mapCoverageGapNotice is appended to the combined Map output whenever coverage
+// is incomplete for ANY reason — a tolerated per-chunk failure, a blank-but-
+// successful chunk, a message dropped after the citation manifest froze, or the
+// maxChunkCalls fan-out truncation — so the gap is disclosed IN the summary text,
+// independent of the V2 run-row disclosure (recordDroppedMessages → finishgate
+// PARTIAL), which ships dark by default, meaning the combined text alone would
+// otherwise read complete (#256 P1). merge_summaries treats it as ordinary text;
+// the reduce prompt (prompts/summary.md) lists the coverage fields the planner
+// must act on.
 const mapCoverageGapNotice = "\n\n---\n\n（注意：部分聊天内容未能纳入本次总结，结果可能不完整。）"
 
 // chunkCoverage 汇总 summarize_chunk 实际喂给模型的消息覆盖情况，随工具结果
 // 返回，让 Runner/Planner 能判断是否发生丢弃或截断，而不是只看到 chunk_count。
 type chunkCoverage struct {
-	InputCount            int  `json:"input_count"`
-	ProcessedCount        int  `json:"processed_count"`
-	DroppedCount          int  `json:"dropped_count"`
-	OversizedMessageCount int  `json:"oversized_message_count"`
-	FailedChunkCount      int  `json:"failed_chunk_count"`
-	ChunkCallsCapped      bool `json:"chunk_calls_capped"`
-	Truncated             bool `json:"truncated"`
-	ChunkSize             int  `json:"chunk_size"`
+	InputCount     int `json:"input_count"`
+	ProcessedCount int `json:"processed_count"`
+	// DroppedCount is ACCIDENTAL/silent loss only: messages not represented in
+	// the Map output because their chunk failed, returned blank, or was fetched
+	// after the citation manifest froze. Intentional fan-out-cap drops live in
+	// CappedDroppedCount instead — a disclosed cap is not a silent loss — so a
+	// "did we lose data unexpectedly?" check keys on this field alone (#256 P2).
+	DroppedCount int `json:"dropped_count"`
+	// CappedDroppedCount is the messages dropped by the maxChunkCalls fan-out cap
+	// (#241). It is intentional and disclosed via ChunkCallsCapped, and is kept
+	// OUT of DroppedCount so it does not read as accidental loss (#256 P2).
+	CappedDroppedCount    int `json:"capped_dropped_count"`
+	OversizedMessageCount int `json:"oversized_message_count"`
+	FailedChunkCount      int `json:"failed_chunk_count"`
+	// BlankChunkCount is chunks whose Map LLM call SUCCEEDED but returned an empty
+	// summary. Their messages are folded into DroppedCount (not ProcessedCount)
+	// so a blank result cannot masquerade as covered (#256 P2).
+	BlankChunkCount  int  `json:"blank_chunk_count"`
+	ChunkCallsCapped bool `json:"chunk_calls_capped"`
+	Truncated        bool `json:"truncated"`
+	ChunkSize        int  `json:"chunk_size"`
 }
 
 // clampChunkSize 把请求的 chunk_size 收敛到 [1, hardMessageBackstop]；<=0 取
@@ -405,12 +420,22 @@ func SummarizeChunkTool() (Tool, Handler) {
 		// error that latches the run FAILED with no planner recovery). capChunks
 		// keeps the MOST RECENT chunks (see its doc); the drop is disclosed below.
 		chunks, capped := capChunks(chunks)
+		cappedDropped := 0
 		if capped {
-			log.Printf("[summarize_chunk] fan-out capped at %d chunks; kept the most recent, dropped the older tail, disclosed via chunk_calls_capped (#241)", maxChunkCalls)
+			// Count the messages the cap discarded. chunks partitions msgMaps, so
+			// the kept messages plus the capped-away tail sum to len(msgMaps); the
+			// difference is the intentional drop, reported separately from the
+			// silent-loss DroppedCount (#256 P2-4).
+			keptMsgs := 0
+			for _, c := range chunks {
+				keptMsgs += len(c)
+			}
+			cappedDropped = len(msgMaps) - keptMsgs
+			log.Printf("[summarize_chunk] fan-out capped at %d chunks; kept the most recent, dropped the older tail (%d messages), disclosed via chunk_calls_capped (#241)", maxChunkCalls, cappedDropped)
 		}
 
 		// Summarize each chunk and aggregate honest coverage counts.
-		cov := chunkCoverage{InputCount: inputCount, ChunkSize: msgsPerChunk, ChunkCallsCapped: capped}
+		cov := chunkCoverage{InputCount: inputCount, ChunkSize: msgsPerChunk, ChunkCallsCapped: capped, CappedDroppedCount: cappedDropped}
 		// SS-06: load the run's SummarySpec-derived guidance once so every Map
 		// call summarizes toward the user's actual requirements. Empty when V2 is
 		// off / no run / no spec → legacy generic prompt.
@@ -425,18 +450,30 @@ func SummarizeChunkTool() (Tool, Handler) {
 		// tool span and a slow Map is indistinguishable from a slow planner.
 		TraceFromContext(ctx).AddSubPhase(fmt.Sprintf("map(%dchunks)", len(chunks)),
 			time.Since(mapStart).Milliseconds())
-		cov.DroppedCount = cov.InputCount - cov.ProcessedCount
+		// DroppedCount is ACCIDENTAL loss only: total unrepresented messages minus
+		// the intentional, disclosed fan-out-cap drops (#256 P2-4). Truncated is the
+		// silent-loss signal, so it keys on DroppedCount alone — a deliberate cap
+		// sets ChunkCallsCapped/CappedDroppedCount but must not raise Truncated.
+		cov.DroppedCount = cov.InputCount - cov.ProcessedCount - cov.CappedDroppedCount
 		cov.Truncated = cov.DroppedCount > 0
 
-		combinedSummary, err := assembleMapOutput(summaries, cov.FailedChunkCount, capped, len(chunks))
+		// The gap notice fires for ANY real coverage gap — accidental (a failed or
+		// blank chunk, or a manifest-miss, all folded into DroppedCount) OR the
+		// intentional cap — so the combined text discloses incompleteness whatever
+		// the cause (#256 P1).
+		coverageGap := cov.DroppedCount > 0 || cov.CappedDroppedCount > 0
+		combinedSummary, err := assembleMapOutput(summaries, coverageGap)
 		if err != nil {
 			return "", err
 		}
 		// Persist the dropped-message count only once we have a usable Map output
 		// to return. recordDroppedMessages does `dropped_messages = dropped_messages
 		// + ?`, so recording it before the error return above would double-count on
-		// every retry of an all-blank Map (#256 P2).
-		recordDroppedMessages(ctx, uid, runID, cov.DroppedCount)
+		// every retry of an all-blank Map (#256 P2). Record the TOTAL loss
+		// (accidental + capped) so the finish-gate PARTIAL disclosure still reflects
+		// every message the run did not cover, even though the two are tracked
+		// separately in the coverage result.
+		recordDroppedMessages(ctx, uid, runID, cov.DroppedCount+cov.CappedDroppedCount)
 		// chunk_count reports the summaries actually stored (successful chunks),
 		// not attempted, so it does not over-report by FailedChunkCount.
 		return marshalSummarizeChunkResult(ctx, combinedSummary, len(summaries), cov)
@@ -451,8 +488,10 @@ type summarizeChunkToolResult struct {
 	InputCount            int    `json:"input_count"`
 	ProcessedCount        int    `json:"processed_count"`
 	DroppedCount          int    `json:"dropped_count"`
+	CappedDroppedCount    int    `json:"capped_dropped_count"`
 	OversizedMessageCount int    `json:"oversized_message_count"`
 	FailedChunkCount      int    `json:"failed_chunk_count"`
+	BlankChunkCount       int    `json:"blank_chunk_count"`
 	ChunkCallsCapped      bool   `json:"chunk_calls_capped"`
 	Truncated             bool   `json:"truncated"`
 	ChunkSize             int    `json:"chunk_size"`
@@ -473,8 +512,10 @@ func marshalSummarizeChunkResult(ctx context.Context, summary string, chunkCount
 		InputCount:            cov.InputCount,
 		ProcessedCount:        cov.ProcessedCount,
 		DroppedCount:          cov.DroppedCount,
+		CappedDroppedCount:    cov.CappedDroppedCount,
 		OversizedMessageCount: cov.OversizedMessageCount,
 		FailedChunkCount:      cov.FailedChunkCount,
+		BlankChunkCount:       cov.BlankChunkCount,
 		ChunkCallsCapped:      cov.ChunkCallsCapped,
 		Truncated:             cov.Truncated,
 		ChunkSize:             cov.ChunkSize,
@@ -616,44 +657,20 @@ type chunkMapOutcome struct {
 	err       error
 }
 
-// summarizeChunksConcurrently runs the Map phase over chunks with bounded
-// concurrency and returns the summaries in ORIGINAL chunk order, aggregating
-// coverage counters into cov.
+// assembleMapOutput joins the kept chunk summaries into one Map document and,
+// when coverageGap is set (any message was dropped — a failed or blank chunk, a
+// manifest-miss, or the intentional fan-out cap), appends the V2-independent gap
+// notice so the incompleteness is visible IN the text, not only in the run row.
 //
-// Why this is not a plain `go` over the old loop body:
-//
-//   - Order. Callers join the summaries into one document and the [n] citation
-//     markers inside them index a frozen manifest, so a completion-ordered
-//     append would reorder the deliverable. Results land in outcomes[i], never
-//     appended, so output order is independent of completion order.
-//   - Coverage counters. The serial loop incremented cov.ProcessedCount /
-//     cov.OversizedMessageCount inside the loop body. Those are plain ints on a
-//     shared struct; incrementing them from N goroutines is a data race and
-//     would silently under-count coverage — the exact class of defect SS-01
-//     exists to prevent. They are accumulated here, after Wait, in index order.
-//   - Error determinism. The serial loop failed on the first chunk by position.
-//     With concurrency, "first error to arrive" varies run to run, so the same
-//     input could surface different errors. This waits for every started
-//     goroutine and reports the LOWEST-INDEX error, preserving the old
-//     behaviour exactly.
-//   - Cancellation. Acquiring the semaphore selects on ctx.Done(): when the
-//     request deadline fires, queued chunks abort immediately instead of
-//     waiting for an in-flight LLM call to release a slot.
-//   - Panic containment. Registry.Dispatch deliberately converts handler
-//     panics into tool errors. Map workers run below that recovery boundary, so
-//     each worker must recover locally to preserve the same process-safety
-//     contract as the old serial loop.
-//
-// assembleMapOutput joins the successful chunk summaries and, when coverage was
-// incomplete (a dropped/capped chunk), appends the V2-independent gap notice —
-// but ONLY when there is real content to ship. Empty joined output (every kept
-// summary blank — e.g. a chunk whose upstream returned empty content as a
-// non-error "success" alongside a tolerated failure) is a no-usable-Map result,
-// returned as an error so classifyToolError makes it fatal-and-retryable and the
-// planner can recover, rather than shipping a "summary" whose entire body is the
-// notice (which would slip past the handle store's empty guard and reduce into a
-// vacuous deliverable — #256 P1-R4). Pure + testable (#256 P2).
-func assembleMapOutput(summaries []string, failedChunks int, capped bool, totalChunks int) (string, error) {
+// It appends the notice ONLY when there is real content to ship. An all-blank
+// input (every entry whitespace — e.g. the caller handed through summaries that
+// all came back empty) is a no-usable-Map result, returned as an error so
+// classifyToolError makes it fatal-and-retryable and the planner can recover,
+// rather than shipping a "summary" whose entire body is the notice (which would
+// slip past the handle store's empty guard and reduce into a vacuous deliverable
+// — #256 P1-R4). In production summarizeChunksConcurrently already drops blank
+// chunks, so this guard is defense-in-depth. Pure + testable (#256 P2).
+func assembleMapOutput(summaries []string, coverageGap bool) (string, error) {
 	// Emptiness must be judged on the SUMMARIES, not the joined string: the
 	// "\n\n---\n\n" separator is itself non-whitespace, so a TrimSpace on the
 	// join would never see an all-blank set as empty.
@@ -665,14 +682,10 @@ func assembleMapOutput(summaries []string, failedChunks int, capped bool, totalC
 		}
 	}
 	if !hasContent {
-		// attempted = len(kept chunks); failed = errored/dropped; the remainder
-		// "succeeded" but returned blank — spell all three out so the message is
-		// honest even when failedChunks is 0 (blank-but-no-error case).
-		return "", fmt.Errorf("summarize_chunk: no usable Map output (%d chunks attempted, %d failed, %d blank)",
-			totalChunks, failedChunks, len(summaries))
+		return "", fmt.Errorf("summarize_chunk: no usable Map output (every kept chunk failed, was dropped, or returned blank)")
 	}
 	combined := strings.Join(summaries, "\n\n---\n\n")
-	if failedChunks > 0 || capped {
+	if coverageGap {
 		combined += mapCoverageGapNotice
 	}
 	return combined, nil
@@ -716,20 +729,50 @@ func summarizeChunkRecovered(ctx context.Context, idx int, chunk []map[string]in
 	return summarizeChunkFn(ctx, chunk, specGuidance)
 }
 
-// summarizeChunksConcurrently runs the per-chunk Map LLM calls. Concurrency 1
-// takes a dedicated serial path (see below) rather than a one-permit semaphore,
-// so it is a true rollback switch.
+// summarizeChunksConcurrently runs the Map phase over chunks with bounded
+// concurrency and returns the kept summaries in ORIGINAL chunk order, aggregating
+// coverage counters into cov. Concurrency 1 takes a dedicated serial path (see
+// below) rather than a one-permit semaphore, so it is a true rollback switch.
+//
+// Why this is not a plain `go` over the old loop body:
+//
+//   - Order. Callers join the summaries into one document and the [n] citation
+//     markers inside them index a frozen manifest, so a completion-ordered
+//     append would reorder the deliverable. Results land in outcomes[i], never
+//     appended, so output order is independent of completion order.
+//   - Coverage counters. The serial loop incremented cov.ProcessedCount /
+//     cov.OversizedMessageCount inside the loop body. Those are plain ints on a
+//     shared struct; incrementing them from N goroutines is a data race and
+//     would silently under-count coverage — the exact class of defect SS-01
+//     exists to prevent. They are accumulated after Wait, in index order.
+//   - Cancellation. Acquiring the semaphore selects on ctx.Done(): when the
+//     request deadline fires, queued chunks abort immediately instead of
+//     waiting for an in-flight LLM call to release a slot.
+//   - Panic containment. Registry.Dispatch deliberately converts handler
+//     panics into tool errors. Map workers run below that recovery boundary, so
+//     each worker must recover locally to preserve the same process-safety
+//     contract as the old serial loop.
 //
 // Failure policy (#241 item 2): a single chunk's failure does NOT discard the
 // summaries already computed for the others — the failed slice is dropped from
 // the reduce input (NOT replaced with a marker: the worker path filters its
 // MapFailedMarker out of reduce too, and the gap is disclosed structurally via
-// cov.FailedChunkCount → DroppedCount → PARTIAL). Only the RUN's own context
-// being cancelled/expired aborts the whole phase — a single chunk's own
-// per-attempt timeout (which also unwraps to context.DeadlineExceeded) is a
-// tolerated per-chunk failure, not a reason to throw away the paid-for work. If
-// every chunk fails there is nothing usable, so the phase errors and wraps the
-// lowest-index cause so classifyToolError sees the real (often transient) shape.
+// cov.FailedChunkCount → DroppedCount → PARTIAL). A chunk that SUCCEEDS but
+// returns a blank summary is likewise dropped and counted (cov.BlankChunkCount),
+// never counted as processed — otherwise its messages would read as covered
+// while contributing nothing (#256 P2). Only the RUN's own context being
+// cancelled/expired, or a fatal per-chunk error (truncation / reasoning-budget
+// exhaustion, see isFatalChunkError), aborts the whole phase — a single chunk's
+// own per-attempt timeout (which also unwraps to context.DeadlineExceeded) is a
+// tolerated per-chunk failure, not a reason to throw away the paid-for work.
+//
+// Error reporting when EVERY chunk fails: there is nothing usable, so the phase
+// errors. It no longer returns a single "first"/lowest-index cause — the old
+// serial loop stopped at the first error by position, but the tolerant path
+// above lets every chunk fail independently, so the causes may all differ. It
+// wraps errors.Join of ALL the per-chunk causes (in index order) so no reason is
+// lost for triage and classifyToolError can still match any transient shape
+// among them (#256 P2-6).
 func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]interface{}, specGuidance string, cov *chunkCoverage) ([]string, error) {
 	_, _, _, cfg := GetSummaryDeps()
 	concurrency := cfg.ResolveAgentMapConcurrency()
@@ -744,7 +787,7 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 	// still not be running the old code path. Short-circuit instead.
 	if concurrency <= 1 {
 		summaries := make([]string, 0, len(chunks))
-		var firstErr error
+		var errs []error
 		for i, chunk := range chunks {
 			summary, processed, oversized, err := summarizeChunkRecovered(ctx, i, chunk, specGuidance)
 			if err != nil {
@@ -758,12 +801,20 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 					return nil, fmt.Errorf("summarize chunk %d: %w", i, err)
 				}
 				// Per-chunk failure with the run still alive: drop this slice and
-				// keep the rest (#241 item 2). Gap disclosed via cov.
+				// keep the rest (#241 item 2). Gap disclosed via cov; the cause is
+				// retained (index order) for the all-failed errors.Join below.
 				log.Printf("[summarize_chunk] chunk %d failed, dropping from reduce input: %v", i, err)
-				if firstErr == nil {
-					firstErr = err
-				}
+				errs = append(errs, fmt.Errorf("chunk %d: %w", i, err))
 				cov.FailedChunkCount++
+				continue
+			}
+			if strings.TrimSpace(summary) == "" {
+				// Successful call, blank summary: its messages contribute nothing to
+				// the output, so counting them as processed would hide the loss
+				// (#256 P2-3). Drop it — the messages fall into DroppedCount — and
+				// count it separately.
+				log.Printf("[summarize_chunk] chunk %d returned a blank summary, dropping from reduce input", i)
+				cov.BlankChunkCount++
 				continue
 			}
 			summaries = append(summaries, summary)
@@ -771,7 +822,7 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 			cov.OversizedMessageCount += oversized
 		}
 		if len(chunks) > 0 && cov.FailedChunkCount == len(chunks) {
-			return nil, fmt.Errorf("summarize_chunk: all %d chunks failed: %w", len(chunks), firstErr)
+			return nil, fmt.Errorf("summarize_chunk: all %d chunks failed: %w", len(chunks), errors.Join(errs...))
 		}
 		log.Printf("[summarize_chunk] map phase: chunks=%d concurrency=1 failed=%d elapsed=%dms",
 			len(chunks), cov.FailedChunkCount, time.Since(start).Milliseconds())
@@ -819,7 +870,7 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 		len(chunks), concurrency, time.Since(start).Milliseconds())
 
 	summaries := make([]string, 0, len(chunks))
-	var firstErr error
+	var errs []error
 	for i, o := range outcomes {
 		if o.err != nil {
 			if ctx.Err() != nil {
@@ -833,12 +884,18 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 			}
 			// Per-chunk failure (e.g. this chunk's own upstream timeout) with the
 			// run still alive: drop this slice, keep the rest (#241 item 2). The
-			// lowest-index cause is kept for the all-failed wrap below.
+			// cause is retained (index order) for the all-failed errors.Join below.
 			log.Printf("[summarize_chunk] chunk %d failed, dropping from reduce input: %v", i, o.err)
-			if firstErr == nil {
-				firstErr = o.err
-			}
+			errs = append(errs, fmt.Errorf("chunk %d: %w", i, o.err))
 			cov.FailedChunkCount++
+			continue
+		}
+		if strings.TrimSpace(o.summary) == "" {
+			// Successful call, blank summary: its messages contribute nothing to the
+			// output, so counting them as processed would hide the loss (#256 P2-3).
+			// Drop it — the messages fall into DroppedCount — and count it separately.
+			log.Printf("[summarize_chunk] chunk %d returned a blank summary, dropping from reduce input", i)
+			cov.BlankChunkCount++
 			continue
 		}
 		summaries = append(summaries, o.summary)
@@ -846,7 +903,7 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 		cov.OversizedMessageCount += o.oversized
 	}
 	if len(chunks) > 0 && cov.FailedChunkCount == len(chunks) {
-		return nil, fmt.Errorf("summarize_chunk: all %d chunks failed: %w", len(chunks), firstErr)
+		return nil, fmt.Errorf("summarize_chunk: all %d chunks failed: %w", len(chunks), errors.Join(errs...))
 	}
 	return summaries, nil
 }

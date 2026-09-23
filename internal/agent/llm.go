@@ -135,7 +135,7 @@ func (c *Client) attemptChat(ctx context.Context, model string, msgs []Message, 
 	if len(tools) > 0 {
 		reqBody.ToolChoice = "auto"
 	}
-	payload, err := json.Marshal(reqBody)
+	payload, err := service.MarshalRequestBody(reqBody)
 	if err != nil {
 		return AssistantTurn{}, llmfallback.Terminal, fmt.Errorf("marshal request: %w", err)
 	}

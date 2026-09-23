@@ -15,9 +15,9 @@ import (
 )
 
 // Map-phase concurrency tests. All of them swap summarizeChunkFn, so none of
-// them touches a real LLM; they assert the four properties the concurrent Map
-// path must preserve relative to the previous serial loop: bounded fan-out,
-// original output order, deterministic (lowest-index) error, and prompt
+// them touches a real LLM; they assert the properties the concurrent Map path
+// must preserve relative to the previous serial loop: bounded fan-out, original
+// output order, an all-failed error that preserves every cause, and prompt
 // cancellation.
 
 // withMapConcurrency installs cfg.AgentMapConcurrency for the duration of a
@@ -178,14 +178,61 @@ func TestSummarizeChunksConcurrently_FailedChunkDropped(t *testing.T) {
 	}
 }
 
+// A chunk whose Map call SUCCEEDS but returns a blank summary must be dropped,
+// NOT counted as processed — otherwise its messages read as covered while
+// contributing nothing to the output (silent loss, #256 P2-3). It is counted in
+// BlankChunkCount and its processed messages must not inflate ProcessedCount.
+func TestSummarizeChunksConcurrently_BlankSuccessDropped(t *testing.T) {
+	for _, concurrency := range []int{1, 4} {
+		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
+			withMapConcurrency(t, concurrency)
+			withStubMapCall(t, func(_ context.Context, chunk []map[string]interface{}, _ string) (string, int, int, error) {
+				switch chunk[0]["content"].(string) {
+				case "chunk-1":
+					return "   ", 5, 0, nil // whitespace-only "success"
+				case "chunk-3":
+					return "", 5, 0, nil // empty "success"
+				}
+				return "s", 5, 0, nil
+			})
+
+			var cov chunkCoverage
+			got, err := summarizeChunksConcurrently(context.Background(), makeChunks(5), "", &cov)
+			if err != nil {
+				t.Fatalf("blank successes must be tolerated, got %v", err)
+			}
+			if len(got) != 3 {
+				t.Fatalf("want the 3 non-blank summaries kept, got %d", len(got))
+			}
+			if cov.BlankChunkCount != 2 {
+				t.Errorf("BlankChunkCount = %d, want 2", cov.BlankChunkCount)
+			}
+			if cov.FailedChunkCount != 0 {
+				t.Errorf("blank success is not a failure: FailedChunkCount = %d, want 0", cov.FailedChunkCount)
+			}
+			// Only the 3 non-blank chunks (5 messages each) may count as processed;
+			// the 2 blank chunks' 10 messages must NOT be counted as covered.
+			if cov.ProcessedCount != 15 {
+				t.Fatalf("ProcessedCount = %d, want 15 — blank chunk messages leaked into processed", cov.ProcessedCount)
+			}
+		})
+	}
+}
+
 // When EVERY chunk fails there is nothing usable, so the whole phase errors —
-// and it WRAPS the lowest-index cause so classifyToolError sees the real
-// (often transient) shape rather than a bare "all failed" string.
-func TestSummarizeChunksConcurrently_AllFailuresErrorWrapsCause(t *testing.T) {
+// and it wraps errors.Join of ALL the per-chunk causes so classifyToolError sees
+// the real (often transient) shapes and nothing is lost for triage (#256 P2-6).
+// Two DISTINCT sentinels are essential: a single shared error would make
+// errors.Is trivially true and pin nothing about which causes survive.
+func TestSummarizeChunksConcurrently_AllFailuresJoinAllCauses(t *testing.T) {
 	withMapConcurrency(t, 3)
-	boom := errors.New("boom")
+	errFirst := errors.New("cause for the first chunk")
+	errRest := errors.New("cause for the other chunks")
 	withStubMapCall(t, func(ctx context.Context, chunk []map[string]interface{}, _ string) (string, int, int, error) {
-		return "", 0, 0, boom
+		if chunk[0]["content"].(string) == "chunk-0" {
+			return "", 0, 0, errFirst
+		}
+		return "", 0, 0, errRest
 	})
 
 	var cov chunkCoverage
@@ -193,8 +240,11 @@ func TestSummarizeChunksConcurrently_AllFailuresErrorWrapsCause(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error when all chunks fail, got nil")
 	}
-	if !errors.Is(err, boom) {
-		t.Fatalf("all-failed error must wrap the cause, got %v", err)
+	if !errors.Is(err, errFirst) {
+		t.Errorf("all-failed error dropped the chunk-0 cause: %v", err)
+	}
+	if !errors.Is(err, errRest) {
+		t.Errorf("all-failed error dropped the later chunks' cause — errors.Join must keep every cause: %v", err)
 	}
 	if got != nil {
 		t.Fatalf("expected no summaries when all fail, got %d", len(got))
@@ -377,7 +427,7 @@ func TestCapChunks(t *testing.T) {
 // notice-only body; a clean full-coverage run gets no notice.
 func TestAssembleMapOutput(t *testing.T) {
 	t.Run("drop with real content: notice appended", func(t *testing.T) {
-		out, err := assembleMapOutput([]string{"real summary"}, 1, false, 2)
+		out, err := assembleMapOutput([]string{"real summary"}, true)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -386,19 +436,19 @@ func TestAssembleMapOutput(t *testing.T) {
 		}
 	})
 	t.Run("capped with real content: notice appended", func(t *testing.T) {
-		out, err := assembleMapOutput([]string{"s"}, 0, true, 300)
+		out, err := assembleMapOutput([]string{"s"}, true)
 		if err != nil || !strings.Contains(out, mapCoverageGapNotice) {
 			t.Fatalf("want notice on cap, got %q err %v", out, err)
 		}
 	})
 	t.Run("all-blank output errors (no notice-only body ships)", func(t *testing.T) {
-		out, err := assembleMapOutput([]string{"", "  "}, 1, false, 3)
+		out, err := assembleMapOutput([]string{"", "  "}, true)
 		if err == nil {
 			t.Fatalf("want a no-usable-Map error, got %q", out)
 		}
 	})
 	t.Run("full coverage: no notice", func(t *testing.T) {
-		out, err := assembleMapOutput([]string{"a", "b"}, 0, false, 2)
+		out, err := assembleMapOutput([]string{"a", "b"}, false)
 		if err != nil || strings.Contains(out, mapCoverageGapNotice) {
 			t.Fatalf("clean run must not carry a gap notice, got %q err %v", out, err)
 		}
