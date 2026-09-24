@@ -118,12 +118,16 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整失败，请稍后重试"})
 		return
 	}
+	// Size gate on the RAW model output, before normalization (mochashanyao
+	// round-3 P2): the normalizer only adds bytes, so gating the normalized
+	// bytes would reject near-cap bodies pr-base accepted.
+	rawLen := len(newContent)
 	newContent = finalizeRefineContent(newContent)
 	if newContent == "" {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整结果为空"})
 		return
 	}
-	if len(newContent) > maxContentBytes {
+	if rawLen > maxContentBytes {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "调整结果超过 500KB 限制"})
 		return
 	}
@@ -368,12 +372,15 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 		writeStreamError("调整失败，请稍后重试")
 		return
 	}
+	// Size gate on the RAW model output, before normalization (see the
+	// non-stream twin above for the mochashanyao round-3 P2 rationale).
+	rawLen := len(newContent)
 	newContent = finalizeRefineContent(newContent)
 	if newContent == "" {
 		writeStreamError("调整结果为空")
 		return
 	}
-	if len(newContent) > maxContentBytes {
+	if rawLen > maxContentBytes {
 		writeStreamError("调整结果超过 500KB 限制")
 		return
 	}

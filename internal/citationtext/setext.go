@@ -30,7 +30,12 @@
 // when a paragraph's last line is indented 4+ spaces ("para\n    more\n---")
 // the normalizer treats that line as indented code and skips the rule, even
 // though CommonMark lets indented text continue a paragraph (PR#268 round-1
-// P2-4 / round-2 A-3).
+// P2-4 / round-2 A-3). Hand-edit and restore paths (EditSummary, PersonalEdit,
+// PersonalDraft, RestorePersonalVersion, failure-restore) persist
+// client-/snapshot-supplied bytes verbatim by design — they are deliberately
+// out of scope (PR#268 round-3: normalizing them would mutate what the user
+// or a version snapshot authored; the asymmetry with normalized team rows is
+// accepted).
 package citationtext
 
 import (
@@ -42,11 +47,16 @@ const (
 	// maxSetextContentRunes caps the paragraph line considered for a setext
 	// underline; longer "paragraphs" are treated as noise and left alone.
 	maxSetextContentRunes = 10000
-	// setextMaxContentBytes bounds the scanned body in BYTES. It must cover
-	// the largest body the write sites accept: maxContentBytes is
-	// 500*1024 = 512000 bytes (internal/api/handler/edit.go), so this guard
-	// sits ABOVE it, not below (PR#268 round-1 P2-1: the old 200000-byte
-	// guard silently bypassed accepted 200KB-500KB summaries).
+	// setextMaxContentBytes bounds the scanned body in BYTES. It is sized to
+	// the largest body the ENFORCING write sites accept: maxContentBytes is
+	// 500*1024 = 512000 bytes (internal/api/handler/edit.go), enforced by
+	// both refine transports and both team/personal write checks — so this
+	// guard sits ABOVE those, not below (PR#268 round-1 P2-1: the old
+	// 200000-byte guard silently bypassed accepted 200KB-500KB summaries).
+	// Known exception (mochashanyao round-3 P2): CreateAgentSummary enforces
+	// no content cap (ValidateAgentSave only rejects empty content), so an
+	// oversized agent deliverable above this bound skips normalization
+	// rather than being rejected.
 	setextMaxContentBytes = 512000
 )
 

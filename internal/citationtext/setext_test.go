@@ -214,6 +214,41 @@ func TestNormalizeSetextHeadingsIndentedUnderlineUntouched(t *testing.T) {
 	}
 }
 
+// Nit pin (mochashanyao round-3): the documented limitations at the package
+// comment currently have no assertions, so a future refactor could widen them
+// silently. These three cases pin the accepted boundary — they exist to
+// surface an accidental change, not to enshrine desired behavior.
+func TestNormalizeSetextHeadingsDocumentedLimitations(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string // "" = byte-identical
+	}{
+		// 1-2 dash underlines are setext H2 in CommonMark but out of scope.
+		{"short underline", "para\n-\n", ""},
+		// Raw HTML blocks are not tracked: the blank line IS inserted, which
+		// terminates the block early — reference rendering (markdown-it,
+		// commonmark preset) of the output gains an <hr/> inside the element
+		// ("<div> | text | <hr /> | </div>"). That mutation is exactly the
+		// documented limitation; this pin locks the current boundary.
+		{"html block", "<div>\ntext\n---\n</div>\n", "<div>\ntext\n\n---\n</div>\n"},
+		// Lazy continuation: the indented last paragraph line suppresses the
+		// fix (A-3) — byte-identical, hijack survives by design.
+		{"lazy continuation", "para\n    more\n---\n", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want := tc.want
+			if want == "" {
+				want = tc.in
+			}
+			if got := NormalizeSetextHeadings(tc.in); got != want {
+				t.Fatalf("documented-limitation boundary changed (update the setext.go:26 block deliberately if intended):\n got=%q\nwant=%q", got, want)
+			}
+		})
+	}
+}
+
 func TestNormalizeSetextHeadingsOversized(t *testing.T) {
 	var b strings.Builder
 	b.WriteString("# 报告\n\n短段落\n\n")

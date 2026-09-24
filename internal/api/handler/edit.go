@@ -286,12 +286,17 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整失败，请稍后重试"})
 		return
 	}
+	// Size gate on the RAW model output, before normalization (mochashanyao
+	// round-3 P2): the normalizer only adds bytes, so gating the normalized
+	// bytes would reject near-cap bodies pr-base accepted. bytesAdded is
+	// report-only (same accounting the agent-save audit log uses).
+	rawLen := len(newContent)
 	newContent = finalizeRefineContent(newContent)
 	if newContent == "" {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整结果为空"})
 		return
 	}
-	if len(newContent) > maxContentBytes {
+	if rawLen > maxContentBytes {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "调整结果超过 500KB 限制"})
 		return
 	}
@@ -471,12 +476,15 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 		writeStreamError("调整失败，请稍后重试")
 		return
 	}
+	// Size gate on the RAW model output, before normalization (see the
+	// non-stream twin above for the mochashanyao round-3 P2 rationale).
+	rawLen := len(newContent)
 	newContent = finalizeRefineContent(newContent)
 	if newContent == "" {
 		writeStreamError("调整结果为空")
 		return
 	}
-	if len(newContent) > maxContentBytes {
+	if rawLen > maxContentBytes {
 		writeStreamError("调整结果超过 500KB 限制")
 		return
 	}
@@ -824,6 +832,10 @@ func finalizeRefineContent(raw string) string {
 		return ""
 	}
 	// Neutralize setext headings the refine model may emit (see
-	// citationtext.NormalizeSetextHeadings).
+	// citationtext.NormalizeSetextHeadings). Note the size gate at the call
+	// sites is applied to the RAW length (mochashanyao round-3 P2): the
+	// normalizer only adds bytes, so gating the normalized bytes would move
+	// the accept/reject boundary — a body just under the cap with a bare
+	// rule was accepted at pr-base and must stay accepted.
 	return citationtext.NormalizeSetextHeadings(newContent)
 }

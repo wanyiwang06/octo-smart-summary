@@ -37,10 +37,10 @@ import (
 // publishes the normalized snapshot.
 
 type recordedEvents struct {
-	mu    sync.Mutex
-	types []string
+	mu     sync.Mutex
+	types  []string
 	bodies []map[string]any
-	done  chan struct{}
+	done   chan struct{}
 }
 
 func (r *recordedEvents) snapshot() ([]string, []map[string]any) {
@@ -97,8 +97,15 @@ func assertNormalizedSnapshotEvent(t *testing.T, rec *recordedEvents) {
 		t.Fatalf("P1: no snapshot event published on the internal stream; wire carries raw bytes while persistence is normalized (events: %v)", types)
 	}
 	content, _ := bodies[snapIdx]["content"].(string)
-	if !strings.Contains(content, "如下：\n\n---") {
-		t.Fatalf("P1: snapshot event content not neutralized: %q", content)
+	// The neutralized signature is a blank line before the rule. (The
+	// personal pipeline's CanonicalizeAdjacent may insert the [n] marker
+	// between the lead-in text and its colon, so anchor on the colon+rule
+	// shape, not on the lead-in words.)
+	if !strings.Contains(content, "：\n\n---") && !strings.Contains(content, "：\n \n---") {
+		if strings.Contains(content, "：\n---") {
+			t.Fatalf("P1: snapshot event still carries the raw setext shape: %q", content)
+		}
+		t.Fatalf("P1: snapshot event content not neutralized (no blank line before rule): %q", content)
 	}
 	if doneIdx != -1 && doneIdx < snapIdx {
 		t.Fatalf("P1: done frame arrived before the normalized snapshot; done would still carry raw accumulation")
@@ -108,8 +115,6 @@ func assertNormalizedSnapshotEvent(t *testing.T, rec *recordedEvents) {
 const setextStreamContent = "现将进展整理如下[1]：\n\n---\n\n### 一、已完成事项\n\n内容甲[2]。\n"
 
 func TestPersonalPipelinePublishesNormalizedSnapshot(t *testing.T) {
-	var llmCalls int32 = 0
-	_ = &llmCalls
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		data, _ := json.Marshal(map[string]interface{}{"choices": []interface{}{

@@ -252,9 +252,13 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 
 			// Neutralize setext headings before persistence and citation
 			// extraction (see citationtext.NormalizeSetextHeadings).
-			// Known divergence (PR#268 round-1 P2-6): teamStream.Delta already
-			// streamed the raw text; only the persisted content is normalized.
+			// Publish the normalized bytes as an EventSnapshot so the done
+			// frame matches the persisted row (mochashanyao round-3 P1:
+			// raw-on-wire vs normalized-in-DB broke edit.go's byte-equality
+			// no-change guard). The single-submission branch is already
+			// consistent — it normalizes before streaming.
 			finalContent = citationtext.NormalizeSetextHeadings(finalContent)
+			teamStream.Send(streaming.Event{Type: streaming.EventSnapshot, Content: finalContent})
 
 			teamCitations = extractTeamCitations(finalContent, indexed)
 		}
