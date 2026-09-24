@@ -703,6 +703,47 @@ func workflowHasDocumentSource(sources []SummaryWorkflowSource) bool {
 }
 
 func validateDocumentWorkflowInput(in LegacyCreateSummaryWorkflowInput, sources []SummaryWorkflowSource) *BizError {
+	// Mixed document+chat scope (admission gate on) is validated by the
+	// handler layer (contract caps, per-source snapshot integrity below);
+	// here only the mixed-invariant subset of the pure-document rules
+	// applies: personal-only, no participants, no origin auto-reply.
+	// TimeRange is LEGAL for mixed scopes (it scopes the chat side), so the
+	// documents-only rejection does not fire when chat sources are present.
+	mixedChat := false
+	for _, source := range sources {
+		if source.SourceType != model.SourceDocument {
+			mixedChat = true
+			break
+		}
+	}
+	if mixedChat {
+		// Mixed scope: personal-only, no origin auto-reply. TimeRange is
+		// LEGAL for mixed scopes (it scopes the chat side), so the
+		// documents-only rejection does not fire when chat sources are
+		// present. Admission is unconditional (owner decision).
+		if in.CreatorID != "" && in.CreatorID != in.ActorID {
+			return NewBizError(40001, "文档总结仅支持当前用户创建", http.StatusBadRequest)
+		}
+		if len(in.Participants) != 0 {
+			return NewBizError(40001, "混合来源总结暂不支持其他参与者", http.StatusBadRequest)
+		}
+		if len(sources) > MixedMaxTotalSources {
+			return MixedSourceCountExceededError()
+		}
+		for _, source := range sources {
+			if source.SourceType != model.SourceDocument {
+				continue
+			}
+			if strings.TrimSpace(source.SourceID) == "" || strings.TrimSpace(source.SnapshotContent) == "" {
+				return NewBizError(40001, "文档来源缺少正文快照", http.StatusBadRequest)
+			}
+			hash := sha256.Sum256([]byte(source.SnapshotContent))
+			if source.SourceHash != hex.EncodeToString(hash[:]) {
+				return NewBizError(40001, "文档来源正文哈希不匹配", http.StatusBadRequest)
+			}
+		}
+		return nil
+	}
 	if len(sources) > MaxDocumentSummarySourceCount {
 		return NewBizError(40001, "文档来源不能超过10个", http.StatusBadRequest)
 	}

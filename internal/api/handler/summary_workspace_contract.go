@@ -34,14 +34,19 @@ const (
 	workspaceSnapshotVersion            = 1
 	maxSummaryWorkspaceSelectedChannels = agent.MaxWorkspaceSelectedChannels
 	maxSummaryWorkspaceDocuments        = service.MaxDocumentSummarySourceCount
-	maxSummaryWorkspaceParticipants     = 30
-	maxSummaryWorkspaceReferencedTask   = 20
-	maxSummaryWorkspaceIDLength         = 256
-	maxSummaryWorkspaceLabelLength      = 256
-	maxSummaryWorkspaceRequirement      = 8192
-	summaryWorkspaceInputUser           = "user"
-	summaryWorkspaceInputTemplate       = "template"
-	summaryWorkspaceInputSystemIntent   = "system_intent"
+	// mixedMaxTotalSources bounds the COMBINED document+chat source count of a
+	// mixed context (plan §1.2: documents ≤ 10, chat+documents ≤ 30). The RAW
+	// request arrays are checked against their caps BEFORE dedup so a giant
+	// duplicate-filled body cannot turn normalization into an amplifier.
+	mixedMaxTotalSources              = 30
+	maxSummaryWorkspaceParticipants   = 30
+	maxSummaryWorkspaceReferencedTask = 20
+	maxSummaryWorkspaceIDLength       = 256
+	maxSummaryWorkspaceLabelLength    = 256
+	maxSummaryWorkspaceRequirement    = 8192
+	summaryWorkspaceInputUser         = "user"
+	summaryWorkspaceInputTemplate     = "template"
+	summaryWorkspaceInputSystemIntent = "system_intent"
 )
 
 var errInvalidSummaryWorkspaceContext = errors.New("invalid summary workspace context")
@@ -187,6 +192,10 @@ func emptySummaryWorkspaceContext() summaryWorkspaceContext {
 	}
 }
 
+// Mixed document+chat scope is admitted UNCONDITIONALLY (owner decision —
+// no admission gate). normalizeSummaryWorkspaceContext enforces the phase-1
+// boundaries: personal-only (no participants), no reference-summary stacking,
+// and the combined source cap.
 func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorkspaceContext, error) {
 	out := emptySummaryWorkspaceContext()
 	if len(in.SelectedChannels) > maxSummaryWorkspaceSelectedChannels {
@@ -232,18 +241,49 @@ func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorksp
 	}
 	dropDocumentDefaultTimeRange := false
 	if len(out.Documents) > 0 {
-		if len(out.SelectedChannels) > 0 || len(in.Participants) > 0 {
-			return out, fmt.Errorf("%w: 文档总结不能混合聊天、参与者或时间范围", errInvalidSummaryWorkspaceContext)
-		}
-		if in.TimeRange != nil {
-			source := strings.TrimSpace(in.TimeRange.Source)
-			if source == "" {
-				source = summaryWorkspaceTimeRangeSourcePicker
+		mixedChat := len(out.SelectedChannels) > 0
+		mixedParticipants := len(in.Participants) > 0
+		mixedReferences := len(in.ReferencedTaskIDs) > 0
+		if mixedChat {
+			// Mixed document+chat: personal-only (no extra participants), no
+			// reference-summary stacking, and the chat time range stays.
+			// Admission is unconditional (owner decision). Phase-1 contract,
+			// see docs/mixed-document-chat-summary-development-plan.md §4.2.
+			if mixedParticipants {
+				return out, fmt.Errorf("%w: 混合来源总结暂不支持协作参与者，请移除参与者后再生成", errInvalidSummaryWorkspaceContext)
 			}
-			if source != summaryWorkspaceTimeRangeSourceDefault {
+			if mixedReferences {
+				return out, fmt.Errorf("%w: 混合来源总结暂不支持叠加引用总结", errInvalidSummaryWorkspaceContext)
+			}
+			if len(out.SelectedChannels)+len(out.Documents) > mixedMaxTotalSources {
+				return out, fmt.Errorf("%w: 混合来源总数不能超过%d个", errInvalidSummaryWorkspaceContext, mixedMaxTotalSources)
+			}
+			// A NON-default time range is the chat side's window and is kept.
+			// Only the document-flow DEFAULT range is meaningless here and is
+			// dropped when no chat sources remain after the merge below.
+			if in.TimeRange != nil {
+				source := strings.TrimSpace(in.TimeRange.Source)
+				if source == "" {
+					source = summaryWorkspaceTimeRangeSourcePicker
+				}
+				if source == summaryWorkspaceTimeRangeSourceDefault && !mixedChat {
+					dropDocumentDefaultTimeRange = true
+				}
+			}
+		} else {
+			if mixedParticipants {
 				return out, fmt.Errorf("%w: 文档总结不能混合聊天、参与者或时间范围", errInvalidSummaryWorkspaceContext)
 			}
-			dropDocumentDefaultTimeRange = true
+			if in.TimeRange != nil {
+				source := strings.TrimSpace(in.TimeRange.Source)
+				if source == "" {
+					source = summaryWorkspaceTimeRangeSourcePicker
+				}
+				if source != summaryWorkspaceTimeRangeSourceDefault {
+					return out, fmt.Errorf("%w: 文档总结不能混合聊天、参与者或时间范围", errInvalidSummaryWorkspaceContext)
+				}
+				dropDocumentDefaultTimeRange = true
+			}
 		}
 	}
 

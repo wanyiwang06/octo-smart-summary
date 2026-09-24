@@ -396,7 +396,27 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		return
 	}
 	if documentMode {
-		workflowInput.Sources = documentSources
+		if len(workflowInput.Sources) == 0 {
+			// Documents-only (or no chat sources at all): the prepared
+			// document sources ARE the full source set.
+			workflowInput.Sources = documentSources
+		} else {
+			// Mixed document+chat (admission gate on): keep the chat sources
+			// already collected from req.Sources and append the fetched
+			// document sources — never replace (plan §4.3 step 3).
+			seenSources := make(map[string]struct{}, len(workflowInput.Sources)+len(documentSources))
+			for _, source := range workflowInput.Sources {
+				seenSources[fmt.Sprintf("%d:%s", source.SourceType, source.SourceID)] = struct{}{}
+			}
+			for _, source := range documentSources {
+				key := fmt.Sprintf("%d:%s", source.SourceType, source.SourceID)
+				if _, exists := seenSources[key]; exists {
+					continue
+				}
+				seenSources[key] = struct{}{}
+				workflowInput.Sources = append(workflowInput.Sources, source)
+			}
+		}
 	} else {
 		for _, source := range req.Sources {
 			workflowInput.Sources = append(workflowInput.Sources, service.SummaryWorkflowSource{

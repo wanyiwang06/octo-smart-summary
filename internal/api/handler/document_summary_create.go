@@ -50,30 +50,45 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 	badRequest := func(message string) ([]service.SummaryWorkflowSource, bool, *documentSummaryCreateError) {
 		return nil, true, &documentSummaryCreateError{status: http.StatusBadRequest, code: 40001, message: message}
 	}
+	// Mixed document+chat is allowed when the admission gate is on; the merge
+	// with the chat sources happens in CreateSummary. Phase-1 keeps the rest
+	// of the pure-document boundaries (no participants, no origin channel).
+	mixedMode := false
+	hasChatSource := false
 	for _, source := range req.Sources {
 		if source.SourceType != model.SourceDocument {
-			return badRequest("文档总结不能混合聊天来源")
+			hasChatSource = true
+			break
 		}
 	}
-	if req.UID != "" && req.UID != userID {
-		return badRequest("文档总结仅支持当前用户创建")
+	if hasChatSource {
+		// Mixed document+chat admitted unconditionally (owner decision).
+		mixedMode = true
 	}
-	if len(req.Participants) != 0 {
-		return badRequest("文档总结暂不支持其他参与者")
-	}
-	if req.TimeRange != nil {
-		return badRequest("文档总结不支持时间范围")
-	}
-	if req.OriginChannelID != "" || req.OriginChannelType != 0 {
-		return badRequest("文档总结不支持来源会话")
+	if !mixedMode {
+		if req.UID != "" && req.UID != userID {
+			return badRequest("文档总结仅支持当前用户创建")
+		}
+		if len(req.Participants) != 0 {
+			return badRequest("文档总结暂不支持其他参与者")
+		}
+		if req.TimeRange != nil {
+			return badRequest("文档总结不支持时间范围")
+		}
+		if req.OriginChannelID != "" || req.OriginChannelType != 0 {
+			return badRequest("文档总结不支持来源会话")
+		}
 	}
 
 	refs := make([]documentRefReq, 0, len(req.Sources))
 	for _, source := range req.Sources {
+		if source.SourceType != model.SourceDocument {
+			continue
+		}
 		refs = append(refs, documentRefReq{DocumentID: strings.TrimSpace(source.SourceID)})
 	}
 	sources, err := prepareDocumentSummarySourcesFromRefs(requestContext, h.documentClient, header, spaceID, userID, refs)
-	return sources, true, err
+	return sources, !mixedMode, err
 }
 
 func prepareDocumentSummarySourcesFromRefs(

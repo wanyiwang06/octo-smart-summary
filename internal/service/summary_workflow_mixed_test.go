@@ -1,0 +1,122 @@
+//go:build cgo
+
+package service
+
+import (
+	"context"
+	"testing"
+
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
+)
+
+// PR1: mixed-scope persistence + idempotency (plan §4.3 steps 4-5 and the
+// "no fake conflicts on retry" rule).
+
+func mixedSourcesForTest() []SummaryWorkflowSource {
+	return []SummaryWorkflowSource{
+		{SourceType: model.SourceGroup, SourceID: "group-1"},
+		mixedDocSource("doc-1"),
+	}
+}
+
+func TestMixedWorkflowPersistsBothSourceClassesAndSnapshot(t *testing.T) {
+	svc, db := newSummaryWorkflowTestService(t)
+
+	in := baseSummaryWorkflowInput()
+	in.Sources = mixedSourcesForTest()
+	created, err := svc.CreateFromLegacyHTTP(context.Background(), in)
+	if err != nil {
+		t.Fatalf("mixed create: %v", err)
+	}
+
+	var sources []model.SummarySource
+	if err := db.Where("task_id = ?", created.Task.ID).Find(&sources).Error; err != nil {
+		t.Fatalf("load sources: %v", err)
+	}
+	if len(sources) != 2 {
+		t.Fatalf("persisted %d sources, want 2 (chat + document): %#v", len(sources), sources)
+	}
+	seenTypes := map[int]bool{}
+	for _, source := range sources {
+		seenTypes[source.SourceType] = true
+	}
+	if !seenTypes[model.SourceGroup] || !seenTypes[model.SourceDocument] {
+		t.Fatalf("source classes wrong: %#v", sources)
+	}
+
+	var snapshots int64
+	db.Model(&model.SummarySourceSnapshot{}).Count(&snapshots)
+	if snapshots != 1 {
+		t.Fatalf("snapshot rows = %d, want 1 (document only)", snapshots)
+	}
+}
+
+func TestMixedWorkflowIdempotentReplayKeepsOriginalSnapshot(t *testing.T) {
+	svc, db := newSummaryWorkflowTestService(t)
+
+	in := baseSummaryWorkflowInput()
+	in.Sources = mixedSourcesForTest()
+	in.IdempotencyKey = "mixed-create-001"
+
+	first, err := svc.CreateFromLegacyHTTP(context.Background(), in)
+	if err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+
+	// A replay (e.g. client retry) returns the SAME task — the original
+	// document snapshot must be reused, not re-fetched or overwritten.
+	second, err := svc.CreateFromLegacyHTTP(context.Background(), in)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if !second.Replayed || second.Task.ID != first.Task.ID {
+		t.Fatalf("replay = %#v, want same task", second)
+	}
+	var snapshots int64
+	db.Model(&model.SummarySourceSnapshot{}).Count(&snapshots)
+	if snapshots != 1 {
+		t.Fatalf("snapshot rows after replay = %d, want 1 (original preserved)", snapshots)
+	}
+}
+
+func TestMixedWorkflowSourceChangeWithSameKeyIsMismatch(t *testing.T) {
+	svc, _ := newSummaryWorkflowTestService(t)
+
+	in := baseSummaryWorkflowInput()
+	in.Sources = mixedSourcesForTest()
+	in.IdempotencyKey = "mixed-create-002"
+
+	if _, err := svc.CreateFromLegacyHTTP(context.Background(), in); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+
+	// Same key, different user request (source set changed) → conflict.
+	in.Sources = []SummaryWorkflowSource{
+		{SourceType: model.SourceGroup, SourceID: "group-2"},
+		mixedDocSource("doc-1"),
+	}
+	_, err := svc.CreateFromLegacyHTTP(context.Background(), in)
+	mismatch, ok := err.(*SummaryWorkflowIdempotencyError)
+	if !ok {
+		t.Fatalf("error = %v, want SummaryWorkflowIdempotencyError", err)
+	}
+	if mismatch.Reason != "request_mismatch" {
+		t.Fatalf("reason = %q, want request_mismatch", mismatch.Reason)
+	}
+}
+
+// Gate removal (owner decision): mixed create is admitted without any gate.
+// This test replaces the original TestMixedWorkflowRejectedWhenGateOff.
+func TestMixedWorkflowAdmittedUnconditionally(t *testing.T) {
+	svc, _ := newSummaryWorkflowTestService(t)
+
+	in := baseSummaryWorkflowInput()
+	in.Sources = mixedSourcesForTest()
+	created, err := svc.CreateFromLegacyHTTP(context.Background(), in)
+	if err != nil {
+		t.Fatalf("mixed create must be admitted without a gate: %v", err)
+	}
+	if created.Task.ID == 0 {
+		t.Fatal("mixed create returned no task")
+	}
+}
