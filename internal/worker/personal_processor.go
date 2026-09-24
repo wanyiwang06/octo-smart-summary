@@ -424,6 +424,9 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 	}
 	// Neutralize setext headings before persistence: a model-emitted "text\n---\n"
 	// lead-in renders as a broken H2 on the web (see citationtext.NormalizeSetextHeadings).
+	// Known divergence (PR#268 round-1 P2-6, pending companion frontend
+	// decision): the streamed deltas/done-frame still carry the RAW
+	// accumulation — only the persisted content below is normalized.
 	content = citationtext.NormalizeSetextHeadings(content)
 	isScheduledEmptyWindow := shouldSkipScheduledPlaceholderResult(task.TriggerType, content)
 

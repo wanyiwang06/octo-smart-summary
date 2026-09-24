@@ -249,6 +249,8 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 
 			// Neutralize setext headings before persistence and citation
 			// extraction (see citationtext.NormalizeSetextHeadings).
+			// Known divergence (PR#268 round-1 P2-6): teamStream.Delta already
+			// streamed the raw text; only the persisted content is normalized.
 			finalContent = citationtext.NormalizeSetextHeadings(finalContent)
 
 			teamCitations = extractTeamCitations(finalContent, indexed)
