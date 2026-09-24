@@ -205,10 +205,11 @@ func (h *AgentChatHandler) SummaryWorkspaceCapabilities(c *gin.Context) {
 		"contract_version":     summaryWorkspaceContractVersion,
 		"max_time_range_days":  pipeline.MaxTimeRangeDays,
 		"direct_team_workflow": enabled,
-		// Additive, informational: mixed document+chat creation is admitted
-		// unconditionally (owner decision — no admission gate). The field
-		// stays so the frontend can feature-detect without version sniffing.
-		"mixed_sources": true,
+		// Mixed document+chat creation is admitted only when the worker
+		// executor half has landed (SUMMARY_MIXED_SOURCES_ENABLED). The
+		// frontend feature-detects on this field, so it must agree with the
+		// admission decision made in normalizeSummaryWorkspaceContext.
+		"mixed_sources": service.MixedSourcesAdmissionEnabled(),
 	}})
 }
 

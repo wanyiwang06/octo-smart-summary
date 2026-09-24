@@ -34,11 +34,12 @@ const (
 	workspaceSnapshotVersion            = 1
 	maxSummaryWorkspaceSelectedChannels = agent.MaxWorkspaceSelectedChannels
 	maxSummaryWorkspaceDocuments        = service.MaxDocumentSummarySourceCount
-	// mixedMaxTotalSources bounds the COMBINED document+chat source count of a
-	// mixed context (plan §1.2: documents ≤ 10, chat+documents ≤ 30). The RAW
-	// request arrays are checked against their caps BEFORE dedup so a giant
-	// duplicate-filled body cannot turn normalization into an amplifier.
-	mixedMaxTotalSources              = 30
+	// mixedMaxTotalSources aliases the service cap so the handler and the
+	// service validator enforce the SAME combined bound (documents ≤ 10,
+	// chat+documents ≤ 30). The RAW request arrays are checked against their
+	// caps BEFORE dedup so a giant duplicate-filled body cannot turn
+	// normalization into an amplifier.
+	mixedMaxTotalSources              = service.MixedMaxTotalSources
 	maxSummaryWorkspaceParticipants   = 30
 	maxSummaryWorkspaceReferencedTask = 20
 	maxSummaryWorkspaceIDLength       = 256
@@ -192,10 +193,10 @@ func emptySummaryWorkspaceContext() summaryWorkspaceContext {
 	}
 }
 
-// Mixed document+chat scope is admitted UNCONDITIONALLY (owner decision —
-// no admission gate). normalizeSummaryWorkspaceContext enforces the phase-1
-// boundaries: personal-only (no participants), no reference-summary stacking,
-// and the combined source cap.
+// Mixed document+chat scope is admitted behind service.MixedSourcesAdmissionEnabled
+// (default OFF until the worker executor lands). normalizeSummaryWorkspaceContext
+// enforces the phase-1 boundaries: personal-only (no participants), no
+// reference-summary stacking, and the combined source cap.
 func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorkspaceContext, error) {
 	out := emptySummaryWorkspaceContext()
 	if len(in.SelectedChannels) > maxSummaryWorkspaceSelectedChannels {
@@ -247,8 +248,13 @@ func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorksp
 		if mixedChat {
 			// Mixed document+chat: personal-only (no extra participants), no
 			// reference-summary stacking, and the chat time range stays.
-			// Admission is unconditional (owner decision). Phase-1 contract,
-			// see docs/mixed-document-chat-summary-development-plan.md §4.2.
+			// Admission is gated until the worker executor lands (default
+			// OFF); when OFF, a mixed scope is rejected with the pre-PR
+			// contract error. Phase-1 contract, see
+			// docs/mixed-document-chat-summary-development-plan.md §4.2.
+			if !service.MixedSourcesAdmissionEnabled() {
+				return out, fmt.Errorf("%w: 文档总结不能混合聊天、参与者或时间范围", errInvalidSummaryWorkspaceContext)
+			}
 			if mixedParticipants {
 				return out, fmt.Errorf("%w: 混合来源总结暂不支持协作参与者，请移除参与者后再生成", errInvalidSummaryWorkspaceContext)
 			}
@@ -258,18 +264,9 @@ func normalizeSummaryWorkspaceContext(in summaryWorkspaceContext) (summaryWorksp
 			if len(out.SelectedChannels)+len(out.Documents) > mixedMaxTotalSources {
 				return out, fmt.Errorf("%w: 混合来源总数不能超过%d个", errInvalidSummaryWorkspaceContext, mixedMaxTotalSources)
 			}
-			// A NON-default time range is the chat side's window and is kept.
-			// Only the document-flow DEFAULT range is meaningless here and is
-			// dropped when no chat sources remain after the merge below.
-			if in.TimeRange != nil {
-				source := strings.TrimSpace(in.TimeRange.Source)
-				if source == "" {
-					source = summaryWorkspaceTimeRangeSourcePicker
-				}
-				if source == summaryWorkspaceTimeRangeSourceDefault && !mixedChat {
-					dropDocumentDefaultTimeRange = true
-				}
-			}
+			// The time range is the chat side's window and is kept verbatim for
+			// a mixed scope; dropDocumentDefaultTimeRange stays false. Only the
+			// pure-document branch below manages the document-flow default range.
 		} else {
 			if mixedParticipants {
 				return out, fmt.Errorf("%w: 文档总结不能混合聊天、参与者或时间范围", errInvalidSummaryWorkspaceContext)

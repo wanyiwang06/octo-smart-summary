@@ -703,12 +703,13 @@ func workflowHasDocumentSource(sources []SummaryWorkflowSource) bool {
 }
 
 func validateDocumentWorkflowInput(in LegacyCreateSummaryWorkflowInput, sources []SummaryWorkflowSource) *BizError {
-	// Mixed document+chat scope (admission gate on) is validated by the
-	// handler layer (contract caps, per-source snapshot integrity below);
-	// here only the mixed-invariant subset of the pure-document rules
-	// applies: personal-only, no participants, no origin auto-reply.
-	// TimeRange is LEGAL for mixed scopes (it scopes the chat side), so the
-	// documents-only rejection does not fire when chat sources are present.
+	// Mixed document+chat scope is admitted behind service.MixedSourcesAdmissionEnabled
+	// (default OFF until the worker executor lands); the check is the first line
+	// of the mixed branch below. Once admitted, here only the mixed-invariant
+	// subset of the pure-document rules applies: personal-only, no participants,
+	// no origin auto-reply. TimeRange is LEGAL for mixed scopes (it scopes the
+	// chat side), so the documents-only rejection does not fire when chat
+	// sources are present.
 	mixedChat := false
 	for _, source := range sources {
 		if source.SourceType != model.SourceDocument {
@@ -717,10 +718,16 @@ func validateDocumentWorkflowInput(in LegacyCreateSummaryWorkflowInput, sources 
 		}
 	}
 	if mixedChat {
+		// Mixed scope admission is gated until the worker executor lands
+		// (see mixed_sources_gate.go). When OFF, reject with the same clear
+		// contract error the pure-document path uses, before any snapshot work.
+		if !MixedSourcesAdmissionEnabled() {
+			return NewBizError(40001, "文档总结不能混合聊天来源", http.StatusBadRequest)
+		}
 		// Mixed scope: personal-only, no origin auto-reply. TimeRange is
 		// LEGAL for mixed scopes (it scopes the chat side), so the
 		// documents-only rejection does not fire when chat sources are
-		// present. Admission is unconditional (owner decision).
+		// present.
 		if in.CreatorID != "" && in.CreatorID != in.ActorID {
 			return NewBizError(40001, "文档总结仅支持当前用户创建", http.StatusBadRequest)
 		}

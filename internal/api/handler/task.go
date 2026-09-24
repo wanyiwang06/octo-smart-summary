@@ -377,6 +377,19 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 			End:   req.TimeRange.End,
 		}
 	}
+	// Collect the chat-side sources from the request body first (bare
+	// {SourceType, SourceID} rows — snapshots come from the worker, not the
+	// request). Document sources are fetched separately below and merged in.
+	chatSources := make([]service.SummaryWorkflowSource, 0, len(req.Sources))
+	for _, source := range req.Sources {
+		if source.SourceType == model.SourceDocument {
+			continue
+		}
+		chatSources = append(chatSources, service.SummaryWorkflowSource{
+			SourceType: source.SourceType,
+			SourceID:   source.SourceID,
+		})
+	}
 	workflowInput.Sources = make([]service.SummaryWorkflowSource, 0, len(req.Sources))
 	if createSummaryHasDocumentSource(req) {
 		releaseSlot, admitted := documentSummaryLimiterInstance.acquire(userID)
@@ -396,34 +409,14 @@ func (h *TaskHandler) CreateSummary(c *gin.Context) {
 		return
 	}
 	if documentMode {
-		if len(workflowInput.Sources) == 0 {
-			// Documents-only (or no chat sources at all): the prepared
-			// document sources ARE the full source set.
-			workflowInput.Sources = documentSources
-		} else {
-			// Mixed document+chat (admission gate on): keep the chat sources
-			// already collected from req.Sources and append the fetched
-			// document sources — never replace (plan §4.3 step 3).
-			seenSources := make(map[string]struct{}, len(workflowInput.Sources)+len(documentSources))
-			for _, source := range workflowInput.Sources {
-				seenSources[fmt.Sprintf("%d:%s", source.SourceType, source.SourceID)] = struct{}{}
-			}
-			for _, source := range documentSources {
-				key := fmt.Sprintf("%d:%s", source.SourceType, source.SourceID)
-				if _, exists := seenSources[key]; exists {
-					continue
-				}
-				seenSources[key] = struct{}{}
-				workflowInput.Sources = append(workflowInput.Sources, source)
-			}
-		}
+		// Documents were fetched. mergeMixedWorkflowSources keeps the chat
+		// rows in order and the fetched snapshot-carrying document rows, and
+		// correctly skips any chat-side document rows (there are none here —
+		// chatSources is built from non-document types already — but the
+		// shared helper guarantees the invariant both paths rely on).
+		workflowInput.Sources = mergeMixedWorkflowSources(chatSources, documentSources)
 	} else {
-		for _, source := range req.Sources {
-			workflowInput.Sources = append(workflowInput.Sources, service.SummaryWorkflowSource{
-				SourceType: source.SourceType,
-				SourceID:   source.SourceID,
-			})
-		}
+		workflowInput.Sources = chatSources
 	}
 	workflowInput.Participants = make([]service.SummaryWorkflowParticipant, 0, len(req.Participants))
 	for _, participant := range req.Participants {

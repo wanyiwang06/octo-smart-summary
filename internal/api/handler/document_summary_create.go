@@ -50,9 +50,11 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 	badRequest := func(message string) ([]service.SummaryWorkflowSource, bool, *documentSummaryCreateError) {
 		return nil, true, &documentSummaryCreateError{status: http.StatusBadRequest, code: 40001, message: message}
 	}
-	// Mixed document+chat is allowed when the admission gate is on; the merge
-	// with the chat sources happens in CreateSummary. Phase-1 keeps the rest
-	// of the pure-document boundaries (no participants, no origin channel).
+	// Mixed document+chat is admitted only when service.MixedSourcesAdmissionEnabled();
+	// the gate is checked at validateDocumentWorkflowInput. Here we only detect
+	// whether the request is mixed so the pure-document-only boundaries (no
+	// participants, no time range, no origin channel) are enforced exactly when
+	// there are no chat sources.
 	mixedMode := false
 	hasChatSource := false
 	for _, source := range req.Sources {
@@ -62,7 +64,6 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 		}
 	}
 	if hasChatSource {
-		// Mixed document+chat admitted unconditionally (owner decision).
 		mixedMode = true
 	}
 	if !mixedMode {
@@ -88,7 +89,14 @@ func (h *TaskHandler) prepareDocumentSummarySources(
 		refs = append(refs, documentRefReq{DocumentID: strings.TrimSpace(source.SourceID)})
 	}
 	sources, err := prepareDocumentSummarySourcesFromRefs(requestContext, h.documentClient, header, spaceID, userID, refs)
-	return sources, !mixedMode, err
+	// documentMode here means "document sources were fetched and must be
+	// merged into workflowInput.Sources". It is true for BOTH pure-document
+	// and mixed requests (the caller discriminates via the chat side later).
+	// Returning !mixedMode was the pre-PR bug: mixed requests came back
+	// documentMode=false, so CreateSummary dropped the fetched snapshots and
+	// rebuilt bare snapshot-less rows (mirroring mergeMixedWorkflowSources'
+	// skip of chat-side document rows was the fix in CreateSummary).
+	return sources, true, err
 }
 
 func prepareDocumentSummarySourcesFromRefs(
