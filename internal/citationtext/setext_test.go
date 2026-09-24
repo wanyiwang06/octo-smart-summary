@@ -3,6 +3,7 @@ package citationtext
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNormalizeSetextHeadingsInsertsBlankBeforeRule(t *testing.T) {
@@ -137,13 +138,38 @@ func TestNormalizeSetextHeadingsNoNewline(t *testing.T) {
 	}
 }
 
+// P2-7 (Jerry-Xin): the old Oversized test was vacuous — its 200,010-rune body
+// tripped the prev-line cap independently, so removing the size guard left the
+// suite green. Rewrite with a short-prev-line body above the guard: removing
+// or lowering the guard must fail this test (the body then normalizes).
+// B-5 acceptance (Jerry-Xin): a 20k-rule-pair body must normalize in <500ms;
+// the quadratic in-place insertion measured 2.10s at 120KB and ~40s near the
+// size guard. Kills mutant M-Q (restore in-place insertion).
+func TestNormalizeSetextHeadingsLinearPerformance(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < 20000; i++ {
+		b.WriteString("para\n---\ntext\n\n")
+	}
+	in := b.String()
+	start := time.Now()
+	got := NormalizeSetextHeadings(in)
+	elapsed := time.Since(start)
+	want := strings.ReplaceAll(in, "para\n---", "para\n\n---")
+	if got != want {
+		t.Fatalf("normalization output mismatch under perf probe")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("normalization took %s for a %dKB body; quadratic insertion regressed (B-5)", elapsed, len(in)/1024)
+	}
+}
+
 func TestNormalizeSetextHeadingsOversized(t *testing.T) {
 	var b strings.Builder
-	b.Grow(setextMaxRunes + 10)
-	for i := 0; i < setextMaxRunes+10; i++ {
-		b.WriteByte('x')
+	b.WriteString("# 报告\n\n短段落\n\n")
+	for b.Len() <= setextMaxContentBytes {
+		b.WriteString("这是一段足够长的正文内容，用于把文档体量推过守卫而不触发任何其他上限。\n\n")
 	}
-	b.WriteString("\n---\n")
+	b.WriteString("结论段落\n---\n后续\n")
 	in := b.String()
 	if got := NormalizeSetextHeadings(in); got != in {
 		t.Fatalf("oversized input must stay byte-identical")

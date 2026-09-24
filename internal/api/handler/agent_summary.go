@@ -620,6 +620,12 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 			workspaceCandidate = lockedCandidate
 			draftMsg = lockedCandidate.Message
 			content = lockedCandidate.Content
+			// The pre-transaction normalization at the top of this handler is
+			// discarded when the locked workspace payload replaces `content`
+			// here (PR#268 round-1 B-2 / M-P2 dead store). Re-neutralize so
+			// the persisted PersonalResult.Content carries the fix on the
+			// workspace-save branch too.
+			content = citationtext.NormalizeSetextHeadings(content)
 			lockedBinding, bindingErr := resolveAgentMessageRunBinding(
 				c.Request.Context(), tx, userID, req.SessionID, req.RequestID, draftMsg,
 			)

@@ -118,7 +118,7 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整失败，请稍后重试"})
 		return
 	}
-	newContent = strings.TrimSpace(stripMarkdownFence(newContent))
+	newContent = finalizeRefineContent(newContent)
 	if newContent == "" {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整结果为空"})
 		return
@@ -368,7 +368,7 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 		writeStreamError("调整失败，请稍后重试")
 		return
 	}
-	newContent = strings.TrimSpace(stripMarkdownFence(newContent))
+	newContent = finalizeRefineContent(newContent)
 	if newContent == "" {
 		writeStreamError("调整结果为空")
 		return

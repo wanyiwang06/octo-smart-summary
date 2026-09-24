@@ -126,3 +126,53 @@ func TestCreateAgentSummary_WorkspaceSavePersistsNeutralizedContent(t *testing.T
 		t.Fatalf("M-P2: workspace-save persisted raw setext content:\n got=%q\nwant=%q", result.Content, want)
 	}
 }
+
+// M6a mutation-lock (Jerry-Xin mutation battery: identity-replacing both
+// edit.go normalize calls kept the full 727-test handler suite green — the
+// team-refine transports had zero wiring coverage). Pins that both team
+// refine transports persist the neutralized form. Passes today (edit.go
+// carried the call from round 1); it exists to die under the mutation.
+func TestRefineTeamNeutralizesSetextHeadingsBothTransports(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					delta, _ := json.Marshal(map[string]interface{}{"choices": []interface{}{
+						map[string]interface{}{"delta": map[string]string{"content": setextRedlineLeadIn}},
+					}})
+					fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", delta)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"choices": []interface{}{
+					map[string]interface{}{"message": map[string]string{"content": setextRedlineLeadIn}, "finish_reason": "stop"},
+				}})
+			}))
+			defer srv.Close()
+			llm := service.NewLLMClient(srv.URL, "test", "test", 5, 1024, false, 5, nil)
+			db := setupEditDB(t)
+			id, resultID, prID := seedEditableTask(t, db)
+			var base model.SummaryResult
+			db.First(&base, resultID)
+			base.SetTeamCitations([]model.TeamCitation{{Index: 1, UserID: "creator1"}})
+			db.Save(&base)
+			if err := db.Model(&model.PersonalResult{}).Where("id = ?", prID).Update("citations_json", base.CitationsJSON).Error; err != nil {
+				t.Fatal(err)
+			}
+			h := NewEditHandler(db, llm)
+			r := setupEditRouter(h)
+			path := fmt.Sprintf("/api/v1/summaries/%d/refine", id)
+			if stream {
+				r.POST("/api/v1/summaries/:id/refine-stream", h.RefineSummaryStream)
+				path += "-stream"
+			}
+			w := doJSONRequest(r, "POST", path, "creator1", map[string]interface{}{"feedback": "保留正文", "base_result_id": resultID})
+			var saved model.SummaryResult
+			db.Order("id DESC").First(&saved)
+			if !strings.Contains(saved.Content, "如下：\n\n---") {
+				t.Fatalf("M6a (stream=%t): team refine persisted content not neutralized: %q (status=%d body=%s)",
+					stream, saved.Content, w.Code, w.Body.String())
+			}
+		})
+	}
+}

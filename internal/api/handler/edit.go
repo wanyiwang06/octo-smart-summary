@@ -286,14 +286,11 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整失败，请稍后重试"})
 		return
 	}
-	newContent = strings.TrimSpace(stripMarkdownFence(newContent))
+	newContent = finalizeRefineContent(newContent)
 	if newContent == "" {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整结果为空"})
 		return
 	}
-	// Neutralize setext headings the refine model may emit (see
-	// citationtext.NormalizeSetextHeadings).
-	newContent = citationtext.NormalizeSetextHeadings(newContent)
 	if len(newContent) > maxContentBytes {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "调整结果超过 500KB 限制"})
 		return
@@ -474,14 +471,11 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 		writeStreamError("调整失败，请稍后重试")
 		return
 	}
-	newContent = strings.TrimSpace(stripMarkdownFence(newContent))
+	newContent = finalizeRefineContent(newContent)
 	if newContent == "" {
 		writeStreamError("调整结果为空")
 		return
 	}
-	// Neutralize setext headings the refine model may emit (see
-	// citationtext.NormalizeSetextHeadings).
-	newContent = citationtext.NormalizeSetextHeadings(newContent)
 	if len(newContent) > maxContentBytes {
 		writeStreamError("调整结果超过 500KB 限制")
 		return
@@ -816,4 +810,20 @@ func stripMarkdownFence(s string) string {
 		return strings.Join(lines[1:len(lines)-1], "\n")
 	}
 	return trimmed
+}
+
+// finalizeRefineContent is the shared post-processing pipeline for every LLM
+// refine path (edit.go non-stream + stream, personal_refine.go non-stream +
+// stream). PR#268 round-1 B-2: two of the four structural-twin refine handlers
+// missed the setext-neutralization call because the sequence was copy-pasted;
+// funneling all of them through this helper is what makes the next twin
+// impossible to miss.
+func finalizeRefineContent(raw string) string {
+	newContent := strings.TrimSpace(stripMarkdownFence(raw))
+	if newContent == "" {
+		return ""
+	}
+	// Neutralize setext headings the refine model may emit (see
+	// citationtext.NormalizeSetextHeadings).
+	return citationtext.NormalizeSetextHeadings(newContent)
 }
