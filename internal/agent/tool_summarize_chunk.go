@@ -184,7 +184,7 @@ func ProbeChunkCoverage(msgMaps []map[string]interface{}, requestedChunkSize, bu
 func ProbeChunkCoverageDefault(msgMaps []map[string]interface{}, requestedChunkSize int) (processed, dropped, chunks, capped int) {
 	for _, cjk := range []int{1, 2} {
 		cfg := config.Config{CharsPerTokenCJK: cjk, CharsPerTokenASCII: 4}
-		p, d, c, cap := ProbeChunkCoverage(msgMaps, requestedChunkSize, chunkTokenBudget(cfg), cfg.ResolveCharsPerTokenCJK(), cfg.CharsPerTokenASCII)
+		p, d, c, capd := ProbeChunkCoverage(msgMaps, requestedChunkSize, chunkTokenBudget(cfg), cfg.ResolveCharsPerTokenCJK(), cfg.CharsPerTokenASCII)
 		if p < processed || processed == 0 {
 			processed = p
 		}
@@ -194,8 +194,8 @@ func ProbeChunkCoverageDefault(msgMaps []map[string]interface{}, requestedChunkS
 		if c > chunks {
 			chunks = c
 		}
-		if cap > capped {
-			capped = cap
+		if capd > capped {
+			capped = capd
 		}
 	}
 	return processed, dropped, chunks, capped
@@ -474,7 +474,7 @@ func SummarizeChunkTool() (Tool, Handler) {
 				keptMsgs += len(c)
 			}
 			cappedDropped = len(msgMaps) - keptMsgs
-			log.Printf("[summarize_chunk] fan-out capped at %d chunks; kept the most recent, dropped the older tail (%d messages), disclosed via chunk_calls_capped (#241)", maxChunkCalls, cappedDropped)
+			log.Printf("[summarize_chunk] fan-out capped at %d chunks; kept the most recent, dropped the oldest chunks (%d messages), disclosed via chunk_calls_capped (#241)", maxChunkCalls, cappedDropped)
 		}
 
 		// Summarize each chunk and aggregate honest coverage counts.
@@ -734,9 +734,9 @@ func assembleMapOutput(summaries []string, coverageGap bool) (string, error) {
 }
 
 // capChunks bounds the summarize_chunk fan-out to maxChunkCalls, keeping the
-// MOST RECENT chunks (the tail): the message pool is ascending by timestamp and
-// the splitter preserves order, so the newest conversation — usually where the
-// current decisions / action items live — is retained and the OLDER tail is
+// MOST RECENT chunks (the tail slice): the message pool is ascending by timestamp
+// and the splitter preserves order, so the newest conversation — usually where
+// the current decisions / action items live — is retained and the OLDER HEAD is
 // dropped. Returns capped=true when truncation occurred so the caller discloses
 // it (cov.ChunkCallsCapped + mapCoverageGapNotice). Pure + testable (#256 P2).
 func capChunks(chunks [][]map[string]interface{}) (kept [][]map[string]interface{}, capped bool) {

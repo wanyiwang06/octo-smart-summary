@@ -484,9 +484,10 @@ func TestCapChunks(t *testing.T) {
 			t.Fatalf("len = %d, want %d", len(got), maxChunkCalls)
 		}
 		// makeChunks tags content "chunk-<i>"; the kept slice must start at the
-		// 5th chunk (oldest dropped), proving the newest tail is retained.
+		// 5th chunk (the oldest 5 at the head are dropped), proving the newest
+		// tail slice is retained.
 		if first := got[0][0]["content"].(string); first != fmt.Sprintf("chunk-%d", 5) {
-			t.Fatalf("kept slice starts at %q, want chunk-5 (older tail dropped)", first)
+			t.Fatalf("kept slice starts at %q, want chunk-5 (oldest head dropped)", first)
 		}
 	})
 }
