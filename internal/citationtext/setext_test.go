@@ -163,6 +163,46 @@ func TestNormalizeSetextHeadingsLinearPerformance(t *testing.T) {
 	}
 }
 
+// B-N1 (Jerry-Xin round-2 🔴, PR#268): CommonMark expands a tab in leading
+// indentation to the next 4-column tab stop, so ANY tab in the leading
+// whitespace run makes the line indented-code content — never a valid opening
+// or closing fence. The round-2 fenceIndent rewrite counted only literal
+// spaces and re-opened both round-1 B-3 mechanisms on tab-indented shapes
+// (over-fire: blank inserted inside a still-open code block; under-fire: a
+// space+tab fence-lookalike suppresses normalization for the rest of the
+// document). Pin-gap evidence: the correctness-direction fix SURVIVED the
+// shipped suite — mutant M-TABC (revert fenceIndent to space-only counting)
+// must turn these pins red.
+func TestNormalizeSetextHeadingsTabIndentedFenceShapes(t *testing.T) {
+	cases := []struct{ name, in string }{
+		// F3: tab-indented closer is code CONTENT; the fence stays open and
+		// the trailing para+rule must NOT get a blank line inside the block.
+		{"F3 tab closer", "```\ncode\n\t```\npara\n---\nmore\n"},
+		// F4: space+tab closer, same contract.
+		{"F4 space+tab closer", "```\ncode\n  \t```\ntext\n---\nmore\n"},
+		// F6: tilde variant.
+		{"F6 tilde tab closer", "~~~\ncode\n\t~~~\ntext\n---\nmore\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := NormalizeSetextHeadings(tc.in); got != tc.in {
+				t.Fatalf("M-TABC: tab-indented closer must not close the fence (blank line inserted inside open code block):\n got=%q\nwant=%q", got, tc.in)
+			}
+		})
+	}
+	// F7: a space+tab fence-lookalike OPENER is indented code (visual column
+	// >= 4); it must not flip fence state, so both later setext hijacks
+	// normalize. (The isIndentedCode pre-check only catches literal-tab
+	// prefixes, NOT space+tab — fenceIndent must carry the tab rule itself.)
+	t.Run("F7 space+tab opener lookalike", func(t *testing.T) {
+		in := "para\n\n  \t```\ninside\n---\npara2\n---\n"
+		want := "para\n\n  \t```\ninside\n\n---\npara2\n\n---\n"
+		if got := NormalizeSetextHeadings(in); got != want {
+			t.Fatalf("M-TABC: space+tab lookalike must not suppress later normalization:\n got=%q\nwant=%q", got, want)
+		}
+	})
+}
+
 func TestNormalizeSetextHeadingsOversized(t *testing.T) {
 	var b strings.Builder
 	b.WriteString("# 报告\n\n短段落\n\n")
