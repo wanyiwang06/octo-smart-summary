@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/streaming"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/timezone"
@@ -245,6 +246,10 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 			finalContent = content
 			totalTokens = tokens
 			modelVersion = usedModel
+
+			// Neutralize setext headings before persistence and citation
+			// extraction (see citationtext.NormalizeSetextHeadings).
+			finalContent = citationtext.NormalizeSetextHeadings(finalContent)
 
 			teamCitations = extractTeamCitations(finalContent, indexed)
 		}

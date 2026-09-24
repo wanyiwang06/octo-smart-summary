@@ -422,6 +422,9 @@ func (p *Processor) processPersonalSummaryWithOptions(ctx context.Context, taskI
 	if strings.TrimSpace(content) == "" {
 		content = noRelevantContentMessage
 	}
+	// Neutralize setext headings before persistence: a model-emitted "text\n---\n"
+	// lead-in renders as a broken H2 on the web (see citationtext.NormalizeSetextHeadings).
+	content = citationtext.NormalizeSetextHeadings(content)
 	isScheduledEmptyWindow := shouldSkipScheduledPlaceholderResult(task.TriggerType, content)
 
 	// Best-effort check: abort early if task is no longer Processing.

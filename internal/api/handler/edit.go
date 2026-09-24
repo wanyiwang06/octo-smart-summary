@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/llmfallback"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -290,6 +291,9 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, apiResponse{Code: 50000, Message: "调整结果为空"})
 		return
 	}
+	// Neutralize setext headings the refine model may emit (see
+	// citationtext.NormalizeSetextHeadings).
+	newContent = citationtext.NormalizeSetextHeadings(newContent)
 	if len(newContent) > maxContentBytes {
 		c.JSON(http.StatusBadRequest, apiResponse{Code: 40010, Message: "调整结果超过 500KB 限制"})
 		return
@@ -475,6 +479,9 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 		writeStreamError("调整结果为空")
 		return
 	}
+	// Neutralize setext headings the refine model may emit (see
+	// citationtext.NormalizeSetextHeadings).
+	newContent = citationtext.NormalizeSetextHeadings(newContent)
 	if len(newContent) > maxContentBytes {
 		writeStreamError("调整结果超过 500KB 限制")
 		return
