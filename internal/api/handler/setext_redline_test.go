@@ -176,3 +176,46 @@ func TestRefineTeamNeutralizesSetextHeadingsBothTransports(t *testing.T) {
 		})
 	}
 }
+
+// M7 pin (Jerry-Xin round-2 A-2, PR#268): the LEGACY (non-workspace)
+// agent-save branch had no setext pin — only the workspace branch was pinned —
+// so removing the pre-transaction normalization at agent_summary.go:512 kept
+// the shipped suite green (r1 mutant M7 survivor). Passes today; exists to
+// die under the mutation.
+func TestCreateAgentSummary_LegacySavePersistsNeutralizedContent(t *testing.T) {
+	db := setupAgentSummaryTestDB(t)
+	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	r := setupAgentSummaryRouter(h)
+	sessionID := "session-setext-legacy"
+	// The setext shape sits mid-document: stripAgentPreamble (owner decision
+	// Q3=A) treats text before the FIRST heading/rule as strippable preamble,
+	// so a lead-in+\n--- at the very top would be stripped before the
+	// normalizer ever runs. A heading-first document with a body setext shape
+	// is the realistic legacy-save exposure for the :512 call.
+	db.Create(&model.AgentMessage{
+		UserID:    "test-user",
+		SessionID: sessionID,
+		Role:      "assistant",
+		Content:   "### 一、已完成事项\n\n现将进展整理如下：\n---\n### 二、待办事项\n",
+	})
+	w := doAgentSave(t, r, map[string]interface{}{
+		"session_id":          sessionID,
+		"origin_channel_id":   "CH-SETEXT-LEGACY",
+		"origin_channel_type": 2,
+		"title":               "Legacy Setext Save",
+	}, map[string]string{"Idempotency-Key": "legacy-setext-key"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("legacy agent save want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var task model.SummaryTask
+	if err := db.Where("creator_id = ?", "test-user").Take(&task).Error; err != nil {
+		t.Fatalf("load saved task: %v", err)
+	}
+	var result model.PersonalResult
+	if err := db.Where("task_id = ? AND user_id = ?", task.ID, "test-user").Take(&result).Error; err != nil {
+		t.Fatalf("load saved result: %v", err)
+	}
+	if !strings.Contains(result.Content, "如下：\n\n---") {
+		t.Fatalf("M7: legacy agent save persisted raw setext content: %q", result.Content)
+	}
+}

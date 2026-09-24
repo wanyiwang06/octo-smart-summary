@@ -179,8 +179,11 @@ func (m *MetaProcessor) processMetaSummary(ctx context.Context, taskID int64) {
 		var teamCitations []model.TeamCitation
 
 		if len(submitted) == 1 {
-			// Single submission: copy content directly, no LLM call
-			finalContent = submitted[0].Content
+			// Single submission: copy content directly, no LLM call.
+			// Defense-in-depth normalize (A-1, PR#268 round-2): this row may
+			// predate the deploy (historical rows) or carry client-authored
+			// hand-edit bytes; the call is idempotent.
+			finalContent = citationtext.NormalizeSetextHeadings(submitted[0].Content)
 			totalTokens = 0
 			if submitted[0].ModelVersion != "" {
 				modelVersion = submitted[0].ModelVersion

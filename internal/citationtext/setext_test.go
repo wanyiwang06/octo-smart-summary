@@ -203,6 +203,17 @@ func TestNormalizeSetextHeadingsTabIndentedFenceShapes(t *testing.T) {
 	})
 }
 
+// M4 pin (Jerry-Xin r1 P2-4 / r2 A-2, PR#268): the underline-line indent
+// check must stay — removing it corrupts `para\n    ---` into paragraph +
+// indented code block (the 4-space-indented underline is indented-code
+// content, NOT an underline). Passes today; exists to die under the mutation.
+func TestNormalizeSetextHeadingsIndentedUnderlineUntouched(t *testing.T) {
+	in := "para\n    ---\n"
+	if got := NormalizeSetextHeadings(in); got != in {
+		t.Fatalf("M4: 4-space-indented underline is indented-code content; byte-identity broken:\n got=%q\nwant=%q", got, in)
+	}
+}
+
 func TestNormalizeSetextHeadingsOversized(t *testing.T) {
 	var b strings.Builder
 	b.WriteString("# 报告\n\n短段落\n\n")

@@ -25,8 +25,12 @@
 // treated. Lines inside fenced code blocks and indented code blocks are left
 // byte-identical. Known, accepted limitations (documented, not asserted away):
 // 1-2 character underlines ("-"/"--" are setext H2 in CommonMark) are out of
-// scope, and raw HTML blocks are not tracked, so inserting a blank line can
-// terminate one early (PR#268 round-1 P2-5/P2-3).
+// scope, raw HTML blocks are not tracked so inserting a blank line can
+// terminate one early, and lazy-continuation paragraphs keep their hijack —
+// when a paragraph's last line is indented 4+ spaces ("para\n    more\n---")
+// the normalizer treats that line as indented code and skips the rule, even
+// though CommonMark lets indented text continue a paragraph (PR#268 round-1
+// P2-4 / round-2 A-3).
 package citationtext
 
 import (
@@ -159,7 +163,11 @@ func isSetextUnderline(line string) bool {
 // guard measured indentation AFTER TrimLeft had already stripped every
 // leading space, so it only ever counted tabs and never enforced the rule.)
 func fenceIndent(line string) int {
-	return len(line) - len(strings.TrimLeft(line, " "))
+	ws := line[:len(line)-len(strings.TrimLeft(line, " 	"))]
+	if strings.Contains(ws, "	") {
+		return 4 // any tab in leading whitespace => visual column >= 4
+	}
+	return len(ws)
 }
 
 // opensFence detects a fenced code block opener: 3+ backticks or tildes,
