@@ -85,3 +85,29 @@ func TestCoverageRegressionGuard(t *testing.T) {
 			cov.ProcessedCount, cov.DroppedCount)
 	}
 }
+
+// TestCoverageGateExemptsDisclosedCap drives the gate over an input large enough
+// to trip the 256-chunk fan-out cap and pins that a DISCLOSED cap is not counted
+// as silent loss (#256 r8 N4). At the default ~200-msg chunk size, 52000 messages
+// split into 260 chunks; the cap keeps 256 and drops the oldest 4 (800 messages).
+// dropped is therefore non-zero, so a `NoSilentLoss: dropped == 0` reversion would
+// wrongly fail here — the subtraction of the intentional, cap-fired count is what
+// keeps the gate honest.
+func TestCoverageGateExemptsDisclosedCap(t *testing.T) {
+	const n = 52000
+	cov := Coverage(GoldenCase{Messages: make([]GoldenMessage, n)})
+	if cov.Chunks != 256 {
+		t.Fatalf("chunks = %d, want 256 (fan-out cap must bind)", cov.Chunks)
+	}
+	if cov.DroppedCount == 0 || cov.CappedDroppedCount == 0 {
+		t.Fatalf("want a real cap drop, got dropped=%d capped=%d", cov.DroppedCount, cov.CappedDroppedCount)
+	}
+	// All loss here is the intentional cap, so the two counts must match exactly —
+	// no splitter/formatter loss leaked in.
+	if cov.DroppedCount != cov.CappedDroppedCount {
+		t.Fatalf("dropped=%d capped=%d — the whole drop should be the disclosed cap", cov.DroppedCount, cov.CappedDroppedCount)
+	}
+	if !cov.NoSilentLoss {
+		t.Fatalf("a disclosed fan-out cap must NOT fail the no-silent-loss gate; dropped=%d capped=%d", cov.DroppedCount, cov.CappedDroppedCount)
+	}
+}

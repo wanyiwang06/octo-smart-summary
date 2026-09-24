@@ -29,7 +29,10 @@ import (
 // #241 item 2 之后覆盖不再恒为 100%：单块 LLM 调用失败会被容忍并从 reduce 输入
 // 剔除，且扇出超过 maxChunkCalls 时截断最旧的分片——两种缺口都经 cov
 // （failed_chunk_count / chunk_calls_capped / dropped_count / truncated）披露，
-// 并在合并文本里追加一条 mapCoverageGapNotice，使缺口在 V2 关闭时也对用户可见。
+// 并在合并文本里追加一条 mapCoverageGapNotice 作为尽力而为的提示——它是 Reduce
+// 输入，会经 merge/planner 两次模型改写，模型可能删掉；真正模型删不掉的结构性披露
+// （recordDroppedMessages → finishgate PARTIAL）仍取决于 AGENT_SUMMARY_V2_MODE≠off。
+// V2=off 回落下只剩这条可被改写的提示，其模型无关的结构通道见后续 issue #267。
 const (
 	// defaultChunkSize 是 chunk_size 缺省（<=0）时使用的每片消息数基准，
 	// 与 SS-01 止血值一致。
@@ -123,11 +126,14 @@ func clampChunkSize(requested int) int {
 // processed = lines the formatter really emitted, dropped = input − processed,
 // chunks = number of chunks the splitter produced for the given budget and
 // ratios, capped = messages the fan-out cap intentionally discarded (a subset of
-// dropped). The eval gate (SS-02) calls this, so a silent-drop cap reintroduced
-// ANYWHERE in the chain makes dropped go non-zero. capped is reported separately
-// so the gate can subtract the INTENTIONAL, disclosed cap and still fail on a
-// genuine splitter/formatter regression — matching production, where
-// CappedDroppedCount is deliberately kept out of the silent-loss signal (#256 P2).
+// dropped). The eval gate (SS-02) subtracts capped, so it treats a disclosed cap
+// as no loss while STILL failing on a genuine splitter/formatter regression:
+// capped counts ONLY the chunks capChunks actually removed, and only when the cap
+// fired. Deriving it unconditionally as input−kept would misattribute splitter-
+// class loss (a message that never reached any chunk) to the intentional-cap
+// counter, cancelling it in dropped−capped and masking a real regression (#256 r8
+// §3). Matches production, where CappedDroppedCount is likewise gated on the cap
+// flag and kept out of the silent-loss signal (#256 P2).
 //
 // Replaces the arithmetic-only ComputeCoverage, which returned a hardcoded
 // dropped=0 and never touched the splitter or formatter — a guard that
@@ -138,20 +144,31 @@ func ProbeChunkCoverage(msgMaps []map[string]interface{}, requestedChunkSize, bu
 	}
 	size := clampChunkSize(requestedChunkSize)
 	chunked := splitMsgMapsByTokenBudget(msgMaps, budget, size, cjkRatio, asciiRatio)
+	// Count the messages the splitter emitted BEFORE the cap, so capped can be the
+	// exact size of the cap-removed tail rather than input−kept (which would also
+	// swallow any splitter loss).
+	preCapMsgs := 0
+	for _, c := range chunked {
+		preCapMsgs += len(c)
+	}
 	// The fan-out cap (#241) is part of the SHIPPED chunking chain, so the probe
 	// must apply it too — otherwise the SS-02 gate would miss a regression that
 	// only manifests past the cap. capChunks keeps the kept chunks; the dropped
-	// tail's messages never get counted into processed, so they show up in
-	// dropped. kept counts the retained messages, so capped = input − kept is the
-	// portion of dropped that is the intentional cap rather than silent loss.
-	chunked, _ = capChunks(chunked)
+	// tail's messages never get counted into processed, so they show up in dropped.
+	chunked, capFired := capChunks(chunked)
 	kept := 0
 	for _, c := range chunked {
 		_, p, _ := formatChunkForLLM(c)
 		processed += p
 		kept += len(c)
 	}
-	return processed, len(msgMaps) - processed, len(chunked), len(msgMaps) - kept
+	// capped = the cap-removed tail (preCapMsgs − kept), ONLY when the cap fired.
+	// Splitter loss (input − preCapMsgs) is NOT in capped, so it stays in dropped
+	// and dropped−capped catches it.
+	if capFired {
+		capped = preCapMsgs - kept
+	}
+	return processed, len(msgMaps) - processed, len(chunked), capped
 }
 
 // ProbeChunkCoverageDefault runs ProbeChunkCoverage across BOTH ratio sets the
@@ -847,7 +864,8 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 				}
 				// Per-chunk failure with the run still alive: drop this slice and
 				// keep the rest (#241 item 2). Gap disclosed via cov; the cause is
-				// retained (index order) for the all-failed errors.Join below.
+				// retained (index order) so mapPhaseFailedErr below can key on the
+				// lowest-index one when nothing usable survives.
 				log.Printf("[summarize_chunk] chunk %d failed, dropping from reduce input: %v", i, err)
 				errs = append(errs, fmt.Errorf("chunk %d: %w", i, err))
 				cov.FailedChunkCount++
@@ -929,7 +947,8 @@ func summarizeChunksConcurrently(ctx context.Context, chunks [][]map[string]inte
 			}
 			// Per-chunk failure (e.g. this chunk's own upstream timeout) with the
 			// run still alive: drop this slice, keep the rest (#241 item 2). The
-			// cause is retained (index order) for the all-failed errors.Join below.
+			// cause is retained (index order) so mapPhaseFailedErr below can key on
+			// the lowest-index one when nothing usable survives.
 			log.Printf("[summarize_chunk] chunk %d failed, dropping from reduce input: %v", i, o.err)
 			errs = append(errs, fmt.Errorf("chunk %d: %w", i, o.err))
 			cov.FailedChunkCount++

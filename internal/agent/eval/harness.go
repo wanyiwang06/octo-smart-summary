@@ -107,8 +107,10 @@ func Coverage(gc GoldenCase) CoverageMetric {
 		Chunks:             chunks,
 		// The fan-out cap is INTENTIONAL and disclosed, so it is not silent loss:
 		// subtract it, matching production where CappedDroppedCount is kept out of
-		// the silent-loss signal. A genuine splitter/formatter regression still
-		// makes (dropped-capped) go non-zero and fails the gate (#256 P2).
+		// the silent-loss signal. capped counts ONLY the cap-removed tail (probe
+		// gates it on the cap actually firing), so a genuine splitter/formatter
+		// regression — which loses messages the cap never touched — still makes
+		// (dropped-capped) go non-zero and fails the gate (#256 P2).
 		NoSilentLoss: dropped-capped == 0,
 	}
 }
