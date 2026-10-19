@@ -26,11 +26,14 @@ jobs:
 
   scan-pr:
     if: github.event_name == 'pull_request'
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
     with:
       scan-args: |-
         -r
         ./
+      # Full reports remain available as artifacts; exporting JSON as job outputs
+      # can exceed GitHub's 1 MB limit even when no new vulnerabilities are found.
+      export-results: false
       # Skip SARIF upload when GITHUB_TOKEN is read-only:
       # - Fork PRs: token is inherently read-only
       # - Dependabot PRs: GitHub enforces read-only token for dependabot[bot]
