@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -166,7 +167,7 @@ func resolveReferencedArtifact(
 			Citations:       plainCitations,
 			TeamCitations:   teamCitations,
 			CitationMarkers: newCitationMarkerSet(allPlainCitations, teamCitations),
-			Snapshot:        nil,
+			Snapshot:        decodeResultSnapshot(result.SnapshotJSON),
 			Sources:         sources,
 		}, nil
 	}
@@ -336,4 +337,15 @@ func nonEmptyPersonalResultTaskIDs(db *gorm.DB, taskIDs []int64, userID string) 
 		out[id] = true
 	}
 	return out, nil
+}
+
+func decodeResultSnapshot(raw *string) *model.Snapshot {
+	if raw == nil {
+		return nil
+	}
+	var snapshot model.Snapshot
+	if json.Unmarshal([]byte(*raw), &snapshot) != nil {
+		return nil
+	}
+	return &snapshot
 }

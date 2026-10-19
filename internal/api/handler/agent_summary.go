@@ -108,12 +108,14 @@ func NewAgentSummaryHandler(db, imDB *gorm.DB, llmApiURL, llmApiKey, llmModel st
 //   - Idempotency-Key is HTTP-header-borne (mirrors bot_summary_create.go);
 //     absent header keeps the non-idempotent legacy path.
 type createAgentSummaryReq struct {
-	SessionID         string           `json:"session_id"`
-	OriginChannelID   *string          `json:"origin_channel_id,omitempty"`
-	OriginChannelType int              `json:"origin_channel_type,omitempty"`
-	Title             string           `json:"title,omitempty"`
-	Sources           []sourceReq      `json:"sources,omitempty"`
-	Participants      []participantReq `json:"participants,omitempty"`
+	SaveMode          string              `json:"save_mode,omitempty"`
+	Target            *optimizationTarget `json:"target,omitempty"`
+	SessionID         string              `json:"session_id"`
+	OriginChannelID   *string             `json:"origin_channel_id,omitempty"`
+	OriginChannelType int                 `json:"origin_channel_type,omitempty"`
+	Title             string              `json:"title,omitempty"`
+	Sources           []sourceReq         `json:"sources,omitempty"`
+	Participants      []participantReq    `json:"participants,omitempty"`
 	// ReferencedTaskIDs 可选:本次 agent chat 引用的已有总结 task_id 数组。
 	// 前端在保存时把首轮引用的 task IDs 透传过来,后端记录到 SummaryTask
 	// (方便日后做衍生关系追溯),不影响本次生成的 content/citations。
@@ -181,6 +183,18 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 		return
 	}
 	req.Title = strings.TrimSpace(req.Title)
+	if req.SaveMode != "" && req.SaveMode != "new_summary" && req.SaveMode != "new_version" {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "invalid save_mode"})
+		return
+	}
+	if req.SaveMode == "new_version" {
+		h.saveOptimizationVersion(c, req)
+		return
+	}
+	if req.Target != nil {
+		c.JSON(http.StatusBadRequest, apiResponse{Code: 40001, Message: "target requires new_version"})
+		return
+	}
 
 	// SUM-24: origin_channel fields are now optional. Distinguish between:
 	// - nil (not provided) → resolve from session

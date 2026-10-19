@@ -1070,6 +1070,7 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 			"total_token_used": latestResult.TotalTokenUsed,
 			"model_version":    latestResult.ModelVersion,
 			"version":          latestResult.Version,
+			"snapshot":         decodeResultSnapshot(latestResult.SnapshotJSON),
 			"operation_type":   latestResult.OperationType,
 			"operation_note":   latestResult.OperationNote,
 			"parent_result_id": latestResult.ParentResultID,

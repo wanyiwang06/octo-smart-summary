@@ -43,11 +43,18 @@ type Snapshot struct {
 }
 
 // SnapshotScope represents the channel + time range that the agent summarized.
+type SnapshotSource struct {
+	SourceID   string `json:"source_id"`
+	SourceType int    `json:"source_type"`
+	SourceName string `json:"source_name"`
+}
+
 type SnapshotScope struct {
-	ChannelIDs   []string      `json:"channel_ids"`
-	ChannelNames []string      `json:"channel_names"`
-	DocumentIDs  []string      `json:"document_ids,omitempty"`
-	TimeRange    TimeRangeJSON `json:"time_range"`
+	Sources      []SnapshotSource `json:"sources,omitempty"`
+	ChannelIDs   []string         `json:"channel_ids"`
+	ChannelNames []string         `json:"channel_names"`
+	DocumentIDs  []string         `json:"document_ids,omitempty"`
+	TimeRange    TimeRangeJSON    `json:"time_range"`
 }
 
 // TimeRangeJSON represents a start/end timestamp pair.

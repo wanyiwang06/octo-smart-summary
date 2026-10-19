@@ -138,6 +138,17 @@ func (h *EditHandler) EditSummary(c *gin.Context) {
 	now := timezone.Now()
 
 	err = h.db.Transaction(func(tx *gorm.DB) error {
+		var locked model.SummaryTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND deleted_at IS NULL", taskID).First(&locked).Error; err != nil {
+			return err
+		}
+		latest, err := queryDisplayResult(tx, taskID)
+		if err != nil {
+			return err
+		}
+		if latest.ID != req.BaseResultID || latest.Content != summaryResult.Content || latest.CitationsJSON != summaryResult.CitationsJSON {
+			return service.NewBizError(40009, "内容已更新，请刷新后重试", http.StatusConflict)
+		}
 		result := tx.Model(&model.SummaryResult{}).
 			Where("id = ?", req.BaseResultID).
 			Updates(map[string]interface{}{
@@ -706,6 +717,7 @@ func (h *EditHandler) GetSummaryVersion(c *gin.Context) {
 	ok(c, gin.H{
 		"result_id":        row.ID,
 		"version":          row.Version,
+		"snapshot":         decodeResultSnapshot(row.SnapshotJSON),
 		"operation_type":   row.OperationType,
 		"operation_note":   row.OperationNote,
 		"parent_result_id": row.ParentResultID,

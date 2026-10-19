@@ -456,6 +456,7 @@ func (h *PersonalHandler) GetPersonal(c *gin.Context) {
 		"version":            version,
 		"worker_status":      pr.WorkerStatus,
 		"workflow_stage":     pr.WorkflowStage,
+		"snapshot":           pr.GetSnapshot(),
 		"content":            pr.Content,
 		"citations":          pr.GetCitations(),
 		"submitted_at":       nil,

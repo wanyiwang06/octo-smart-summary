@@ -205,6 +205,9 @@ func (SummaryBotCreateIdempotency) TableName() string { return "summary_bot_crea
 // unique index uses user_id where the bot table uses bot_id (see migration
 // 20260810-01-agent-draft-save.sql).
 type SummaryAgentSaveIdempotency struct {
+	ResultID       int64     `gorm:"column:result_id;not null;default:0"`
+	ResultVersion  int       `gorm:"column:result_version;not null;default:0"`
+	ResultKind     string    `gorm:"column:result_kind;type:varchar(24);not null;default:''"`
 	ID             int64     `gorm:"primaryKey;autoIncrement"`
 	SpaceID        string    `gorm:"column:space_id;type:varchar(64);not null;uniqueIndex:uk_agent_save_idempotency"`
 	UserID         string    `gorm:"column:user_id;type:varchar(64);not null;uniqueIndex:uk_agent_save_idempotency"`
@@ -361,6 +364,7 @@ type TeamCitation struct {
 
 // SummaryResult represents the final summary output.
 type SummaryResult struct {
+	SnapshotJSON      *string    `gorm:"column:snapshot_json;type:mediumtext" json:"-"`
 	ID                int64      `gorm:"primaryKey;autoIncrement" json:"id"`
 	TaskID            int64      `gorm:"column:task_id;not null" json:"task_id"`
 	Content           string     `gorm:"column:content;type:mediumtext;not null" json:"content"`
