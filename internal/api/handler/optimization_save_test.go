@@ -4,7 +4,10 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
@@ -154,5 +157,201 @@ func TestOptimizationSaveAuthorization(t *testing.T) {
 				t.Fatalf("expected rejection: %d %s", w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+// A task-only reference always resolves to the shared artifact when it exists.
+// Do not advertise a personal write that generation cannot safely produce.
+func TestOptimizationTargetMatchesReferenceWithBothResults(t *testing.T) {
+	db, h, _, b := seedOptimization(t, "personal")
+	team := model.SummaryResult{TaskID: b.Task.ID, Content: "Shared content", Version: 1}
+	if err := db.Create(&team).Error; err != nil {
+		t.Fatal(err)
+	}
+	r := setupAgentSummaryRouter(h)
+	r.GET("/api/v1/summaries/:id/optimization-target", h.GetOptimizationTarget)
+	for _, tt := range []struct {
+		query  string
+		status int
+	}{{"", 200}, {"?result_kind=team", 200}, {"?result_kind=personal", 409}} {
+		req := httptest.NewRequest("GET", fmt.Sprintf("/api/v1/summaries/%d/optimization-target%s", b.Task.ID, tt.query), nil)
+		req.Header.Set("token", "test-user")
+		req.Header.Set("X-Space-Id", "test-space")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != tt.status {
+			t.Fatalf("%s: %d %s", tt.query, w.Code, w.Body.String())
+		}
+		if tt.status == 200 && !strings.Contains(w.Body.String(), `"result_kind":"team"`) {
+			t.Fatal(w.Body.String())
+		}
+	}
+}
+
+func TestOptimizationPersonalMetadataDoesNotFabricateHistory(t *testing.T) {
+	db, h, f, b := seedOptimization(t, "personal")
+	if err := db.Model(&b.Personal).Updates(map[string]interface{}{"total_token_used": 123, "model_version": "original-model", "msg_count": 17}).Error; err != nil {
+		t.Fatal(err)
+	}
+	b, err := loadOptimizationBase(db, "test-space", "test-user", b.Task.ID, "personal", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Body["target"] = optimizationTarget{b.Task.ID, "personal", b.revision()}
+	w := doAgentSave(t, setupAgentSummaryRouter(h), f.Body, map[string]string{"Idempotency-Key": "personal-metadata"})
+	if w.Code != 200 {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+	if err := db.First(&b.Personal, b.Personal.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	current, err := ensurePersonalVersionBaseline(db, b.Personal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	db.Model(&model.PersonalResultVersion{}).Count(&count)
+	if count != 2 || current.TotalTokenUsed != 123 || current.ModelVersion != "original-model" || current.MsgCount != 17 {
+		t.Fatalf("phantom history or lost metadata: count=%d version=%+v", count, current)
+	}
+	if *b.Personal.CurrentVersionID != current.ID {
+		t.Fatal("version pointer mismatch")
+	}
+}
+
+func TestOptimizationTeamMirrorIsAtomicVersion(t *testing.T) {
+	for _, multiple := range []bool{false, true} {
+		t.Run(fmt.Sprint(multiple), func(t *testing.T) {
+			db, h, f, b := seedOptimization(t, "team")
+			old := `{"snapshot_version":1,"content_version":1,"requirement":"old source"}`
+			p := model.PersonalResult{TaskID: b.Task.ID, UserID: "test-user", Content: "Personal original", WorkerStatus: model.PersonalStatusCompleted, SnapshotJSON: &old, TotalTokenUsed: 123, ModelVersion: "original-model"}
+			if err := db.Create(&p).Error; err != nil {
+				t.Fatal(err)
+			}
+			baseline, err := ensurePersonalVersionBaseline(db, p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Personal numbering deliberately differs from team numbering.
+			if err := db.Model(&baseline).Update("version", 4).Error; err != nil {
+				t.Fatal(err)
+			}
+			if multiple {
+				if err := db.Create(&model.SummaryParticipant{TaskID: b.Task.ID, UserID: "another", Status: model.ParticipantAccepted}).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := db.Model(&b.Result).Updates(map[string]interface{}{"total_token_used": 456, "model_version": "team-model"}).Error; err != nil {
+				t.Fatal(err)
+			}
+			b, err = loadOptimizationBase(db, "test-space", "test-user", b.Task.ID, "team", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.Body["target"] = optimizationTarget{b.Task.ID, "team", b.revision()}
+			w := doAgentSave(t, setupAgentSummaryRouter(h), f.Body, map[string]string{"Idempotency-Key": "team-mirror"})
+			if w.Code != 200 {
+				t.Fatalf("%d %s", w.Code, w.Body.String())
+			}
+			var task model.SummaryTask
+			db.First(&task, b.Task.ID)
+			team, err := queryDisplayResult(db, task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if team.Version != 2 || team.TotalTokenUsed != 456 || team.ModelVersion != "team-model" {
+				t.Fatalf("team metadata lost: %+v", team)
+			}
+			if err := db.First(&p, p.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if multiple {
+				if p.Content != "Personal original" || *p.SnapshotJSON != old {
+					t.Fatal("multi-person result overwritten")
+				}
+				return
+			}
+			current, err := ensurePersonalVersionBaseline(db, p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if p.Content != team.Content || current.Content != team.Content || current.Version != 5 || p.GetSnapshot().ContentVersion != 5 || *p.SnapshotJSON != *current.SnapshotJSON || current.TotalTokenUsed != 123 {
+				t.Fatalf("inconsistent mirror: personal=%+v history=%+v", p, current)
+			}
+			var count int64
+			db.Model(&model.PersonalResultVersion{}).Count(&count)
+			if count != 2 {
+				t.Fatalf("phantom history: %d", count)
+			}
+			r := setupAgentSummaryRouter(h)
+			r.GET("/api/v1/summaries/:id/personal", NewPersonalHandler(db, "", nil).GetPersonal)
+			req := httptest.NewRequest("GET", fmt.Sprintf("/api/v1/summaries/%d/personal", task.ID), nil)
+			req.Header.Set("token", "test-user")
+			req.Header.Set("X-Space-Id", "test-space")
+			response := httptest.NewRecorder()
+			r.ServeHTTP(response, req)
+			if response.Code != 200 || !strings.Contains(response.Body.String(), `"version":5`) || !strings.Contains(response.Body.String(), `"content_version":5`) {
+				t.Fatal(response.Body.String())
+			}
+		})
+	}
+}
+
+func TestOptimizationPersonalRevisionIgnoresTeamPointer(t *testing.T) {
+	_, _, _, b := seedOptimization(t, "personal")
+	before := b.revision()
+	id := int64(999)
+	b.Task.CurrentResultID = &id
+	if b.revision() != before {
+		t.Fatal("unrelated team pointer invalidates personal revision")
+	}
+	raw := "changed snapshot"
+	b.Personal.SnapshotJSON = &raw
+	if b.revision() == before {
+		t.Fatal("personal snapshot change must invalidate revision")
+	}
+}
+
+func TestRefinedResultSnapshotPreservesProvenance(t *testing.T) {
+	raw := `{"snapshot_version":1,"content_version":2,"requirement":"original","scope":{"channel_ids":["chat1"]}}`
+	next := decodeResultSnapshot(refinedResultSnapshot(&raw, 3, "shorten"))
+	if next == nil || next.ContentVersion != 3 || next.Requirement != "original" || *next.ParentSnapshotVersion != 2 || *next.UserInstruction != "shorten" || next.Scope.ChannelIDs[0] != "chat1" {
+		t.Fatalf("bad snapshot: %+v", next)
+	}
+	if refinedResultSnapshot(nil, 2, "shorten") != nil {
+		t.Fatal("invented snapshot for legacy result")
+	}
+}
+
+func TestOptimizationMirrorFailureRollsBackTeamAndPreview(t *testing.T) {
+	db, h, f, b := seedOptimization(t, "team")
+	personal := model.PersonalResult{TaskID: b.Task.ID, UserID: "test-user", Content: "Original personal", WorkerStatus: model.PersonalStatusCompleted}
+	if err := db.Create(&personal).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensurePersonalVersionBaseline(db, personal); err != nil {
+		t.Fatal(err)
+	}
+	// Fail after the team version has been inserted, inside personal mirroring.
+	if err := db.Exec(`CREATE TRIGGER reject_personal_version BEFORE INSERT ON summary_personal_result_version BEGIN SELECT RAISE(ABORT, 'simulated history failure'); END`).Error; err != nil {
+		t.Fatal(err)
+	}
+	w := doAgentSave(t, setupAgentSummaryRouter(h), f.Body, map[string]string{"Idempotency-Key": "mirror-rollback"})
+	if w.Code != 500 {
+		t.Fatalf("expected failure: %d %s", w.Code, w.Body.String())
+	}
+	var count int64
+	db.Model(&model.SummaryResult{}).Where("task_id = ?", b.Task.ID).Count(&count)
+	if count != 1 {
+		t.Fatalf("team version survived rollback: %d", count)
+	}
+	var session model.AgentSummarySession
+	db.First(&session, f.Session.ID)
+	if session.State != "preview_ready" {
+		t.Fatal("preview consumed on rollback")
+	}
+	db.First(&personal, personal.ID)
+	if personal.Content != "Original personal" {
+		t.Fatal("personal content changed on rollback")
 	}
 }

@@ -35,12 +35,13 @@ type optimizationBase struct {
 }
 
 func (b optimizationBase) revision() string {
-	var value interface{} = b.Result
+	// Hash only the artifact being updated; unrelated team pointer changes
+	// must not invalidate a personal revision. Storage-only fields are explicit.
+	values := []interface{}{b.Kind, b.Result, b.Result.CitationsJSON, b.Result.TeamCitationsJSON, b.Result.SnapshotJSON, b.Task.CurrentResultID}
 	if b.Kind == "personal" {
-		value = b.Personal
+		values = []interface{}{b.Kind, b.Personal, b.Personal.CitationsJSON, b.Personal.SnapshotJSON}
 	}
-	// JSON excludes citation storage fields, so include them explicitly.
-	data, _ := json.Marshal([]interface{}{b.Kind, value, b.Result.CitationsJSON, b.Result.TeamCitationsJSON, b.Personal.CitationsJSON, b.Task.CurrentResultID})
+	data, _ := json.Marshal(values)
 	hash := sha256.Sum256(data)
 	return hex.EncodeToString(hash[:])
 }
@@ -70,9 +71,14 @@ func loadOptimizationBase(db *gorm.DB, space, user string, id int64, kind string
 	if kind != "" && kind != "team" && kind != "personal" {
 		return b, service.NewBizError(40001, "invalid result_kind", http.StatusBadRequest)
 	}
-	if kind != "personal" {
+	// Keep the same team-first precedence as the generation reference resolver.
+	// Explicit personal targets cannot redirect a shared task reference.
+	{
 		r, err := queryDisplayResult(db, id)
-		if err == nil && strings.TrimSpace(r.Content) != "" {
+		if err == nil && r.Content != "" {
+			if kind == "personal" {
+				return b, service.NewBizError(40009, "reference resolves to team summary; personal optimization unavailable", http.StatusConflict)
+			}
 			if lock {
 				if err := db.Clauses(clause.Locking{Strength: "UPDATE"}).First(&r, r.ID).Error; err != nil {
 					return b, err
@@ -286,7 +292,9 @@ func (h *AgentSummaryHandler) saveOptimizationVersion(c *gin.Context, req create
 			snapshot.Scope.TimeRange = artifact.Snapshot.Scope.TimeRange
 		}
 		instruction := agentMessageRequirement(tx, candidate.Message, user)
-		snapshot.UserInstruction = &instruction
+		if strings.TrimSpace(instruction) != "" {
+			snapshot.UserInstruction = &instruction
+		}
 		snapshotJSON := func(version int) *string {
 			snapshot.ContentVersion = version
 			data, _ := json.Marshal(snapshot)
@@ -300,7 +308,7 @@ func (h *AgentSummaryHandler) saveOptimizationVersion(c *gin.Context, req create
 			if err != nil {
 				return err
 			}
-			result := model.SummaryResult{TaskID: task.ID, Content: content, Version: version, OperationType: "refine", ParentResultID: &b.Result.ID, CreatedBy: user, GeneratedAt: now, TotalMsgCount: b.Result.TotalMsgCount}
+			result := model.SummaryResult{TaskID: task.ID, Content: content, Version: version, OperationType: "refine", ParentResultID: &b.Result.ID, CreatedBy: user, GeneratedAt: now, TotalMsgCount: b.Result.TotalMsgCount, TotalTokenUsed: b.Result.TotalTokenUsed, ModelVersion: b.Result.ModelVersion}
 			result.SnapshotJSON = snapshotJSON(version)
 			result.OperationNote = instruction
 			result.SetCitations(cits)
@@ -318,37 +326,27 @@ func (h *AgentSummaryHandler) saveOptimizationVersion(c *gin.Context, req create
 				return err
 			}
 			if count <= 1 {
-				if err := tx.Model(&model.PersonalResult{}).Where("task_id = ? AND user_id = ?", task.ID, user).Updates(map[string]interface{}{"content": content, "citations_json": result.CitationsJSON, "edited_at": now}).Error; err != nil {
+				var personal model.PersonalResult
+				err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("task_id = ? AND user_id = ?", task.ID, user).First(&personal).Error
+				if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 					return err
+				}
+				if err == nil {
+					if _, err := saveOptimizedPersonalVersion(tx, personal, content, cits, instruction, snapshot); err != nil {
+						return err
+					}
 				}
 			}
 			if err := service.PruneSummaryResultVersions(tx, task.ID, service.SummaryResultVersionKeepLimit); err != nil {
 				return err
 			}
 		} else {
-			baseline, err := ensurePersonalVersionBaseline(tx, b.Personal)
+			result, err := saveOptimizedPersonalVersion(tx, b.Personal, content, cits, instruction, snapshot)
 			if err != nil {
-				return err
-			}
-			version, err := service.GetNextPersonalVersion(tx, task.ID, user)
-			if err != nil {
-				return err
-			}
-			result := model.PersonalResultVersion{TaskID: task.ID, ParticipantRefID: b.Personal.ParticipantRefID, UserID: user, Content: content, Version: version, OperationType: "refine", ParentVersionID: &baseline.ID, CreatedBy: user, GeneratedAt: now, MsgCount: b.Personal.MsgCount}
-			result.SnapshotJSON = snapshotJSON(version)
-			result.OperationNote = instruction
-			result.SetCitations(cits)
-			if err := tx.Create(&result).Error; err != nil {
-				return err
-			}
-			if err := tx.Model(&model.PersonalResult{}).Where("id = ?", b.Personal.ID).Updates(map[string]interface{}{"content": content, "citations_json": result.CitationsJSON, "snapshot_json": result.SnapshotJSON, "current_version_id": result.ID, "generated_at": now, "edited_at": now}).Error; err != nil {
 				return err
 			}
 			saved.ResultID = result.ID
-			saved.ResultVersion = version
-			if err := service.PrunePersonalResultVersions(tx, task.ID, user, service.PersonalResultVersionKeepLimit); err != nil {
-				return err
-			}
+			saved.ResultVersion = result.Version
 		}
 		if err := createAgentSaveIdempotencyBinding(tx, &saved); err != nil {
 			return err
@@ -363,4 +361,35 @@ func (h *AgentSummaryHandler) saveOptimizationVersion(c *gin.Context, req create
 		return
 	}
 	ok(c, gin.H{"task_id": task.ID, "task_no": task.TaskNo, "status": task.Status, "created_at": task.CreatedAt, "save_mode": "new_version", "version": saved.ResultVersion, "result_id": saved.ResultID, "result_kind": saved.ResultKind})
+}
+
+// Keep the materialized personal result and its history in the same transaction.
+// The snapshot uses the personal history sequence, which can differ from team's.
+func saveOptimizedPersonalVersion(tx *gorm.DB, personal model.PersonalResult, content string, citations []model.Citation, instruction string, snapshot *model.Snapshot) (model.PersonalResultVersion, error) {
+	var result model.PersonalResultVersion
+	baseline, err := ensurePersonalVersionBaseline(tx, personal)
+	if err != nil {
+		return result, err
+	}
+	version, err := service.GetNextPersonalVersion(tx, personal.TaskID, personal.UserID)
+	if err != nil {
+		return result, err
+	}
+	now := timezone.Now()
+	snapshotCopy := *snapshot
+	snapshotCopy.ContentVersion = version
+	raw, err := json.Marshal(snapshotCopy)
+	if err != nil {
+		return result, err
+	}
+	snapshotJSON := string(raw)
+	result = model.PersonalResultVersion{TaskID: personal.TaskID, ParticipantRefID: personal.ParticipantRefID, UserID: personal.UserID, Content: content, Version: version, OperationType: "refine", ParentVersionID: &baseline.ID, CreatedBy: personal.UserID, GeneratedAt: now, MsgCount: personal.MsgCount, TotalTokenUsed: personal.TotalTokenUsed, ModelVersion: personal.ModelVersion, SnapshotJSON: &snapshotJSON, OperationNote: instruction}
+	result.SetCitations(citations)
+	if err := tx.Create(&result).Error; err != nil {
+		return result, err
+	}
+	if err := tx.Model(&model.PersonalResult{}).Where("id = ?", personal.ID).Updates(map[string]interface{}{"content": content, "citations_json": result.CitationsJSON, "snapshot_json": result.SnapshotJSON, "current_version_id": result.ID, "generated_at": now, "edited_at": now}).Error; err != nil {
+		return result, err
+	}
+	return result, service.PrunePersonalResultVersions(tx, personal.TaskID, personal.UserID, service.PersonalResultVersionKeepLimit)
 }

@@ -344,8 +344,30 @@ func decodeResultSnapshot(raw *string) *model.Snapshot {
 		return nil
 	}
 	var snapshot model.Snapshot
-	if json.Unmarshal([]byte(*raw), &snapshot) != nil {
+	if err := json.Unmarshal([]byte(*raw), &snapshot); err != nil {
+		log.Printf("[summary] invalid generation snapshot: %v", err)
 		return nil
 	}
 	return &snapshot
+}
+
+// Preserve provenance when deriving a version without refetching sources.
+func refinedResultSnapshot(raw *string, version int, instruction string) *string {
+	snapshot := decodeResultSnapshot(raw)
+	if snapshot == nil {
+		return nil
+	}
+	parent := snapshot.ContentVersion
+	snapshot.ParentSnapshotVersion = &parent
+	snapshot.ContentVersion = version
+	snapshot.UserInstruction = nil
+	if instruction != "" {
+		snapshot.UserInstruction = &instruction
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil
+	}
+	result := string(encoded)
+	return &result
 }

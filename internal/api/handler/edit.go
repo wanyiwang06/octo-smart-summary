@@ -367,6 +367,7 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 			return err
 		}
 		newResult.Version = nextVer
+		newResult.SnapshotJSON = refinedResultSnapshot(baseResult.SnapshotJSON, nextVer, feedback)
 		if err := tx.Create(&newResult).Error; err != nil {
 			return err
 		}
@@ -558,6 +559,7 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 			return err
 		}
 		newResult.Version = nextVer
+		newResult.SnapshotJSON = refinedResultSnapshot(baseResult.SnapshotJSON, nextVer, feedback)
 		if err := tx.Create(&newResult).Error; err != nil {
 			return err
 		}
