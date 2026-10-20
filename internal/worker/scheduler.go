@@ -257,7 +257,12 @@ func preservePersonalResultVersionsBeforeRequeue(tx *gorm.DB, taskID int64) erro
 		var latest model.PersonalResultVersion
 		err := tx.Where("task_id = ? AND user_id = ?", pr.TaskID, pr.UserID).
 			Order("version DESC").Order("id DESC").First(&latest).Error
-		if err == nil && latest.Content == pr.Content && latest.CitationsJSON == pr.CitationsJSON && equalSnapshotJSON(latest.SnapshotJSON, pr.SnapshotJSON) {
+		if err == nil {
+			if normalizeErr := service.NormalizePersonalVersionSnapshot(tx, pr, &latest); normalizeErr != nil {
+				return normalizeErr
+			}
+		}
+		if err == nil && latest.Content == pr.Content && latest.CitationsJSON == pr.CitationsJSON && !service.KnownPersonalSnapshotsDiffer(latest.SnapshotJSON, pr.SnapshotJSON) {
 			if pr.CurrentVersionID == nil {
 				if err := tx.Model(&model.PersonalResult{}).Where("id = ?", pr.ID).Update("current_version_id", latest.ID).Error; err != nil {
 					return err
@@ -532,11 +537,4 @@ func schedulerTriggerWorker(workerTriggerURL string, req model.WorkerTriggerRequ
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		log.Printf("[scheduler] trigger worker returned HTTP %d", resp.StatusCode)
 	}
-}
-
-func equalSnapshotJSON(a, b *string) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return *a == *b
 }

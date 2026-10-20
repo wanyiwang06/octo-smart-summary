@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -175,12 +176,36 @@ func (h *EditHandler) EditSummary(c *gin.Context) {
 		// (hasPersonal already encodes participantCount<=1 && row exists). Multi-person
 		// team edits touch the team SummaryResult only, never a PersonalResult (R4).
 		if hasPersonal {
+			// The task lock serializes API writers; lock/reload the personal row
+			// as well before rebasing the display provenance into its history.
+			var currentPersonal model.PersonalResult
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND task_id = ? AND user_id = ?", personalResult.ID, taskID, task.CreatorID).First(&currentPersonal).Error; err != nil {
+				return err
+			}
+			personalVersion, err := currentPersonalVersion(tx, taskID, task.CreatorID, currentPersonal)
+			if err != nil {
+				return err
+			}
+			mirroredSnapshot := latest.SnapshotJSON
+			if snapshot := decodeResultSnapshot(mirroredSnapshot); snapshot != nil {
+				snapshot.ContentVersion = personalVersion
+				snapshot.ParentSnapshotVersion = nil
+				raw, err := json.Marshal(snapshot)
+				if err != nil {
+					return err
+				}
+				value := string(raw)
+				mirroredSnapshot = &value
+			} else if currentPersonal.SnapshotJSON != nil {
+				mirroredSnapshot = model.UnknownGenerationSnapshot(taskID, personalVersion)
+			}
 			if err := tx.Model(&model.PersonalResult{}).
 				Where("id = ?", personalResult.ID).
 				Updates(map[string]interface{}{
 					"content":        req.Content,
 					"citations_json": citationsJSON,
 					"edited_at":      now,
+					"snapshot_json":  mirroredSnapshot,
 				}).Error; err != nil {
 				return err
 			}

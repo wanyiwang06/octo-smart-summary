@@ -624,6 +624,11 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	var finishGaps []finishgate.Gap
 	var savedCitations []model.Citation
 	err = h.db.Transaction(func(tx *gorm.DB) error {
+		if !workspaceSave {
+			if err := h.authorizeLegacySaveSources(c.Request.Context(), spaceID, userID, req); err != nil {
+				return err
+			}
+		}
 		if workspaceSave {
 			lockedCandidate, lockErr := loadWorkspacePreviewForSave(tx, spaceID, userID, req, true)
 			if lockErr != nil {

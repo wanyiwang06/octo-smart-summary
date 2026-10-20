@@ -798,3 +798,60 @@ func TestPersonalRequeuePreservesSnapshotAndNewGenerationMarksUnknown(t *testing
 		t.Fatal("history and materialized snapshot differ")
 	}
 }
+
+func TestLegacyProvenanceRequeueAndEmptyWindowStayAligned(t *testing.T) {
+	for _, matching := range []bool{true, false} {
+		t.Run(fmt.Sprint(matching), func(t *testing.T) {
+			db := newSchedulerTestDB(t)
+			task := model.SummaryTask{TaskNo: "legacy-provenance", CreatorID: "owner", SpaceID: "space", Status: model.StatusCompleted, SummaryMode: model.ModeByPerson, TriggerType: model.TriggerScheduled}
+			if err := db.Create(&task).Error; err != nil {
+				t.Fatal(err)
+			}
+			raw := fmt.Sprintf(`{"snapshot_version":1,"task_id":%d,"content_version":1,"scope":{"channel_ids":["old-channel"]}}`, task.ID)
+			if !matching {
+				raw = fmt.Sprintf(`{"snapshot_version":1,"task_id":%d,"content_version":9,"scope":{"channel_ids":["newer-channel"]}}`, task.ID)
+			}
+			v := model.PersonalResultVersion{TaskID: task.ID, UserID: "owner", Version: 1, Content: "Old", OperationType: "generate"}
+			if err := db.Create(&v).Error; err != nil {
+				t.Fatal(err)
+			}
+			pr := model.PersonalResult{TaskID: task.ID, UserID: "owner", Content: "Old", SnapshotJSON: &raw, CurrentVersionID: &v.ID, WorkerStatus: model.PersonalStatusCompleted}
+			if err := db.Create(&pr).Error; err != nil {
+				t.Fatal(err)
+			}
+			processor := &Processor{db: db}
+			for run := 0; run < 3; run++ {
+				if err := db.Transaction(func(tx *gorm.DB) error { return preservePersonalResultVersionsBeforeRequeue(tx, task.ID) }); err != nil {
+					t.Fatal(err)
+				}
+				if err := processor.persistCompletedPersonalResult(task, pr, "", nil, 0, 0, "", time.Now(), true); err != nil {
+					t.Fatal(err)
+				}
+				var current model.PersonalResult
+				if err := db.First(&current, pr.ID).Error; err != nil {
+					t.Fatal(err)
+				}
+				var version model.PersonalResultVersion
+				if err := db.First(&version, *current.CurrentVersionID).Error; err != nil {
+					t.Fatal(err)
+				}
+				var count int64
+				db.Model(&model.PersonalResultVersion{}).Where("task_id = ?", task.ID).Count(&count)
+				if count != 1 || version.OperationType != "generate" {
+					t.Fatalf("empty run %d invented history", run)
+				}
+				if version.SnapshotJSON == nil || current.SnapshotJSON == nil || *version.SnapshotJSON != *current.SnapshotJSON {
+					t.Fatal("history/current provenance desynchronized")
+				}
+				snapshot := current.GetSnapshot()
+				if matching {
+					if *current.SnapshotJSON != raw {
+						t.Fatal("empty window lost known provenance")
+					}
+				} else if snapshot.ProvenanceStatus != "unknown" || len(snapshot.Scope.ChannelIDs) != 0 {
+					t.Fatal("unknown history borrowed newer source")
+				}
+			}
+		})
+	}
+}

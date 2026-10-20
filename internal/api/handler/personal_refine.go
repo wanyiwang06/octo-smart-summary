@@ -963,6 +963,9 @@ func ensurePersonalVersionBaseline(tx *gorm.DB, pr model.PersonalResult) (model.
 	var latest model.PersonalResultVersion
 	if pr.CurrentVersionID != nil {
 		if err := tx.Where("id = ? AND task_id = ? AND user_id = ?", *pr.CurrentVersionID, pr.TaskID, pr.UserID).First(&latest).Error; err == nil {
+			if err := service.NormalizePersonalVersionSnapshot(tx, pr, &latest); err != nil {
+				return latest, err
+			}
 			if personalCanonicalDiffersFromVersion(pr, latest) {
 				return createPersonalVersionSnapshot(tx, pr, &latest, "edit")
 			}
@@ -975,6 +978,9 @@ func ensurePersonalVersionBaseline(tx *gorm.DB, pr model.PersonalResult) (model.
 	err := tx.Where("task_id = ? AND user_id = ?", pr.TaskID, pr.UserID).
 		Order("version DESC").Order("id DESC").First(&latest).Error
 	if err == nil {
+		if err := service.NormalizePersonalVersionSnapshot(tx, pr, &latest); err != nil {
+			return latest, err
+		}
 		if personalCanonicalDiffersFromVersion(pr, latest) {
 			return createPersonalVersionSnapshot(tx, pr, &latest, "edit")
 		}
@@ -992,7 +998,7 @@ func ensurePersonalVersionBaseline(tx *gorm.DB, pr model.PersonalResult) (model.
 }
 
 func personalCanonicalDiffersFromVersion(pr model.PersonalResult, version model.PersonalResultVersion) bool {
-	if !sameSnapshotJSON(pr.SnapshotJSON, version.SnapshotJSON) {
+	if service.KnownPersonalSnapshotsDiffer(pr.SnapshotJSON, version.SnapshotJSON) {
 		return true
 	}
 	if pr.EditedAt == nil {
