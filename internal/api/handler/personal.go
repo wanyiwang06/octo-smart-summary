@@ -718,7 +718,7 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 		if lockedTask.Status == model.StatusProcessing {
 			return service.NewBizError(40005, "任务状态已变更，请刷新后重试", http.StatusConflict)
 		}
-		return syncSinglePersonalDisplay(tx, lockedTask, req.Content, citationsJSON, now)
+		return syncSinglePersonalDisplay(tx, lockedTask, userID, req.Content, citationsJSON, now)
 	}); err != nil {
 		var be *service.BizError
 		if errors.As(err, &be) {

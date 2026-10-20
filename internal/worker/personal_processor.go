@@ -188,6 +188,10 @@ func (p *Processor) persistCompletedPersonalResult(task model.SummaryTask, pr mo
 				updates["msg_count"] = latest.MsgCount
 				updates["total_token_used"] = latest.TotalTokenUsed
 				updates["model_version"] = latest.ModelVersion
+				updates["snapshot_json"] = latest.SnapshotJSON
+				if latest.SnapshotJSON == nil && lockedPR.SnapshotJSON != nil {
+					updates["snapshot_json"] = model.UnknownGenerationSnapshot(lockedPR.TaskID, latest.Version)
+				}
 				updates["current_version_id"] = latest.ID
 				updates["generated_at"] = latest.GeneratedAt
 			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -231,6 +235,10 @@ func (p *Processor) persistCompletedPersonalResult(task model.SummaryTask, pr mo
 			CreatedBy:        lockedPR.UserID,
 			GeneratedAt:      genAt,
 		}
+		if lockedPR.SnapshotJSON != nil {
+			version.SnapshotJSON = model.UnknownGenerationSnapshot(lockedPR.TaskID, nextVer)
+		}
+		updates["snapshot_json"] = version.SnapshotJSON
 		version.SetCitations(citations)
 		if err := tx.Create(&version).Error; err != nil {
 			return err

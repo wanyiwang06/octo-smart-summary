@@ -167,7 +167,7 @@ func resolveReferencedArtifact(
 			Citations:       plainCitations,
 			TeamCitations:   teamCitations,
 			CitationMarkers: newCitationMarkerSet(allPlainCitations, teamCitations),
-			Snapshot:        decodeResultSnapshot(result.SnapshotJSON),
+			Snapshot:        projectResultSnapshot(db, nil, task, result.SnapshotJSON),
 			Sources:         sources,
 		}, nil
 	}
@@ -369,5 +369,68 @@ func refinedResultSnapshot(raw *string, version int, instruction string) *string
 		return nil
 	}
 	result := string(encoded)
+	return &result
+}
+
+// Apply the same source projection at persistence, detail/history reads and
+// reference rendering, including snapshots saved before this guard existed.
+func projectResultSnapshot(db, imDB *gorm.DB, task model.SummaryTask, raw *string) *model.Snapshot {
+	return projectResultSnapshotValue(db, imDB, task, decodeResultSnapshot(raw))
+}
+
+func projectResultSnapshotValue(db, imDB *gorm.DB, task model.SummaryTask, snapshot *model.Snapshot) *model.Snapshot {
+	if snapshot == nil {
+		return nil
+	}
+	var sources []model.SummarySource
+	if err := db.Where("task_id = ?", task.ID).Find(&sources).Error; err != nil {
+		log.Printf("[summary] unable to project snapshot for task %d: %v", task.ID, err)
+		return nil
+	}
+	hidden := map[string]bool{}
+	known := map[string]model.SummarySource{}
+	for _, source := range sources {
+		if source.Derived {
+			hidden[source.SourceID] = true
+		} else {
+			known[source.SourceID] = source
+		}
+	}
+	// Work on fresh slices so projection cannot mutate an in-memory base artifact.
+	result := *snapshot
+	result.Scope.ChannelIDs = []string{}
+	result.Scope.ChannelNames = []string{}
+	result.Scope.Sources = nil
+	result.Scope.DocumentIDs = nil
+	for i, id := range snapshot.Scope.ChannelIDs {
+		if hidden[id] {
+			continue
+		}
+		name := ""
+		if i < len(snapshot.Scope.ChannelNames) {
+			name = snapshot.Scope.ChannelNames[i]
+		}
+		if source, ok := known[id]; ok {
+			name = displaySourceName(source, task.CreatorID, imDB)
+		}
+		result.Scope.ChannelIDs = append(result.Scope.ChannelIDs, id)
+		result.Scope.ChannelNames = append(result.Scope.ChannelNames, name)
+	}
+	for _, source := range snapshot.Scope.Sources {
+		if hidden[source.SourceID] {
+			continue
+		}
+		stored := model.SummarySource{SourceID: source.SourceID, SourceType: source.SourceType, SourceName: source.SourceName}
+		if value, ok := known[source.SourceID]; ok {
+			stored = value
+		}
+		source.SourceName = displaySourceName(stored, task.CreatorID, imDB)
+		result.Scope.Sources = append(result.Scope.Sources, source)
+	}
+	for _, id := range snapshot.Scope.DocumentIDs {
+		if !hidden[id] {
+			result.Scope.DocumentIDs = append(result.Scope.DocumentIDs, id)
+		}
+	}
 	return &result
 }

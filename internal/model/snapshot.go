@@ -1,16 +1,16 @@
 package model
 
-// Snapshot represents the complete generation context for an agent-produced
-// PersonalResult. It is stored as JSON in PersonalResult.SnapshotJSON and is
-// only populated for trigger_type=Agent summaries (traditional workflow leaves
-// it NULL).
+import "encoding/json"
+
+// Snapshot represents version-specific generation provenance. Agent optimization
+// may attach it to an originally traditional task. Legacy versions without
+// recoverable provenance use ProvenanceStatus=unknown, never a newer scope.
 //
 // Design (see issue SUM-36 / 需求2 P0.1):
 //
 //   - snapshot_version: numeric, fixed at 1 for this first version
 //   - task_id: numeric, references the SummaryTask primary key
-//   - content_version: numeric, always 1 in this phase (future refine PR will
-//     increment this when the user requests an edit)
+//   - content_version: version of the result described by this snapshot
 //   - requirement: the user's original request as expressed in the agent chat
 //     (can be extracted from SummaryTask.Title or the first user message)
 //   - scope: object containing channel_ids (string array), channel_names (string
@@ -31,6 +31,7 @@ package model
 //   - user_instruction = null
 //   - content_version = 1
 type Snapshot struct {
+	ProvenanceStatus      string        `json:"provenance_status,omitempty"`
 	SnapshotVersion       int           `json:"snapshot_version"`
 	TaskID                int64         `json:"task_id"`
 	ContentVersion        int           `json:"content_version"`
@@ -61,4 +62,13 @@ type SnapshotScope struct {
 type TimeRangeJSON struct {
 	Start string `json:"start"` // RFC3339 format
 	End   string `json:"end"`   // RFC3339 format
+}
+
+// UnknownGenerationSnapshot explicitly represents missing historical provenance.
+// Never borrow a different version's source scope or tool trace.
+func UnknownGenerationSnapshot(taskID int64, version int) *string {
+	snapshot := Snapshot{SnapshotVersion: 1, TaskID: taskID, ContentVersion: version, ProvenanceStatus: "unknown", Scope: SnapshotScope{ChannelIDs: []string{}, ChannelNames: []string{}}, ToolSummary: []string{}, DataFreshnessNote: "此版本的生成来源未记录，不能据此判断来源范围或数据新鲜度。"}
+	raw, _ := json.Marshal(snapshot)
+	result := string(raw)
+	return &result
 }

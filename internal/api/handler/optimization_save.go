@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Mininglamp-OSS/octo-smart-summary/internal/citationtext"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/middleware"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/service"
@@ -37,9 +38,9 @@ type optimizationBase struct {
 func (b optimizationBase) revision() string {
 	// Hash only the artifact being updated; unrelated team pointer changes
 	// must not invalidate a personal revision. Storage-only fields are explicit.
-	values := []interface{}{b.Kind, b.Result, b.Result.CitationsJSON, b.Result.TeamCitationsJSON, b.Result.SnapshotJSON, b.Task.CurrentResultID}
+	values := []interface{}{b.Kind, b.Result.ID, b.Result.Version, b.Result.Content, b.Result.CitationOwnerID, b.Result.CitationsJSON, b.Result.TeamCitationsJSON, b.Result.SnapshotJSON, b.Task.CurrentResultID}
 	if b.Kind == "personal" {
-		values = []interface{}{b.Kind, b.Personal, b.Personal.CitationsJSON, b.Personal.SnapshotJSON}
+		values = []interface{}{b.Kind, b.Personal.ID, b.Personal.CurrentVersionID, b.Personal.Content, b.Personal.CitationsJSON, b.Personal.SnapshotJSON}
 	}
 	data, _ := json.Marshal(values)
 	hash := sha256.Sum256(data)
@@ -234,7 +235,7 @@ func (h *AgentSummaryHandler) saveOptimizationVersion(c *gin.Context, req create
 		if err != nil {
 			return err
 		}
-		content := candidate.Content
+		content := citationtext.NormalizeSetextHeadings(candidate.Content)
 		cits, fallback, err := h.buildWorkspacePreviewCitations(c.Request.Context(), tx, user, req.SessionID, content, candidate, binding)
 		if err != nil {
 			return err
@@ -291,6 +292,15 @@ func (h *AgentSummaryHandler) saveOptimizationVersion(c *gin.Context, req create
 		if candidate.Scope.TimeRange == nil && artifact.Snapshot != nil {
 			snapshot.Scope.TimeRange = artifact.Snapshot.Scope.TimeRange
 		}
+		snapshot = projectResultSnapshotValue(tx, h.imDB, task, snapshot)
+		if snapshot == nil {
+			return errors.New("failed to project snapshot sources")
+		}
+		if artifact.Snapshot != nil {
+			parent := artifact.Snapshot.ContentVersion
+			snapshot.ParentSnapshotVersion = &parent
+		}
+		snapshot.DataFreshnessNote = "本版本由优化会话生成；tool_summary 仅记录该会话可用的工具调用，不代表已重新抓取全部来源。"
 		instruction := agentMessageRequirement(tx, candidate.Message, user)
 		if strings.TrimSpace(instruction) != "" {
 			snapshot.UserInstruction = &instruction
@@ -310,6 +320,7 @@ func (h *AgentSummaryHandler) saveOptimizationVersion(c *gin.Context, req create
 			}
 			result := model.SummaryResult{TaskID: task.ID, Content: content, Version: version, OperationType: "refine", ParentResultID: &b.Result.ID, CreatedBy: user, GeneratedAt: now, TotalMsgCount: b.Result.TotalMsgCount, TotalTokenUsed: b.Result.TotalTokenUsed, ModelVersion: b.Result.ModelVersion}
 			result.SnapshotJSON = snapshotJSON(version)
+			result.CitationOwnerID = user
 			result.OperationNote = instruction
 			result.SetCitations(cits)
 			result.SetTeamCitations(cleanUnreferencedTeamCitations(content, artifact.TeamCitations))
@@ -327,7 +338,7 @@ func (h *AgentSummaryHandler) saveOptimizationVersion(c *gin.Context, req create
 			}
 			if count <= 1 {
 				var personal model.PersonalResult
-				err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("task_id = ? AND user_id = ?", task.ID, user).First(&personal).Error
+				err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("task_id = ? AND user_id = ? AND worker_status = ?", task.ID, user, model.PersonalStatusCompleted).First(&personal).Error
 				if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 					return err
 				}
@@ -378,6 +389,11 @@ func saveOptimizedPersonalVersion(tx *gorm.DB, personal model.PersonalResult, co
 	now := timezone.Now()
 	snapshotCopy := *snapshot
 	snapshotCopy.ContentVersion = version
+	snapshotCopy.ParentSnapshotVersion = nil
+	if previous := personal.GetSnapshot(); previous != nil {
+		parent := previous.ContentVersion
+		snapshotCopy.ParentSnapshotVersion = &parent
+	}
 	raw, err := json.Marshal(snapshotCopy)
 	if err != nil {
 		return result, err

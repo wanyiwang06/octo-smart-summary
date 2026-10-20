@@ -364,6 +364,8 @@ type TeamCitation struct {
 
 // SummaryResult represents the final summary output.
 type SummaryResult struct {
+	// Explicit raw-citation owner for agent-produced artifacts; empty uses legacy authorization.
+	CitationOwnerID   string     `gorm:"column:citation_owner_id;type:varchar(64);not null;default:''" json:"-"`
 	SnapshotJSON      *string    `gorm:"column:snapshot_json;type:mediumtext" json:"-"`
 	ID                int64      `gorm:"primaryKey;autoIncrement" json:"id"`
 	TaskID            int64      `gorm:"column:task_id;not null" json:"task_id"`

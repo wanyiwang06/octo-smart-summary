@@ -333,16 +333,17 @@ func (h *EditHandler) RefineSummary(c *gin.Context) {
 	cleanedCitations := service.CleanUnreferencedCitations(newContent, basePlainCitations)
 	cleanedTeamCitations := cleanUnreferencedTeamCitations(newContent, baseResult.GetTeamCitations())
 	newResult := model.SummaryResult{
-		TaskID:         taskID,
-		Content:        newContent,
-		TotalMsgCount:  baseResult.TotalMsgCount,
-		TotalTokenUsed: baseResult.TotalTokenUsed + tokens,
-		ModelVersion:   usedModel,
-		OperationType:  "refine",
-		OperationNote:  feedback,
-		ParentResultID: &baseResult.ID,
-		CreatedBy:      userID,
-		GeneratedAt:    timezone.Now(),
+		TaskID:          taskID,
+		Content:         newContent,
+		CitationOwnerID: baseResult.CitationOwnerID,
+		TotalMsgCount:   baseResult.TotalMsgCount,
+		TotalTokenUsed:  baseResult.TotalTokenUsed + tokens,
+		ModelVersion:    usedModel,
+		OperationType:   "refine",
+		OperationNote:   feedback,
+		ParentResultID:  &baseResult.ID,
+		CreatedBy:       userID,
+		GeneratedAt:     timezone.Now(),
 	}
 	newResult.SetCitations(cleanedCitations)
 	newResult.SetTeamCitations(cleanedTeamCitations)
@@ -525,16 +526,17 @@ func (h *EditHandler) RefineSummaryStream(c *gin.Context) {
 	cleanedCitations := service.CleanUnreferencedCitations(newContent, basePlainCitations)
 	cleanedTeamCitations := cleanUnreferencedTeamCitations(newContent, baseResult.GetTeamCitations())
 	newResult := model.SummaryResult{
-		TaskID:         taskID,
-		Content:        newContent,
-		TotalMsgCount:  baseResult.TotalMsgCount,
-		TotalTokenUsed: baseResult.TotalTokenUsed + tokens,
-		ModelVersion:   usedModel,
-		OperationType:  "refine",
-		OperationNote:  feedback,
-		ParentResultID: &baseResult.ID,
-		CreatedBy:      userID,
-		GeneratedAt:    timezone.Now(),
+		TaskID:          taskID,
+		Content:         newContent,
+		CitationOwnerID: baseResult.CitationOwnerID,
+		TotalMsgCount:   baseResult.TotalMsgCount,
+		TotalTokenUsed:  baseResult.TotalTokenUsed + tokens,
+		ModelVersion:    usedModel,
+		OperationType:   "refine",
+		OperationNote:   feedback,
+		ParentResultID:  &baseResult.ID,
+		CreatedBy:       userID,
+		GeneratedAt:     timezone.Now(),
 	}
 	newResult.SetCitations(cleanedCitations)
 	newResult.SetTeamCitations(cleanedTeamCitations)
@@ -719,7 +721,7 @@ func (h *EditHandler) GetSummaryVersion(c *gin.Context) {
 	ok(c, gin.H{
 		"result_id":        row.ID,
 		"version":          row.Version,
-		"snapshot":         decodeResultSnapshot(row.SnapshotJSON),
+		"snapshot":         projectResultSnapshot(h.db, nil, task, row.SnapshotJSON),
 		"operation_type":   row.OperationType,
 		"operation_note":   row.OperationNote,
 		"parent_result_id": row.ParentResultID,

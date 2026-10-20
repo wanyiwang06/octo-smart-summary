@@ -762,3 +762,39 @@ func TestClaim_MultiPersonConfig_FlagOff_StillDisables(t *testing.T) {
 		t.Errorf("flag-off multi-person must disable schedule, got is_active=%d", got.IsActive)
 	}
 }
+
+func TestPersonalRequeuePreservesSnapshotAndNewGenerationMarksUnknown(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	task := model.SummaryTask{TaskNo: "snapshot-requeue", CreatorID: "owner", SpaceID: "space", Status: model.StatusCompleted, SummaryMode: model.ModeByPerson, TriggerType: model.TriggerScheduled}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatal(err)
+	}
+	raw := `{"snapshot_version":1,"content_version":1,"scope":{"channel_ids":["old-channel"]}}`
+	pr := model.PersonalResult{TaskID: task.ID, UserID: "owner", Content: "Old", SnapshotJSON: &raw, WorkerStatus: model.PersonalStatusCompleted}
+	if err := db.Create(&pr).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := preservePersonalResultVersionsBeforeRequeue(db, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	var old model.PersonalResultVersion
+	db.Where("task_id = ?", task.ID).First(&old)
+	if old.SnapshotJSON == nil || *old.SnapshotJSON != raw {
+		t.Fatal("requeue lost snapshot")
+	}
+	processor := &Processor{db: db}
+	if err := processor.persistCompletedPersonalResult(task, pr, "Fresh", nil, 1, 5, "model", time.Now(), false); err != nil {
+		t.Fatal(err)
+	}
+	var current model.PersonalResult
+	db.First(&current, pr.ID)
+	snapshot := current.GetSnapshot()
+	if snapshot == nil || snapshot.ProvenanceStatus != "unknown" || snapshot.ContentVersion != 2 || len(snapshot.Scope.ChannelIDs) > 0 {
+		t.Fatalf("new generation borrowed old snapshot: %+v", snapshot)
+	}
+	var version model.PersonalResultVersion
+	db.First(&version, *current.CurrentVersionID)
+	if version.SnapshotJSON == nil || *version.SnapshotJSON != *current.SnapshotJSON {
+		t.Fatal("history and materialized snapshot differ")
+	}
+}
