@@ -209,7 +209,7 @@ func resolveReferencedArtifact(
 			Citations:       plainCitations,
 			TeamCitations:   []model.TeamCitation{},
 			CitationMarkers: newCitationMarkerSet(plainCitations, nil),
-			Snapshot:        pr.GetSnapshot(),
+			Snapshot:        projectResultSnapshot(db.WithContext(ctx), nil, task, pr.SnapshotJSON),
 			Sources:         sources,
 		}, nil
 	}

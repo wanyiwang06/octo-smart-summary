@@ -416,7 +416,7 @@ func (h *PersonalHandler) GetPersonal(c *gin.Context) {
 	// task (no existence leak). This runs BEFORE the "no pr -> default" fallback so
 	// a cross-space caller can never coax a default-shaped 200 out of another
 	// space's task; the missing-pr default behaviour for in-space callers is unchanged.
-	_, taskOK := h.requireTaskInSpace(c, taskID)
+	task, taskOK := h.requireTaskInSpace(c, taskID)
 	if !taskOK {
 		return
 	}
@@ -457,7 +457,7 @@ func (h *PersonalHandler) GetPersonal(c *gin.Context) {
 		"version":            version,
 		"worker_status":      pr.WorkerStatus,
 		"workflow_stage":     pr.WorkflowStage,
-		"snapshot":           pr.GetSnapshot(),
+		"snapshot":           projectResultSnapshot(h.db, nil, *task, pr.SnapshotJSON),
 		"content":            pr.Content,
 		"citations":          pr.GetCitations(),
 		"submitted_at":       nil,
@@ -718,7 +718,7 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 		if lockedTask.Status == model.StatusProcessing {
 			return service.NewBizError(40005, "任务状态已变更，请刷新后重试", http.StatusConflict)
 		}
-		return syncSinglePersonalDisplay(tx, lockedTask, userID, req.Content, citationsJSON, now)
+		return syncSinglePersonalDisplay(tx, lockedTask, userID, req.Content, citationsJSON, pr.SnapshotJSON, now)
 	}); err != nil {
 		var be *service.BizError
 		if errors.As(err, &be) {

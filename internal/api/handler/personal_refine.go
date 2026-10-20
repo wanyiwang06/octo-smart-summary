@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -233,7 +234,7 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 				return err
 			}
 			shouldTriggerMeta = true
-		} else if err := syncSinglePersonalDisplay(tx, lockedTask, userID, newContent, citationsJSON, now); err != nil {
+		} else if err := syncSinglePersonalDisplay(tx, lockedTask, userID, newContent, citationsJSON, newVersion.SnapshotJSON, now); err != nil {
 			return err
 		}
 		return nil
@@ -491,7 +492,7 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 				return err
 			}
 			shouldTriggerMeta = true
-		} else if err := syncSinglePersonalDisplay(tx, lockedTask, userID, newContent, citationsJSON, now); err != nil {
+		} else if err := syncSinglePersonalDisplay(tx, lockedTask, userID, newContent, citationsJSON, newVersion.SnapshotJSON, now); err != nil {
 			return err
 		}
 		return appendBoundScheduleGenerationInstruction(tx, lockedTask, feedback)
@@ -615,7 +616,7 @@ func (h *PersonalHandler) GetPersonalVersion(c *gin.Context) {
 		"result_id":        row.ID,
 		"version_id":       row.ID,
 		"version":          row.Version,
-		"snapshot":         decodeResultSnapshot(row.SnapshotJSON),
+		"snapshot":         projectResultSnapshot(h.db, nil, *task, row.SnapshotJSON),
 		"operation_type":   row.OperationType,
 		"operation_note":   row.OperationNote,
 		"parent_result_id": row.ParentVersionID,
@@ -726,7 +727,7 @@ func (h *PersonalHandler) RestorePersonalVersion(c *gin.Context) {
 				return err
 			}
 			shouldTriggerMeta = true
-		} else if err := syncSinglePersonalDisplay(tx, lockedTask, userID, source.Content, source.CitationsJSON, now); err != nil {
+		} else if err := syncSinglePersonalDisplay(tx, lockedTask, userID, source.Content, source.CitationsJSON, source.SnapshotJSON, now); err != nil {
 			return err
 		}
 		return nil
@@ -933,12 +934,29 @@ func currentPersonalVersion(db *gorm.DB, taskID int64, userID string, pr model.P
 // Single-person tasks display the personal artifact. Keep an existing Workflow
 // display row in sync for older result/forward consumers; Agent-only saves do
 // not need a second artifact. PersonalResultVersion remains the edit history.
-func syncSinglePersonalDisplay(tx *gorm.DB, task model.SummaryTask, userID, content, citations string, editedAt time.Time) error {
+func syncSinglePersonalDisplay(tx *gorm.DB, task model.SummaryTask, userID, content, citations string, snapshotJSON *string, editedAt time.Time) error {
 	if task.CurrentResultID == nil {
 		return nil
 	}
-	return tx.Model(&model.SummaryResult{}).Where("id = ? AND task_id = ?", *task.CurrentResultID, task.ID).
-		Updates(map[string]interface{}{"content": content, "citations_json": citations, "citation_owner_id": userID, "edited_at": editedAt}).Error
+	var display model.SummaryResult
+	if err := tx.Where("id = ? AND task_id = ?", *task.CurrentResultID, task.ID).First(&display).Error; err != nil {
+		return err
+	}
+	// This row is an in-place display mirror, not a new team version. Copy the
+	// producing scope/instruction (including unknown provenance), but never use
+	// personal history numbers as links into the independent team history.
+	if snapshot := decodeResultSnapshot(snapshotJSON); snapshot != nil {
+		snapshot.ContentVersion = display.Version
+		snapshot.ParentSnapshotVersion = nil
+		raw, err := json.Marshal(snapshot)
+		if err != nil {
+			return err
+		}
+		value := string(raw)
+		snapshotJSON = &value
+	}
+	return tx.Model(&display).
+		Updates(map[string]interface{}{"content": content, "citations_json": citations, "citation_owner_id": userID, "snapshot_json": snapshotJSON, "edited_at": editedAt}).Error
 }
 
 func ensurePersonalVersionBaseline(tx *gorm.DB, pr model.PersonalResult) (model.PersonalResultVersion, error) {

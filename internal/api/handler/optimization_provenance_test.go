@@ -269,7 +269,7 @@ func TestPersonalDisplaySyncReassignsRawCitationOwner(t *testing.T) {
 	db, _, _, b := seedOptimization(t, "team")
 	db.Model(&b.Result).Update("citation_owner_id", "old-owner")
 	b.Task.CurrentResultID = &b.Result.ID
-	if err := syncSinglePersonalDisplay(db, b.Task, "test-user", "New [1]", `[{"index":1}]`, b.Result.GeneratedAt); err != nil {
+	if err := syncSinglePersonalDisplay(db, b.Task, "test-user", "New [1]", `[{"index":1}]`, nil, b.Result.GeneratedAt); err != nil {
 		t.Fatal(err)
 	}
 	var result model.SummaryResult
@@ -317,5 +317,207 @@ func TestTeamRefinePreservesExplicitCitationOwner(t *testing.T) {
 				t.Fatalf("lost citation restriction: %+v %s", current, w.Body.String())
 			}
 		})
+	}
+}
+
+// Exercise retention through the shared pruning functions used by all writers,
+// then replay the actual original HTTP request rather than a synthetic binding.
+func TestOptimizationReplaySurvivesHistoryPruning(t *testing.T) {
+	for _, kind := range []string{"team", "personal"} {
+		t.Run(kind, func(t *testing.T) {
+			db, h, f, b := seedOptimization(t, kind)
+			r := setupAgentSummaryRouter(h)
+			headers := map[string]string{"Idempotency-Key": "durable-save"}
+			w := doAgentSave(t, r, f.Body, headers)
+			if w.Code != 200 {
+				t.Fatal(w.Body.String())
+			}
+			var binding model.SummaryAgentSaveIdempotency
+			if err := db.Where("idempotency_key = ?", "durable-save").First(&binding).Error; err != nil {
+				t.Fatal(err)
+			}
+			for version := 3; version <= 10; version++ {
+				var err error
+				if kind == "team" {
+					row := model.SummaryResult{TaskID: b.Task.ID, Version: version, Content: "later"}
+					err = db.Create(&row).Error
+					if err == nil {
+						err = db.Model(&b.Task).Update("current_result_id", row.ID).Error
+					}
+				} else {
+					row := model.PersonalResultVersion{TaskID: b.Task.ID, UserID: "test-user", Version: version, Content: "later"}
+					err = db.Create(&row).Error
+					if err == nil {
+						err = db.Model(&b.Personal).Update("current_version_id", row.ID).Error
+					}
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			var err error
+			if kind == "team" {
+				err = service.PruneSummaryResultVersions(db, b.Task.ID, 5)
+			} else {
+				err = service.PrunePersonalResultVersions(db, b.Task.ID, "test-user", 5)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			w = doAgentSave(t, r, f.Body, headers)
+			if w.Code != 200 || !strings.Contains(w.Body.String(), `"replayed":true`) {
+				t.Fatal(w.Body.String())
+			}
+			var count int64
+			var table interface{} = &model.SummaryResult{}
+			if kind == "personal" {
+				table = &model.PersonalResultVersion{}
+			}
+			db.Model(table).Where("task_id = ? AND version = 3", b.Task.ID).Count(&count)
+			if count != 0 {
+				t.Fatal("unbound old version was not pruned")
+			}
+			// Existing damaged bindings must not cause false success or another save.
+			if err := db.Where("id = ?", binding.ResultID).Delete(table).Error; err != nil {
+				t.Fatal(err)
+			}
+			w = doAgentSave(t, r, f.Body, headers)
+			if w.Code != 409 || !strings.Contains(w.Body.String(), "saved version unavailable") {
+				t.Fatal(w.Body.String())
+			}
+		})
+	}
+}
+
+func TestPersonalSnapshotProjectionAcrossReads(t *testing.T) {
+	db, h, _, b := seedOptimization(t, "personal")
+	raw := `{"snapshot_version":1,"scope":{"channel_ids":["hidden","visible"],"channel_names":["SECRET","Visible"],"sources":[{"source_id":"hidden","source_name":"SECRET"}],"document_ids":["hidden","visible-doc"]}}`
+	if err := db.Create(&model.SummarySource{TaskID: b.Task.ID, SourceID: "hidden", SourceName: "SECRET", Derived: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&b.Personal).Update("snapshot_json", raw).Error; err != nil {
+		t.Fatal(err)
+	}
+	v := model.PersonalResultVersion{TaskID: b.Task.ID, UserID: "test-user", Version: 1, SnapshotJSON: &raw}
+	if err := db.Create(&v).Error; err != nil {
+		t.Fatal(err)
+	}
+	ph := NewPersonalHandler(db, "", nil)
+	r := setupAgentSummaryRouter(h)
+	r.GET("/api/v1/summaries/:id/personal", ph.GetPersonal)
+	r.GET("/api/v1/summaries/:id/personal-versions/:version_id", ph.GetPersonalVersion)
+	for _, path := range []string{fmt.Sprintf("/api/v1/summaries/%d/personal", b.Task.ID), fmt.Sprintf("/api/v1/summaries/%d/personal-versions/%d", b.Task.ID, v.ID)} {
+		w := provenanceRequest(r, "GET", path, "", "test-user")
+		if w.Code != 200 || strings.Contains(w.Body.String(), "hidden") || strings.Contains(w.Body.String(), "SECRET") || !strings.Contains(w.Body.String(), "visible-doc") {
+			t.Fatal(w.Body.String())
+		}
+	}
+	artifact, err := resolveReferencedArtifact(context.Background(), db, b.Task.ID, "test-space", "test-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	projected, _ := json.Marshal(artifact.Snapshot)
+	if strings.Contains(string(projected), "hidden") || strings.Contains(string(projected), "SECRET") || !strings.Contains(string(projected), "visible-doc") {
+		t.Fatal(string(projected))
+	}
+	var stored model.PersonalResultVersion
+	db.First(&stored, v.ID)
+	if !sameSnapshotJSON(stored.SnapshotJSON, &raw) {
+		t.Fatal("read mutated history")
+	}
+}
+
+func TestPersonalWritesSynchronizeTeamDisplayProvenance(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, legacy := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%v/legacy=%v", stream, legacy), func(t *testing.T) {
+				db, h, f, b := seedOptimization(t, "team")
+				raw := `{"snapshot_version":1,"content_version":1,"scope":{"channel_ids":["original-source"]}}`
+				pr := model.PersonalResult{TaskID: b.Task.ID, UserID: "test-user", Content: "Original personal", WorkerStatus: model.PersonalStatusCompleted, SnapshotJSON: &raw}
+				if legacy {
+					pr.SnapshotJSON = nil
+				}
+				if err := db.Create(&pr).Error; err != nil {
+					t.Fatal(err)
+				}
+				r := setupAgentSummaryRouter(h)
+				w := doAgentSave(t, r, f.Body, map[string]string{"Idempotency-Key": "display-provenance"})
+				if w.Code != 200 {
+					t.Fatal(w.Body.String())
+				}
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Refined personal\"}}]}\n\ndata: [DONE]\n\n")
+					} else {
+						fmt.Fprint(w, `{"choices":[{"message":{"content":"Refined personal"},"finish_reason":"stop"}]}`)
+					}
+				}))
+				defer srv.Close()
+				ph := NewPersonalHandler(db, "", nil)
+				ph.SetLLM(service.NewLLMClient(srv.URL, "test", "test", 5, 256, false, 5, nil))
+				r.PUT("/api/v1/summaries/:id/personal-edit", ph.PersonalEdit)
+				r.POST("/api/v1/summaries/:id/refine-personal", ph.RefinePersonalSummary)
+				r.POST("/api/v1/summaries/:id/refine-personal-stream", ph.RefinePersonalSummaryStream)
+				r.POST("/api/v1/summaries/:id/personal-versions/:version_id/restore", ph.RestorePersonalVersion)
+				r.GET("/api/v1/summaries/:id", NewTaskHandler(db, nil, "").GetSummary)
+				path := fmt.Sprintf("/api/v1/summaries/%d/refine-personal", b.Task.ID)
+				if stream {
+					path += "-stream"
+				}
+				w = provenanceRequest(r, "POST", path, `{"feedback":"shorter","base_version":2}`, "test-user")
+				if w.Code != 200 {
+					t.Fatal(w.Body.String())
+				}
+				artifact, err := resolveReferencedArtifact(context.Background(), db, b.Task.ID, "test-space", "test-user")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if artifact.Snapshot == nil || artifact.Snapshot.UserInstruction == nil || *artifact.Snapshot.UserInstruction != "shorter" || artifact.Snapshot.ContentVersion != 2 || artifact.Snapshot.ParentSnapshotVersion != nil {
+					t.Fatalf("display mixed histories: %+v", artifact.Snapshot)
+				}
+				var original model.PersonalResultVersion
+				if err := db.Where("task_id = ? AND version = 1", b.Task.ID).First(&original).Error; err != nil {
+					t.Fatal(err)
+				}
+				w = provenanceRequest(r, "POST", fmt.Sprintf("/api/v1/summaries/%d/personal-versions/%d/restore", b.Task.ID, original.ID), "{}", "test-user")
+				if w.Code != 200 {
+					t.Fatal(w.Body.String())
+				}
+				artifact, err = resolveReferencedArtifact(context.Background(), db, b.Task.ID, "test-space", "test-user")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if artifact.Snapshot == nil {
+					t.Fatal("missing display snapshot")
+				}
+				if legacy {
+					if artifact.Snapshot.ProvenanceStatus != "unknown" || len(artifact.Snapshot.Scope.ChannelIDs) != 0 {
+						t.Fatal("borrowed optimized scope")
+					}
+				} else if len(artifact.Snapshot.Scope.ChannelIDs) != 1 || artifact.Snapshot.Scope.ChannelIDs[0] != "original-source" {
+					t.Fatal("restore did not synchronize original scope")
+				}
+				w = provenanceRequest(r, "GET", fmt.Sprintf("/api/v1/summaries/%d", b.Task.ID), "", "test-user")
+				if w.Code != 200 || !strings.Contains(w.Body.String(), "Original personal") || strings.Contains(w.Body.String(), "channel-workspace") {
+					t.Fatal(w.Body.String())
+				}
+				beforeEdit := artifact.Snapshot
+				w = provenanceRequest(r, "PUT", fmt.Sprintf("/api/v1/summaries/%d/personal-edit", b.Task.ID), `{"content":"Manually edited personal"}`, "test-user")
+				if w.Code != 200 {
+					t.Fatal(w.Body.String())
+				}
+				artifact, err = resolveReferencedArtifact(context.Background(), db, b.Task.ID, "test-space", "test-user")
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeJSON, _ := json.Marshal(beforeEdit)
+				afterJSON, _ := json.Marshal(artifact.Snapshot)
+				if string(beforeJSON) != string(afterJSON) {
+					t.Fatal("manual edit changed generation scope")
+				}
+
+			})
+		}
 	}
 }

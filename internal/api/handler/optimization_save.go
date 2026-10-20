@@ -171,6 +171,25 @@ func (h *AgentSummaryHandler) replayOptimization(c *gin.Context, key, hash strin
 		c.JSON(409, apiResponse{Code: 40009, Message: "saved summary unavailable"})
 		return true
 	}
+	var count int64
+	var resultQuery *gorm.DB
+	switch binding.ResultKind {
+	case "team":
+		resultQuery = h.db.Model(&model.SummaryResult{})
+	case "personal":
+		resultQuery = h.db.Model(&model.PersonalResultVersion{}).Where("user_id = ?", user)
+	default:
+		c.JSON(409, apiResponse{Code: 40009, Message: "saved version unavailable"})
+		return true
+	}
+	if err := resultQuery.Where("id = ? AND task_id = ? AND version = ?", binding.ResultID, task.ID, binding.ResultVersion).Count(&count).Error; err != nil {
+		writeOptimizationError(c, err)
+		return true
+	}
+	if count != 1 {
+		c.JSON(409, apiResponse{Code: 40009, Message: "saved version unavailable"})
+		return true
+	}
 	ok(c, gin.H{"task_id": task.ID, "task_no": task.TaskNo, "status": task.Status, "created_at": task.CreatedAt, "save_mode": "new_version", "version": binding.ResultVersion, "result_id": binding.ResultID, "result_kind": binding.ResultKind, "replayed": true})
 	return true
 }
