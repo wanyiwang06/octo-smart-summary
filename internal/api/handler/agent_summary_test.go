@@ -119,7 +119,7 @@ func TestCreateAgentSummary_ProvidedOriginChannelDirectPass(t *testing.T) {
 // and successfully creates the task with the resolved values.
 func TestCreateAgentSummary_NotProvidedResolveSuccess(t *testing.T) {
 	db := setupAgentSummaryTestDB(t)
-	h := NewAgentSummaryHandler(db, nil, "", "", "", 0, 0)
+	h := NewAgentSummaryHandler(db, newLegacySaveIMDB(t, "CH-RESOLVED"), "", "", "", 0, 0)
 	r := setupAgentSummaryRouter(h)
 
 	// Seed: session with assistant message (deliverable) and fetch_channel tool call

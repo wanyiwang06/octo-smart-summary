@@ -203,6 +203,9 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	var finalChannelID string
 	var finalChannelType int
 	var finalOriginFromDerived bool
+	// Transcript arguments identify a historical channel, not current access.
+	// Keep this separate from permission-checked shared-summary inheritance.
+	var sessionOrigin *sourceReq
 
 	// R7 P2-3 / R9 P2-3 (PR #190): normalize referenced_task_ids at the entry
 	// point — dedup first, then REJECT if still over maxReferencedTaskIDs.
@@ -399,6 +402,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 				return
 			}
 			finalChannelType = appOrigin
+			sessionOrigin = &sourceReq{SourceID: finalChannelID, SourceType: finalChannelType}
 		}
 	} else {
 		// Provided (even if empty string) → validate as before
@@ -625,7 +629,7 @@ func (h *AgentSummaryHandler) CreateAgentSummary(c *gin.Context) {
 	var savedCitations []model.Citation
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		if !workspaceSave {
-			if err := h.authorizeLegacySaveSources(c.Request.Context(), spaceID, userID, req); err != nil {
+			if err := h.authorizeLegacySaveSources(c.Request.Context(), spaceID, userID, req, sessionOrigin); err != nil {
 				return err
 			}
 		}

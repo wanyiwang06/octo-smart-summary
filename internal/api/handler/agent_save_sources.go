@@ -12,16 +12,20 @@ import (
 
 // Legacy clients can supply provenance directly. Type/name validation is not
 // authorization: use the workspace's membership + space checks before storing
-// any client-selected source or explicit origin. Server-owned workspace scopes
-// and permission-checked reference origins have their own validation paths.
-func (h *AgentSummaryHandler) authorizeLegacySaveSources(ctx context.Context, spaceID, userID string, req createAgentSummaryReq) error {
+// any client-selected source, explicit origin or transcript-derived origin.
+// Server-owned workspace scopes and permission-checked reference origins have
+// their own validation paths.
+func (h *AgentSummaryHandler) authorizeLegacySaveSources(ctx context.Context, spaceID, userID string, req createAgentSummaryReq, sessionOrigin *sourceReq) error {
 	sources := append([]sourceReq(nil), req.Sources...)
+	if sessionOrigin != nil {
+		sources = append(sources, *sessionOrigin)
+	}
 	if req.OriginChannelID != nil {
 		sources = append(sources, sourceReq{SourceID: *req.OriginChannelID, SourceType: req.OriginChannelType})
 	}
 	channels := make([]summaryWorkspaceChannel, 0, len(sources))
 	for _, source := range sources {
-		if strings.TrimSpace(source.SourceID) == "" {
+		if source.SourceID == "" {
 			continue
 		}
 		kind := ""
