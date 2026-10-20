@@ -311,7 +311,9 @@ func (h *AgentSummaryHandler) saveOptimizationVersion(c *gin.Context, req create
 		if candidate.Scope.TimeRange == nil && artifact.Snapshot != nil {
 			snapshot.Scope.TimeRange = artifact.Snapshot.Scope.TimeRange
 		}
-		snapshot = projectResultSnapshotValue(tx, h.imDB, task, snapshot)
+		// Preserve authorized new selections in the stored version. Reader-specific
+		// filtering happens on reads; Derived provenance stays masked as before.
+		snapshot = projectResultSnapshotValue(tx, h.imDB, task, snapshot, true)
 		if snapshot == nil {
 			return errors.New("failed to project snapshot sources")
 		}

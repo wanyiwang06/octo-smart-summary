@@ -616,7 +616,7 @@ func (h *PersonalHandler) GetPersonalVersion(c *gin.Context) {
 		"result_id":        row.ID,
 		"version_id":       row.ID,
 		"version":          row.Version,
-		"snapshot":         projectResultSnapshot(h.db, nil, *task, row.SnapshotJSON),
+		"snapshot":         projectResultSnapshot(h.db, nil, *task, row.SnapshotJSON, userID, row.UserID),
 		"operation_type":   row.OperationType,
 		"operation_note":   row.OperationNote,
 		"parent_result_id": row.ParentVersionID,

@@ -1076,7 +1076,7 @@ func (h *TaskHandler) GetSummary(c *gin.Context) {
 			"total_token_used": latestResult.TotalTokenUsed,
 			"model_version":    latestResult.ModelVersion,
 			"version":          latestResult.Version,
-			"snapshot":         projectResultSnapshot(h.db, h.imDB, task, latestResult.SnapshotJSON),
+			"snapshot":         projectResultSnapshot(h.db, h.imDB, task, latestResult.SnapshotJSON, callerID, latestResult.CitationOwnerID),
 			"operation_type":   latestResult.OperationType,
 			"operation_note":   latestResult.OperationNote,
 			"parent_result_id": latestResult.ParentResultID,

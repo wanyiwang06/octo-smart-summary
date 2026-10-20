@@ -1,5 +1,10 @@
 -- +migrate Up
 ALTER TABLE summary_result ADD COLUMN citation_owner_id VARCHAR(64) NOT NULL DEFAULT '';
+-- Compatibility backfill for incremental deployments that already wrote trusted
+-- optimization bindings before citation_owner_id was introduced. On a first
+-- upgrade applying all three migrations before serving new code, the binding
+-- columns have default values and this UPDATE normally matches no rows.
+-- It does NOT reconstruct ownership for arbitrary pre-feature legacy results.
 -- Backfill only versions with a server-authenticated optimization save binding.
 -- CreatedBy alone is not proof of authorization to the underlying raw messages.
 UPDATE summary_result AS r

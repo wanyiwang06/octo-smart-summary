@@ -746,7 +746,7 @@ func (h *EditHandler) GetSummaryVersion(c *gin.Context) {
 	ok(c, gin.H{
 		"result_id":        row.ID,
 		"version":          row.Version,
-		"snapshot":         projectResultSnapshot(h.db, nil, task, row.SnapshotJSON),
+		"snapshot":         projectResultSnapshot(h.db, nil, task, row.SnapshotJSON, userID, row.CitationOwnerID),
 		"operation_type":   row.OperationType,
 		"operation_note":   row.OperationNote,
 		"parent_result_id": row.ParentResultID,

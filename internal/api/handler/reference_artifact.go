@@ -167,7 +167,7 @@ func resolveReferencedArtifact(
 			Citations:       plainCitations,
 			TeamCitations:   teamCitations,
 			CitationMarkers: newCitationMarkerSet(allPlainCitations, teamCitations),
-			Snapshot:        projectResultSnapshot(db, nil, task, result.SnapshotJSON),
+			Snapshot:        projectResultSnapshot(db, nil, task, result.SnapshotJSON, userID, result.CitationOwnerID),
 			Sources:         sources,
 		}, nil
 	}
@@ -209,7 +209,7 @@ func resolveReferencedArtifact(
 			Citations:       plainCitations,
 			TeamCitations:   []model.TeamCitation{},
 			CitationMarkers: newCitationMarkerSet(plainCitations, nil),
-			Snapshot:        projectResultSnapshot(db.WithContext(ctx), nil, task, pr.SnapshotJSON),
+			Snapshot:        projectResultSnapshot(db.WithContext(ctx), nil, task, pr.SnapshotJSON, userID, pr.UserID),
 			Sources:         sources,
 		}, nil
 	}
@@ -372,13 +372,16 @@ func refinedResultSnapshot(raw *string, version int, instruction string) *string
 	return &result
 }
 
-// Apply the same source projection at persistence, detail/history reads and
-// reference rendering, including snapshots saved before this guard existed.
-func projectResultSnapshot(db, imDB *gorm.DB, task model.SummaryTask, raw *string) *model.Snapshot {
-	return projectResultSnapshotValue(db, imDB, task, decodeResultSnapshot(raw))
+// Project version provenance for a reader, including snapshots persisted before
+// this guard existed. Storage keeps unlisted selections; reads gate them by owner.
+func projectResultSnapshot(db, imDB *gorm.DB, task model.SummaryTask, raw *string, callerID, ownerID string) *model.Snapshot {
+	// Unlisted provenance belongs to the producing version, not every task reader.
+	// Match the existing explicit citation ownership policy; a legacy empty owner
+	// is never evidence that an unknown source is publishable.
+	return projectResultSnapshotValue(db, imDB, task, decodeResultSnapshot(raw), callerID != "" && callerID == ownerID)
 }
 
-func projectResultSnapshotValue(db, imDB *gorm.DB, task model.SummaryTask, snapshot *model.Snapshot) *model.Snapshot {
+func projectResultSnapshotValue(db, imDB *gorm.DB, task model.SummaryTask, snapshot *model.Snapshot, allowUnlisted bool) *model.Snapshot {
 	if snapshot == nil {
 		return nil
 	}
@@ -403,7 +406,8 @@ func projectResultSnapshotValue(db, imDB *gorm.DB, task model.SummaryTask, snaps
 	result.Scope.Sources = nil
 	result.Scope.DocumentIDs = nil
 	for i, id := range snapshot.Scope.ChannelIDs {
-		if hidden[id] {
+		_, shared := known[id]
+		if hidden[id] || (!shared && !allowUnlisted) {
 			continue
 		}
 		name := ""
@@ -417,7 +421,8 @@ func projectResultSnapshotValue(db, imDB *gorm.DB, task model.SummaryTask, snaps
 		result.Scope.ChannelNames = append(result.Scope.ChannelNames, name)
 	}
 	for _, source := range snapshot.Scope.Sources {
-		if hidden[source.SourceID] {
+		_, shared := known[source.SourceID]
+		if hidden[source.SourceID] || (!shared && !allowUnlisted) {
 			continue
 		}
 		stored := model.SummarySource{SourceID: source.SourceID, SourceType: source.SourceType, SourceName: source.SourceName}
@@ -428,7 +433,8 @@ func projectResultSnapshotValue(db, imDB *gorm.DB, task model.SummaryTask, snaps
 		result.Scope.Sources = append(result.Scope.Sources, source)
 	}
 	for _, id := range snapshot.Scope.DocumentIDs {
-		if !hidden[id] {
+		_, shared := known[id]
+		if !hidden[id] && (shared || allowUnlisted) {
 			result.Scope.DocumentIDs = append(result.Scope.DocumentIDs, id)
 		}
 	}
