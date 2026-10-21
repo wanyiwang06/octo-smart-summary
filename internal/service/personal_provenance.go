@@ -41,3 +41,32 @@ func PersonalVersionPayloadMatches(pr model.PersonalResult, version model.Person
 func KnownPersonalSnapshotsDiffer(a, b *string) bool {
 	return a != nil && b != nil && *a != *b
 }
+
+// RebasePersonalSnapshot labels inherited provenance with the history row that
+// now contains it. NULL stays unknown; invalid or foreign provenance must not
+// become a fabricated source scope. parentVersion is from the actual history
+// parent, never from the potentially stale embedded content_version.
+func RebasePersonalSnapshot(raw *string, taskID int64, version int, parentVersion *int) *string {
+	if raw == nil {
+		return nil
+	}
+	var snapshot model.Snapshot
+	if json.Unmarshal([]byte(*raw), &snapshot) != nil || (snapshot.TaskID != 0 && snapshot.TaskID != taskID) {
+		return model.UnknownGenerationSnapshot(taskID, version)
+	}
+	sameParent := snapshot.ParentSnapshotVersion == nil && parentVersion == nil
+	if snapshot.ParentSnapshotVersion != nil && parentVersion != nil {
+		sameParent = *snapshot.ParentSnapshotVersion == *parentVersion
+	}
+	if snapshot.ContentVersion == version && sameParent {
+		return raw
+	}
+	snapshot.ContentVersion = version
+	snapshot.ParentSnapshotVersion = parentVersion
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		return model.UnknownGenerationSnapshot(taskID, version)
+	}
+	result := string(encoded)
+	return &result
+}

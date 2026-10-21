@@ -855,3 +855,48 @@ func TestLegacyProvenanceRequeueAndEmptyWindowStayAligned(t *testing.T) {
 		})
 	}
 }
+
+func TestRequeueRebasesChangedPersonalSnapshotWithoutPhantomVersions(t *testing.T) {
+	db := newSchedulerTestDB(t)
+	task := model.SummaryTask{TaskNo: "changed-provenance", CreatorID: "owner", SpaceID: "space", Status: model.StatusCompleted, SummaryMode: model.ModeByPerson}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatal(err)
+	}
+	raw := fmt.Sprintf(`{"snapshot_version":1,"task_id":%d,"content_version":1,"scope":{"channel_ids":["old-channel"]}}`, task.ID)
+	v := model.PersonalResultVersion{TaskID: task.ID, UserID: "owner", Version: 1, Content: "Before", SnapshotJSON: &raw, OperationType: "generate"}
+	if err := db.Create(&v).Error; err != nil {
+		t.Fatal(err)
+	}
+	pr := model.PersonalResult{TaskID: task.ID, UserID: "owner", Content: "Edited via display", SnapshotJSON: &raw, CurrentVersionID: &v.ID, WorkerStatus: model.PersonalStatusCompleted}
+	if err := db.Create(&pr).Error; err != nil {
+		t.Fatal(err)
+	}
+	processor := &Processor{db: db}
+	for round := 0; round < 3; round++ {
+		if err := db.Transaction(func(tx *gorm.DB) error { return preservePersonalResultVersionsBeforeRequeue(tx, task.ID) }); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.First(&pr, pr.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		var current model.PersonalResultVersion
+		if err := db.First(&current, *pr.CurrentVersionID).Error; err != nil {
+			t.Fatal(err)
+		}
+		snap := pr.GetSnapshot()
+		if current.Version != 2 || snap == nil || snap.ContentVersion != 2 || snap.ParentSnapshotVersion == nil || *snap.ParentSnapshotVersion != 1 || current.SnapshotJSON == nil || *current.SnapshotJSON != *pr.SnapshotJSON {
+			t.Fatalf("round %d mismatch: %+v %+v", round, current, snap)
+		}
+		if len(snap.Scope.ChannelIDs) != 1 || snap.Scope.ChannelIDs[0] != "old-channel" {
+			t.Fatal("lost source provenance")
+		}
+		if err := processor.persistCompletedPersonalResult(task, pr, "", nil, 0, 0, "", time.Now(), true); err != nil {
+			t.Fatal(err)
+		}
+		var count int64
+		db.Model(&model.PersonalResultVersion{}).Where("task_id = ?", task.ID).Count(&count)
+		if count != 2 {
+			t.Fatalf("phantom history: %d", count)
+		}
+	}
+}

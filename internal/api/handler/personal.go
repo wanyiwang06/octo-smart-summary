@@ -696,9 +696,11 @@ func (h *PersonalHandler) PersonalEdit(c *gin.Context) {
 		}
 		pr.Content = req.Content
 		pr.EditedAt = &now
-		if _, err := createPersonalVersionSnapshot(tx, pr, &baseline, "edit"); err != nil {
+		savedVersion, err := createPersonalVersionSnapshot(tx, pr, &baseline, "edit")
+		if err != nil {
 			return err
 		}
+		pr.SnapshotJSON = savedVersion.SnapshotJSON
 		if err := service.PrunePersonalResultVersions(tx, taskID, userID, service.PersonalResultVersionKeepLimit); err != nil {
 			return err
 		}

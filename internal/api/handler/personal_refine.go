@@ -185,7 +185,7 @@ func (h *PersonalHandler) RefinePersonalSummary(c *gin.Context) {
 			return err
 		}
 		newVersion = model.PersonalResultVersion{
-			SnapshotJSON:     refinedResultSnapshot(latestPR.SnapshotJSON, nextVer, feedback),
+			SnapshotJSON:     refinedResultSnapshot(latestVersion.SnapshotJSON, nextVer, feedback),
 			TaskID:           taskID,
 			ParticipantRefID: latestPR.ParticipantRefID,
 			UserID:           userID,
@@ -443,7 +443,7 @@ func (h *PersonalHandler) RefinePersonalSummaryStream(c *gin.Context) {
 			return err
 		}
 		newVersion = model.PersonalResultVersion{
-			SnapshotJSON:     refinedResultSnapshot(latestPR.SnapshotJSON, nextVer, feedback),
+			SnapshotJSON:     refinedResultSnapshot(latestVersion.SnapshotJSON, nextVer, feedback),
 			TaskID:           taskID,
 			ParticipantRefID: latestPR.ParticipantRefID,
 			UserID:           userID,
@@ -1030,12 +1030,17 @@ func createPersonalVersionSnapshot(tx *gorm.DB, pr model.PersonalResult, parent 
 		}
 		version = nextVer
 	}
+	var parentVersion *int
+	if parent != nil {
+		parentVersion = &parent.Version
+	}
+	snapshotJSON := service.RebasePersonalSnapshot(pr.SnapshotJSON, pr.TaskID, version, parentVersion)
 	latest := model.PersonalResultVersion{
 		TaskID:           pr.TaskID,
 		ParticipantRefID: pr.ParticipantRefID,
 		UserID:           pr.UserID,
 		Content:          pr.Content,
-		SnapshotJSON:     pr.SnapshotJSON,
+		SnapshotJSON:     snapshotJSON,
 		CitationsJSON:    pr.CitationsJSON,
 		MsgCount:         pr.MsgCount,
 		TotalTokenUsed:   pr.TotalTokenUsed,
@@ -1049,7 +1054,7 @@ func createPersonalVersionSnapshot(tx *gorm.DB, pr model.PersonalResult, parent 
 	if err := tx.Create(&latest).Error; err != nil {
 		return latest, err
 	}
-	if err := tx.Model(&model.PersonalResult{}).Where("id = ?", pr.ID).Update("current_version_id", latest.ID).Error; err != nil {
+	if err := tx.Model(&model.PersonalResult{}).Where("id = ?", pr.ID).Updates(map[string]interface{}{"current_version_id": latest.ID, "snapshot_json": snapshotJSON}).Error; err != nil {
 		return latest, err
 	}
 	return latest, nil

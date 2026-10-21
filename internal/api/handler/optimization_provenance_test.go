@@ -60,29 +60,57 @@ func TestOptimizationPersonalRefineHistoryRestoreProvenance(t *testing.T) {
 			ph := NewPersonalHandler(db, "", nil)
 			ph.SetLLM(service.NewLLMClient(srv.URL, "test", "test", 5, 256, false, 5, nil))
 			r := setupAgentSummaryRouter(h)
+			r.PUT("/api/v1/summaries/:id/personal-edit", ph.PersonalEdit)
+			r.GET("/api/v1/summaries/:id/personal", ph.GetPersonal)
 			r.POST("/api/v1/summaries/:id/personal-refine", ph.RefinePersonalSummary)
 			r.POST("/api/v1/summaries/:id/personal-refine-stream", ph.RefinePersonalSummaryStream)
 			r.GET("/api/v1/summaries/:id/personal-versions/:version_id", ph.GetPersonalVersion)
 			r.POST("/api/v1/summaries/:id/personal-versions/:version_id/restore", ph.RestorePersonalVersion)
+
+			w = provenanceRequest(r, "PUT", fmt.Sprintf("/api/v1/summaries/%d/personal-edit", b.Task.ID), `{"content":"Manually edited personal"}`, "test-user")
+			if w.Code != 200 {
+				t.Fatal(w.Body.String())
+			}
+			var edited model.PersonalResultVersion
+			if err := db.Where("task_id = ? AND version = 3", b.Task.ID).First(&edited).Error; err != nil {
+				t.Fatal(err)
+			}
+			editedSnapshot := decodeResultSnapshot(edited.SnapshotJSON)
+			if editedSnapshot == nil || editedSnapshot.ContentVersion != 3 || editedSnapshot.ParentSnapshotVersion == nil || *editedSnapshot.ParentSnapshotVersion != 2 {
+				t.Fatalf("edit snapshot: %+v", editedSnapshot)
+			}
+			var current model.PersonalResult
+			if err := db.First(&current, b.Personal.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if current.CurrentVersionID == nil || *current.CurrentVersionID != edited.ID || !sameSnapshotJSON(current.SnapshotJSON, edited.SnapshotJSON) {
+				t.Fatal("edit history/current mismatch")
+			}
+			for _, readPath := range []string{fmt.Sprintf("/api/v1/summaries/%d/personal", b.Task.ID), fmt.Sprintf("/api/v1/summaries/%d/personal-versions/%d", b.Task.ID, edited.ID)} {
+				response := provenanceRequest(r, "GET", readPath, "", "test-user")
+				if response.Code != 200 || !strings.Contains(response.Body.String(), `"content_version":3`) || !strings.Contains(response.Body.String(), `"version":3`) {
+					t.Fatal(response.Body.String())
+				}
+			}
 			path := fmt.Sprintf("/api/v1/summaries/%d/personal-refine", b.Task.ID)
 			if stream {
 				path += "-stream"
 			}
-			w = provenanceRequest(r, "POST", path, `{"feedback":"shorter","base_version":2}`, "test-user")
+			w = provenanceRequest(r, "POST", path, `{"feedback":"shorter","base_version":3}`, "test-user")
 			if w.Code != 200 {
 				t.Fatal(w.Body.String())
 			}
 			var v model.PersonalResultVersion
-			if err := db.Where("task_id = ? AND version = 3", b.Task.ID).First(&v).Error; err != nil {
+			if err := db.Where("task_id = ? AND version = 4", b.Task.ID).First(&v).Error; err != nil {
 				t.Fatalf("%v %s", err, w.Body.String())
 			}
 			snap := decodeResultSnapshot(v.SnapshotJSON)
-			if snap == nil || snap.ContentVersion != 3 || snap.ParentSnapshotVersion == nil || *snap.ParentSnapshotVersion != 2 || *snap.UserInstruction != "shorter" {
+			if snap == nil || snap.ContentVersion != 4 || snap.ParentSnapshotVersion == nil || *snap.ParentSnapshotVersion != 3 || *snap.UserInstruction != "shorter" {
 				t.Fatalf("bad snapshot %+v", snap)
 			}
 			versionPath := fmt.Sprintf("/api/v1/summaries/%d/personal-versions/%d", b.Task.ID, v.ID)
 			w = provenanceRequest(r, "GET", versionPath, "", "test-user")
-			if w.Code != 200 || !strings.Contains(w.Body.String(), `"content_version":3`) {
+			if w.Code != 200 || !strings.Contains(w.Body.String(), `"content_version":4`) {
 				t.Fatal(w.Body.String())
 			}
 			w = provenanceRequest(r, "POST", versionPath+"/restore", "{}", "test-user")
@@ -94,8 +122,8 @@ func TestOptimizationPersonalRefineHistoryRestoreProvenance(t *testing.T) {
 			if pr.Content != v.Content || !sameSnapshotJSON(pr.SnapshotJSON, v.SnapshotJSON) {
 				t.Fatal("restore lost snapshot")
 			}
-			// Pre-migration NULL history must not borrow V3's scope or erase its record.
-			legacy := model.PersonalResultVersion{TaskID: b.Task.ID, UserID: "test-user", Content: "Legacy", Version: 4, OperationType: "generate"}
+			// Pre-migration NULL history must not borrow V4's scope or erase its record.
+			legacy := model.PersonalResultVersion{TaskID: b.Task.ID, UserID: "test-user", Content: "Legacy", Version: 5, OperationType: "generate"}
 			if err := db.Create(&legacy).Error; err != nil {
 				t.Fatal(err)
 			}
@@ -105,7 +133,7 @@ func TestOptimizationPersonalRefineHistoryRestoreProvenance(t *testing.T) {
 			}
 			db.First(&pr, b.Personal.ID)
 			unknown := pr.GetSnapshot()
-			if unknown == nil || unknown.ProvenanceStatus != "unknown" || unknown.ContentVersion != 4 || len(unknown.Scope.ChannelIDs) != 0 {
+			if unknown == nil || unknown.ProvenanceStatus != "unknown" || unknown.ContentVersion != 5 || len(unknown.Scope.ChannelIDs) != 0 {
 				t.Fatalf("legacy borrowed provenance: %+v", unknown)
 			}
 			var preserved model.PersonalResultVersion
@@ -519,5 +547,41 @@ func TestPersonalWritesSynchronizeTeamDisplayProvenance(t *testing.T) {
 
 			})
 		}
+	}
+}
+
+func TestFirstPersonalEditRebasesSnapshot(t *testing.T) {
+	for _, known := range []bool{true, false} {
+		t.Run(fmt.Sprint(known), func(t *testing.T) {
+			db, h, _, b := seedOptimization(t, "personal")
+			if known {
+				raw := fmt.Sprintf(`{"snapshot_version":1,"task_id":%d,"content_version":1,"scope":{"channel_ids":["original"]}}`, b.Task.ID)
+				if err := db.Model(&b.Personal).Update("snapshot_json", raw).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			ph := NewPersonalHandler(db, "", nil)
+			r := setupAgentSummaryRouter(h)
+			r.PUT("/api/v1/summaries/:id/personal-edit", ph.PersonalEdit)
+			w := provenanceRequest(r, "PUT", fmt.Sprintf("/api/v1/summaries/%d/personal-edit", b.Task.ID), `{"content":"First manual edit"}`, "test-user")
+			if w.Code != 200 {
+				t.Fatal(w.Body.String())
+			}
+			var pr model.PersonalResult
+			db.First(&pr, b.Personal.ID)
+			var v model.PersonalResultVersion
+			db.First(&v, *pr.CurrentVersionID)
+			if v.Version != 2 || !sameSnapshotJSON(v.SnapshotJSON, pr.SnapshotJSON) {
+				t.Fatalf("current/history mismatch: %+v", v)
+			}
+			snap := pr.GetSnapshot()
+			if known {
+				if snap == nil || snap.ContentVersion != 2 || snap.ParentSnapshotVersion == nil || *snap.ParentSnapshotVersion != 1 {
+					t.Fatalf("bad first-edit lineage: %+v", snap)
+				}
+			} else if snap != nil {
+				t.Fatal("invented provenance for legacy NULL")
+			}
+		})
 	}
 }
