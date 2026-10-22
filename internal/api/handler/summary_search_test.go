@@ -1,11 +1,31 @@
 package handler
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 
 	"github.com/Mininglamp-OSS/octo-smart-summary/internal/model"
 )
+
+func TestSummarySearchWireRanges(t *testing.T) {
+	for _, tc := range []struct {
+		name, title, topic, query, want string
+	}{
+		{"title only", "😀ＯＣＴＯ", "其他", "octo", `{"title_ranges":[[1,5]],"topic_ranges":[]}`},
+		{"topic only", "标题", "😀方案评审", "方案", `{"title_ranges":[],"topic_ranges":[[1,3]]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := json.Marshal(matchSummarySearch(model.SummaryTask{Title: tc.title, Topic: tc.topic}, normalizedSummaryKeyword(tc.query)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(encoded) != tc.want {
+				t.Fatalf("wire ranges = %s, want %s", encoded, tc.want)
+			}
+		})
+	}
+}
 
 func TestSummarySearchLiteralMatching(t *testing.T) {
 	for _, tc := range []struct {

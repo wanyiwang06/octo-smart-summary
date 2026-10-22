@@ -78,7 +78,10 @@ Deploy migration `20261021-01-summary-search-normalized.sql` together with the n
 API and worker binaries. `RunMigrations` performs an idempotent Go backfill under
 the migration lock, in transactions of at most 500 rows, before either binary
 serves work. Row locks protect against concurrent new writers, and failures stop
-startup so incomplete search data is not served. Backfill preserves timestamps.
+startup so incomplete search data is not served. Backfill explicitly self-assigns
+`updated_at` to suppress MySQL's `ON UPDATE CURRENT_TIMESTAMP`, preserving historical
+business timestamps. The MySQL regression uses fixed 2019/2020 timestamps across
+501 rows so same-second fixture creation cannot hide an accidental rewrite.
 Stop old API/worker writers before this upgrade: old binaries/raw SQL and GORM
 `SkipHooks`/`UpdateColumns` do not maintain the new fields. Do not use a rolling
 mixed-version write deployment. If `SKIP_MIGRATION=true`, provision both schema

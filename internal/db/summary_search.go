@@ -77,7 +77,9 @@ func backfillSummarySearchBatch(ctx context.Context, db *sql.DB, after int64) (i
 		return after, 0, err
 	}
 	for _, task := range tasks {
-		_, err = tx.ExecContext(ctx, "UPDATE summary_task SET search_title = ?, search_topic = ? WHERE id = ?", model.NormalizeSummarySearch(task.Title), model.NormalizeSummarySearchTopic(task.Topic), task.ID)
+		// MySQL's ON UPDATE CURRENT_TIMESTAMP fires for raw SQL too. An
+		// explicit self-assignment preserves the task's business edit time.
+		_, err = tx.ExecContext(ctx, "UPDATE summary_task SET search_title = ?, search_topic = ?, updated_at = updated_at WHERE id = ?", model.NormalizeSummarySearch(task.Title), model.NormalizeSummarySearchTopic(task.Topic), task.ID)
 		if err != nil {
 			return after, 0, err
 		}

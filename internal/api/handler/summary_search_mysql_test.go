@@ -195,11 +195,13 @@ func TestSummarySearchMySQL(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { db.Where("space_id = ?", "backfill").Delete(&model.SummaryTask{}) })
-		var before model.SummaryTask
-		if err := db.First(&before, rows[0].ID).Error; err != nil {
+		// Fixed historical values expose ON UPDATE CURRENT_TIMESTAMP; freshly
+		// created rows can mask a rewrite within the same second.
+		if err := db.Exec("UPDATE summary_task SET search_title = NULL, search_topic = NULL, created_at = ?, updated_at = ? WHERE space_id = ?", "2019-01-02 03:04:05", "2020-02-03 04:05:06", "backfill").Error; err != nil {
 			t.Fatal(err)
 		}
-		if err := db.Exec("UPDATE summary_task SET search_title = NULL, search_topic = NULL WHERE space_id = ?", "backfill").Error; err != nil {
+		var before model.SummaryTask
+		if err := db.First(&before, rows[0].ID).Error; err != nil {
 			t.Fatal(err)
 		}
 		sqlDB, err := db.DB()
@@ -224,6 +226,12 @@ func TestSummarySearchMySQL(t *testing.T) {
 		}
 		if !after.UpdatedAt.Equal(before.UpdatedAt) || !after.CreatedAt.Equal(before.CreatedAt) {
 			t.Fatal("backfill changed timestamps")
+		}
+		if err := db.Model(&model.SummaryTask{}).Where("space_id = ? AND (created_at <> ? OR updated_at <> ?)", "backfill", before.CreatedAt, before.UpdatedAt).Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("backfill changed timestamps on %d rows", count)
 		}
 		// Blank-topic fallback must not retain an old title after later edits.
 		if err := db.Model(&rows[0]).Update("title", "ＮＥＷ").Error; err != nil {
